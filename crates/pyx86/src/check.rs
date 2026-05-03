@@ -319,6 +319,73 @@ fn lower_block(
                     lower_block(&if_stmt.orelse, scope, loop_depth, signatures, return_ty)?;
                 out.push(Stmt::If { cond, then_body, else_body });
             }
+            ast::Stmt::For(f) => {
+                if !f.orelse.is_empty() {
+                    bail!("unsupported_feature: `else` clause on `for` is not supported");
+                }
+                let loop_var = match f.target.as_ref() {
+                    ast::Expr::Name(n) => n.id.as_str().to_string(),
+                    _ => bail!(
+                        "unsupported_feature: for-loop target must be a simple name (no tuple unpacking yet)"
+                    ),
+                };
+                let (start, stop, step) =
+                    parse_and_lower_range(&f.iter, scope, signatures)?;
+                let step_value = match &step.expr {
+                    Expr::ConstI64(v) => *v,
+                    _ => bail!(
+                        "unsupported_feature: range() step must be a constant integer literal in v0.14"
+                    ),
+                };
+                if step_value == 0 {
+                    bail!("unsupported_feature: range() step must be non-zero");
+                }
+                if step_value < 0 {
+                    bail!(
+                        "unsupported_feature: negative range() step is not yet supported (use a `while` loop)"
+                    );
+                }
+
+                // Bind loop_var BEFORE lowering the body so the body can
+                // reference it.
+                scope.insert(loop_var.clone(), Type::I64);
+                let body_inner =
+                    lower_block(&f.body, scope, loop_depth + 1, signatures, return_ty)?;
+
+                // Desugar to:
+                //   loop_var = start
+                //   while loop_var < stop:
+                //     <body>
+                //     loop_var = loop_var + step
+                out.push(Stmt::Let { name: loop_var.clone(), value: start });
+
+                let cond = TypedExpr::new(
+                    Type::Bool,
+                    Expr::Cmp {
+                        op: CmpOp::Lt,
+                        lhs: Box::new(TypedExpr::new(
+                            Type::I64,
+                            Expr::Var(loop_var.clone()),
+                        )),
+                        rhs: Box::new(stop),
+                    },
+                );
+
+                let mut while_body = body_inner;
+                let incr = TypedExpr::new(
+                    Type::I64,
+                    Expr::BinOp {
+                        op: BinOp::Add,
+                        lhs: Box::new(TypedExpr::new(
+                            Type::I64,
+                            Expr::Var(loop_var.clone()),
+                        )),
+                        rhs: Box::new(step),
+                    },
+                );
+                while_body.push(Stmt::Let { name: loop_var.clone(), value: incr });
+                out.push(Stmt::While { cond, body: while_body });
+            }
             ast::Stmt::While(w) => {
                 if !w.orelse.is_empty() {
                     bail!(
@@ -696,6 +763,45 @@ fn resolve_call_args(
         }
     }
     Ok(out)
+}
+
+/// Parse and lower a `range(...)` call as the iterable of a for-loop.
+/// Returns (start, stop, step) all as I64 TypedExprs. Defaults: start=0, step=1.
+fn parse_and_lower_range(
+    iter: &ast::Expr,
+    scope: &Scope,
+    signatures: &SignatureTable,
+) -> Result<(TypedExpr, TypedExpr, TypedExpr)> {
+    let call = match iter {
+        ast::Expr::Call(c) => c,
+        _ => bail!(
+            "unsupported_feature: for-loop iterables other than range(...) are not supported in v0.14"
+        ),
+    };
+    if !matches!(call.func.as_ref(), ast::Expr::Name(n) if n.id.as_str() == "range") {
+        bail!(
+            "unsupported_feature: for-loop iterables other than range(...) are not supported in v0.14"
+        );
+    }
+    if !call.keywords.is_empty() {
+        bail!("unsupported_feature: range() does not accept keyword arguments");
+    }
+    let zero = TypedExpr::new(Type::I64, Expr::ConstI64(0));
+    let one = TypedExpr::new(Type::I64, Expr::ConstI64(1));
+    let lower_to_i64 = |e: &ast::Expr| -> Result<TypedExpr> {
+        let raw = lower_expr(e, scope, signatures)?;
+        coerce(raw, Type::I64)
+    };
+    match call.args.as_slice() {
+        [stop] => Ok((zero, lower_to_i64(stop)?, one)),
+        [start, stop] => Ok((lower_to_i64(start)?, lower_to_i64(stop)?, one)),
+        [start, stop, step] => Ok((
+            lower_to_i64(start)?,
+            lower_to_i64(stop)?,
+            lower_to_i64(step)?,
+        )),
+        _ => bail!("unsupported_feature: range() takes 1, 2, or 3 arguments"),
+    }
 }
 
 fn convert_cmp_op(op: &ast::CmpOp) -> Result<CmpOp> {
