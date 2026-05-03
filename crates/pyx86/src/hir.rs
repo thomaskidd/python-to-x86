@@ -100,6 +100,12 @@ pub enum Type {
     /// v0.19: literal construction, runtime indexing, len(), iteration.
     /// Append / mutation is deferred.
     List(ListId),
+    /// Immutable byte-string. Stored as `{ i64 len, i8* data }`. For
+    /// literals the data pointer aliases a compile-time constant; for
+    /// runtime concatenations it's a fresh heap allocation. v0.22:
+    /// literal, len, concat, ==/!=. Subscripting, slicing, methods
+    /// deferred.
+    Str,
 }
 
 impl Type {
@@ -122,6 +128,7 @@ impl Type {
                 format!("tuple[{}]", inner)
             }
             Type::List(id) => format!("list[{}]", id.elem().name()),
+            Type::Str => "str".to_string(),
         }
     }
     /// Width of the integer type in bits, or None for non-int types.
@@ -253,6 +260,16 @@ pub enum Expr {
     /// Locals introduced by the inner stmts are collected by codegen
     /// and allocated up-front in the function entry block.
     DoBlock { stmts: Vec<Stmt>, result: Box<TypedExpr> },
+    /// String literal. The codegen emits a private constant `[N x i8]`
+    /// global and returns a `{ i64 N-without-NUL, i8* &.str.x[0] }` value.
+    StrLit(String),
+    /// String concatenation. Allocates a new buffer of total length
+    /// and memcpy's both sources.
+    StrConcat { lhs: Box<TypedExpr>, rhs: Box<TypedExpr> },
+    /// String length (the i64 stored in the str struct's first field).
+    StrLen { s: Box<TypedExpr> },
+    /// String equality / inequality. Result is Bool.
+    StrEq { lhs: Box<TypedExpr>, rhs: Box<TypedExpr>, negated: bool },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

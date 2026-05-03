@@ -541,6 +541,7 @@ fn parse_type_annotation(ann: Option<&ast::Expr>) -> Option<Type> {
             "int" => Some(Type::I64),
             "float" => Some(Type::F64),
             "bool" => Some(Type::Bool),
+            "str" => Some(Type::Str),
             "i8" => Some(Type::I8),
             "i16" => Some(Type::I16),
             "i32" => Some(Type::I32),
@@ -588,7 +589,22 @@ fn lower_expr(e: &ast::Expr, scope: &Scope, signatures: &SignatureTable) -> Resu
             }
             ast::Constant::Float(f) => Ok(TypedExpr::new(Type::F64, Expr::ConstF64(*f))),
             ast::Constant::Bool(b) => Ok(TypedExpr::new(Type::Bool, Expr::ConstBool(*b))),
-            _ => bail!("unsupported_feature: only int / float / bool literals are supported"),
+            ast::Constant::Str(s) => {
+                // Reject non-ASCII for now — the printer/repr story is
+                // ASCII-only and Python escapes non-ASCII differently.
+                if !s.is_ascii() {
+                    bail!(
+                        "unsupported_feature: non-ASCII string literals are not yet supported"
+                    );
+                }
+                if s.bytes().any(|b| b == b'\\' || b == b'\'') {
+                    bail!(
+                        "unsupported_feature: string literals containing backslash or single-quote are not yet supported (printer can't escape them yet)"
+                    );
+                }
+                Ok(TypedExpr::new(Type::Str, Expr::StrLit(s.clone())))
+            }
+            _ => bail!("unsupported_feature: only int / float / bool / str literals are supported"),
         },
         ast::Expr::Name(n) => {
             let name = n.id.as_str();
@@ -645,6 +661,31 @@ fn lower_expr(e: &ast::Expr, scope: &Scope, signatures: &SignatureTable) -> Resu
             let rest = rest_ops?;
             if rest.len() == 1 {
                 let (op, rhs) = rest.into_iter().next().unwrap();
+                // String comparison: only ==/!= supported.
+                if first.ty == Type::Str || rhs.ty == Type::Str {
+                    if first.ty != Type::Str || rhs.ty != Type::Str {
+                        bail!(
+                            "unsupported_feature: cannot compare {} and {}",
+                            first.ty.name(),
+                            rhs.ty.name()
+                        );
+                    }
+                    let negated = match op {
+                        CmpOp::Eq => false,
+                        CmpOp::Ne => true,
+                        _ => bail!(
+                            "unsupported_feature: only == and != are supported for strings (no lexicographic ordering yet)"
+                        ),
+                    };
+                    return Ok(TypedExpr::new(
+                        Type::Bool,
+                        Expr::StrEq {
+                            lhs: Box::new(first),
+                            rhs: Box::new(rhs),
+                            negated,
+                        },
+                    ));
+                }
                 let (lhs, rhs) = unify_cmp_operands(first, rhs)?;
                 Ok(TypedExpr::new(
                     Type::Bool,
@@ -1120,9 +1161,7 @@ fn apply_binop(op: BinOp, lhs: TypedExpr, rhs: TypedExpr) -> Result<TypedExpr> {
             // List concatenation: list[T] + list[T] = list[T].
             if let (Type::List(a), Type::List(b)) = (lhs.ty, rhs.ty) {
                 if op != BinOp::Add {
-                    bail!(
-                        "unsupported_feature: only `+` is defined on lists (no `-`/`*` yet)"
-                    );
+                    bail!("unsupported_feature: only `+` is defined on lists (no `-`/`*` yet)");
                 }
                 if a != b {
                     bail!(
@@ -1133,11 +1172,27 @@ fn apply_binop(op: BinOp, lhs: TypedExpr, rhs: TypedExpr) -> Result<TypedExpr> {
                 }
                 return Ok(TypedExpr::new(
                     lhs.ty,
-                    Expr::ListConcat {
-                        lhs: Box::new(lhs),
-                        rhs: Box::new(rhs),
-                    },
+                    Expr::ListConcat { lhs: Box::new(lhs), rhs: Box::new(rhs) },
                 ));
+            }
+            // String concatenation: str + str = str.
+            if lhs.ty == Type::Str && rhs.ty == Type::Str {
+                if op != BinOp::Add {
+                    bail!(
+                        "unsupported_feature: only `+` is defined on strings"
+                    );
+                }
+                return Ok(TypedExpr::new(
+                    Type::Str,
+                    Expr::StrConcat { lhs: Box::new(lhs), rhs: Box::new(rhs) },
+                ));
+            }
+            if lhs.ty == Type::Str || rhs.ty == Type::Str {
+                bail!(
+                    "unsupported_feature: arithmetic between {} and {} is not supported",
+                    lhs.ty.name(),
+                    rhs.ty.name()
+                );
             }
             let (l, r) = unify_numeric(lhs, rhs)?;
             let ty = l.ty;
@@ -1406,12 +1461,15 @@ fn lower_builtin_call(
                     Expr::ListLen { list: Box::new(inner) },
                 ))),
                 Type::Tuple(id) => {
-                    // Tuple length is known at compile time → constant.
                     let n = id.with_elems(|elems| elems.len()) as i64;
                     Ok(Some(TypedExpr::new(Type::I64, Expr::ConstI64(n))))
                 }
+                Type::Str => Ok(Some(TypedExpr::new(
+                    Type::I64,
+                    Expr::StrLen { s: Box::new(inner) },
+                ))),
                 other => bail!(
-                    "unsupported_feature: len() not supported on {} (only list and tuple)",
+                    "unsupported_feature: len() not supported on {} (only list/tuple/str)",
                     other.name()
                 ),
             }
