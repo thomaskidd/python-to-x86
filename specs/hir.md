@@ -8,7 +8,7 @@ The HIR is the source of truth for "what the compiler can compile." Every accept
 
 This module is intentionally tiny and grows slice by slice. It is not a "permanent" IR design — it accretes shape as features land.
 
-## Current shape (v0.5)
+## Current shape (v0.6)
 
 ```rust
 pub enum Type { I64 }                  // only one user-facing type so far
@@ -28,6 +28,9 @@ pub enum Stmt {
     Let { name: String, value: Expr },
     Return { value: Expr },
     If { cond: Expr, then_body: Vec<Stmt>, else_body: Vec<Stmt> },
+    While { cond: Expr, body: Vec<Stmt> },
+    Break,
+    Continue,
 }
 
 pub enum Expr {
@@ -52,6 +55,7 @@ pub enum CmpOp { Lt, Le, Gt, Ge, Eq, Ne }
 - `Expr::Var(name)` references a name that is either a parameter or has been bound by a preceding `Stmt::Let` in the same surrounding scope. `check.rs` enforces this; codegen panics if it sees an unbound name (treated as internal compiler bug).
 - `BinOp::FloorDiv` / `BinOp::Mod` follow Python semantics (floor toward -∞). Codegen emits the correction blocks documented in `specs/codegen-llvm.md`.
 - `If.else_body` is `Vec::new()` when there is no `else` clause.
+- `Stmt::Break` / `Stmt::Continue` only appear inside the body of a `While` (transitively — they may sit inside nested `If`s). `check.rs` enforces this via a `loop_depth` counter threaded through the recursion.
 - `CmpChain.rest` is non-empty (single comparisons use `Cmp` instead).
 - Operands are pure (no side effects). Codegen exploits this to avoid name-tracking for chained comparisons.
 
@@ -60,7 +64,7 @@ pub enum CmpOp { Lt, Le, Gt, Ge, Eq, Ne }
 These are listed so a future contributor adding the corresponding feature knows the HIR has to grow:
 
 - Function calls (no `Call` Expr — calls are not supported)
-- Loops (no `While` / `For` / labels — v0.6+)
+- `for` loops (`While` only; `for` needs iterators which need container types)
 - `and`, `or` boolean operators (deferred — short-circuit value semantics need careful design)
 - Multiple types beyond i64 (no user-facing `bool`, `f64`, `str`, container types)
 - Multiple functions (`Program` holds exactly one `Function`)

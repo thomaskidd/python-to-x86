@@ -45,6 +45,15 @@ pub enum Stmt {
         /// Empty Vec when there is no `else` clause.
         else_body: Vec<Stmt>,
     },
+    While {
+        cond: Expr,
+        body: Vec<Stmt>,
+    },
+    /// Exit the innermost enclosing `While`. Check ensures it only
+    /// appears inside one.
+    Break,
+    /// Jump to the next iteration of the innermost enclosing `While`.
+    Continue,
 }
 
 #[derive(Debug, Clone)]

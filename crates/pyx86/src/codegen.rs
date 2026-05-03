@@ -94,6 +94,10 @@ struct Codegen {
     /// or `br`). When true, no further instructions are emitted into
     /// the current block until a new label is opened.
     block_terminated: bool,
+    /// Stack of `(continue_target, break_target)` pairs, one per
+    /// enclosing while loop. The top of the stack is the innermost
+    /// loop; `Break` / `Continue` always jump to the top entry.
+    loop_targets: Vec<(String, String)>,
 }
 
 impl Codegen {
@@ -103,6 +107,7 @@ impl Codegen {
             next_id: 0,
             next_block_id: 0,
             block_terminated: false,
+            loop_targets: Vec::new(),
         }
     }
 
@@ -168,6 +173,59 @@ impl Codegen {
                 Stmt::Return { value } => {
                     let op = self.lower(value);
                     self.emit(&format!("ret i64 {}", op));
+                    self.block_terminated = true;
+                }
+                Stmt::While { cond, body } => {
+                    let id = self.next_block_id;
+                    self.next_block_id += 1;
+                    let header_lbl = format!("loop_header.{}", id);
+                    let body_lbl = format!("loop_body.{}", id);
+                    let exit_lbl = format!("loop_exit.{}", id);
+
+                    // Branch into the header from the current block.
+                    self.emit(&format!("br label %{}", header_lbl));
+                    self.block_terminated = true;
+
+                    // Header: evaluate condition, branch to body or exit.
+                    self.open_block(&header_lbl);
+                    let cond_i1 = self.lower_cond(cond);
+                    self.emit(&format!(
+                        "br i1 {}, label %{}, label %{}",
+                        cond_i1, body_lbl, exit_lbl
+                    ));
+                    self.block_terminated = true;
+
+                    // Body: lower with loop targets pushed.
+                    self.open_block(&body_lbl);
+                    self.loop_targets
+                        .push((header_lbl.clone(), exit_lbl.clone()));
+                    self.lower_block(body);
+                    self.loop_targets.pop();
+                    if !self.block_terminated {
+                        // Back-edge to header.
+                        self.emit(&format!("br label %{}", header_lbl));
+                        self.block_terminated = true;
+                    }
+
+                    // Exit: continue with statements after the while.
+                    self.open_block(&exit_lbl);
+                }
+                Stmt::Break => {
+                    let (_, brk) = self
+                        .loop_targets
+                        .last()
+                        .expect("internal: Break with empty loop stack (check should have caught this)");
+                    let target = brk.clone();
+                    self.emit(&format!("br label %{}", target));
+                    self.block_terminated = true;
+                }
+                Stmt::Continue => {
+                    let (cnt, _) = self
+                        .loop_targets
+                        .last()
+                        .expect("internal: Continue with empty loop stack (check should have caught this)");
+                    let target = cnt.clone();
+                    self.emit(&format!("br label %{}", target));
                     self.block_terminated = true;
                 }
                 Stmt::If { cond, then_body, else_body } => {
@@ -388,11 +446,12 @@ fn collect_locals(body: &[Stmt]) -> Vec<String> {
                         out.push(name.clone());
                     }
                 }
-                Stmt::Return { .. } => {}
+                Stmt::Return { .. } | Stmt::Break | Stmt::Continue => {}
                 Stmt::If { then_body, else_body, .. } => {
                     walk(then_body, out, seen);
                     walk(else_body, out, seen);
                 }
+                Stmt::While { body, .. } => walk(body, out, seen),
             }
         }
     }
@@ -532,6 +591,94 @@ mod tests {
         // Either form works; the bench is the source of truth.
         assert!(ll.contains("icmp ne i64") || ll.contains("icmp eq i64"));
         assert!(ll.contains("xor i1") || ll.contains("icmp eq i64"));
+    }
+
+    #[test]
+    fn while_emits_header_body_exit_with_back_edge() {
+        let ll = emit_ll(
+            &make_program(
+                vec!["n"],
+                vec![
+                    Stmt::Let { name: "i".into(), value: Expr::ConstI64(0) },
+                    Stmt::While {
+                        cond: Expr::Cmp {
+                            op: CmpOp::Lt,
+                            lhs: Box::new(Expr::Var("i".into())),
+                            rhs: Box::new(Expr::Var("n".into())),
+                        },
+                        body: vec![Stmt::Let {
+                            name: "i".into(),
+                            value: Expr::BinOp {
+                                op: BinOp::Add,
+                                lhs: Box::new(Expr::Var("i".into())),
+                                rhs: Box::new(Expr::ConstI64(1)),
+                            },
+                        }],
+                    },
+                    Stmt::Return { value: Expr::Var("i".into()) },
+                ],
+            ),
+            "test",
+        );
+        assert!(ll.contains("loop_header.0:"));
+        assert!(ll.contains("loop_body.0:"));
+        assert!(ll.contains("loop_exit.0:"));
+        // Both edges into header: initial entry + back-edge from body.
+        assert!(ll.matches("br label %loop_header.0").count() >= 2);
+    }
+
+    #[test]
+    fn break_jumps_to_loop_exit() {
+        let ll = emit_ll(
+            &make_program(
+                vec!["n"],
+                vec![
+                    Stmt::While {
+                        cond: Expr::ConstI64(1),
+                        body: vec![Stmt::Break],
+                    },
+                    Stmt::Return { value: Expr::ConstI64(0) },
+                ],
+            ),
+            "test",
+        );
+        assert!(ll.contains("br label %loop_exit.0"));
+    }
+
+    #[test]
+    fn continue_jumps_to_loop_header() {
+        let ll = emit_ll(
+            &make_program(
+                vec!["n"],
+                vec![
+                    Stmt::Let { name: "i".into(), value: Expr::ConstI64(0) },
+                    Stmt::While {
+                        cond: Expr::Cmp {
+                            op: CmpOp::Lt,
+                            lhs: Box::new(Expr::Var("i".into())),
+                            rhs: Box::new(Expr::Var("n".into())),
+                        },
+                        body: vec![
+                            Stmt::Let {
+                                name: "i".into(),
+                                value: Expr::BinOp {
+                                    op: BinOp::Add,
+                                    lhs: Box::new(Expr::Var("i".into())),
+                                    rhs: Box::new(Expr::ConstI64(1)),
+                                },
+                            },
+                            Stmt::Continue,
+                        ],
+                    },
+                    Stmt::Return { value: Expr::Var("i".into()) },
+                ],
+            ),
+            "test",
+        );
+        // 2 explicit `br label %loop_header.0` (entry + continue),
+        // plus none from the body (continue terminates the block).
+        let count = ll.matches("br label %loop_header.0").count();
+        assert!(count >= 2, "expected ≥2 br to header, got {} in:\n{}", count, ll);
     }
 
     #[test]
