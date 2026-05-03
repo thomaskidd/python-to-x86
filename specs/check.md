@@ -17,17 +17,21 @@ In later slices this module evolves into a full type-inference pass and is renam
 
 ```text
 def main(<param>: int, …) -> int:
-    return <expr>
+    <name> [: int] = <expr>          # zero or more
+    …
+    return <expr>                    # required, must be last stmt
 ```
 
 with up to 16 typed `int` parameters, and `<expr>` built from:
 - integer literals (must fit i64)
-- parameter references (`Name` nodes that resolve to a declared param)
+- variable references (parameters or previously assigned locals)
 - binary operators `+ - * // %`
 - unary operators `+x`, `-x`
 - parentheses (transparent in the AST)
 
-Anything else — different function name, untyped/non-int parameters, default args, decorators, missing/wrong return annotation, local variable assignment, multiple top-level statements, unsupported expression forms, division by `/`, exponentiation, bitwise, calls, comprehensions, etc. — produces `unsupported_feature: <reason>`. References to names that aren't parameters (locals) are explicitly rejected with a "locals not supported until v0.4" hint.
+Reassignment is allowed (`x = 1; x = x + 1`); the in-scope set is monotonically grown as we walk the body.
+
+Anything else — different function name, untyped/non-int parameters, default args, decorators, missing/wrong return annotation, multiple top-level definitions, augmented assignment (`x += 1`), tuple unpacking, chained assignment (`a = b = 1`), early `return`, statements after `return`, control flow (`if`/`while`/`for`), exceptions, division by `/`, exponentiation, bitwise, calls, comprehensions, etc. — produces `unsupported_feature: <reason>`. Use of an unbound name produces an "not in scope" error.
 
 ## Why not infer types here
 
