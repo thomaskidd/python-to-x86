@@ -6,11 +6,13 @@ use crate::check::Program;
 /// returns 0.
 pub fn emit_ll(prog: &Program, source_basename: &str) -> String {
     let basename = sanitize_module_id(source_basename);
+    // Typed pointers (i8*) rather than opaque pointers (ptr) so we
+    // work on LLVM 10+ — opaque pointers are LLVM 14+ only.
     format!(
         "; ModuleID = 'pyx86_{name}'
 target triple = \"x86_64-unknown-linux-gnu\"
 
-declare i32 @printf(ptr, ...)
+declare i32 @printf(i8*, ...)
 
 @.fmt_i64 = private unnamed_addr constant [5 x i8] c\"%ld\\0A\\00\"
 
@@ -22,8 +24,8 @@ entry:
 define i32 @main() {{
 entry:
   %r = call i64 @py_main()
-  %fmt = getelementptr inbounds [5 x i8], ptr @.fmt_i64, i64 0, i64 0
-  call i32 (ptr, ...) @printf(ptr %fmt, i64 %r)
+  %fmt = getelementptr inbounds [5 x i8], [5 x i8]* @.fmt_i64, i64 0, i64 0
+  call i32 (i8*, ...) @printf(i8* %fmt, i64 %r)
   ret i32 0
 }}
 ",
@@ -51,7 +53,7 @@ mod tests {
         assert!(ll.contains("define i64 @py_main()"));
         assert!(ll.contains("define i32 @main()"));
         assert!(ll.contains("@.fmt_i64"));
-        assert!(ll.contains("call i32 (ptr, ...) @printf"));
+        assert!(ll.contains("call i32 (i8*, ...) @printf"));
     }
 
     #[test]

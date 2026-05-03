@@ -19,8 +19,7 @@ The codegen for this slice emits, conceptually:
 ; ModuleID = 'pyx86_<source basename>'
 target triple = "x86_64-unknown-linux-gnu"
 
-declare i32 @printf(ptr, ...)
-declare void @exit(i32) noreturn
+declare i32 @printf(i8*, ...)
 
 @.fmt_i64 = private unnamed_addr constant [5 x i8] c"%ld\0A\00"
 
@@ -32,8 +31,8 @@ entry:
 define i32 @main() {
 entry:
   %r = call i64 @py_main()
-  %fmt = getelementptr inbounds [5 x i8], ptr @.fmt_i64, i64 0, i64 0
-  call i32 (ptr, ...) @printf(ptr %fmt, i64 %r)
+  %fmt = getelementptr inbounds [5 x i8], [5 x i8]* @.fmt_i64, i64 0, i64 0
+  call i32 (i8*, ...) @printf(i8* %fmt, i64 %r)
   ret i32 0
 }
 ```
@@ -42,7 +41,7 @@ Key points:
 - The user's `main` is renamed to `py_main` to avoid colliding with the C `main` symbol that libc startup expects.
 - The C `main` is the wrapper: it calls `py_main`, prints the return value via `printf("%ld\n", r)`, and returns 0.
 - `printf` is from libc; `clang` links libc by default. No custom runtime crate is needed for this slice.
-- We use opaque pointers (`ptr`) — required for LLVM 15+. Compatible with the LLVM versions we target.
+- We use **typed pointers (`i8*`)** rather than opaque pointers (`ptr`) so the IR is accepted by LLVM 10 through 18+. Opaque pointers are LLVM 14+ only; if/when we drop support for older LLVMs, the IR can be simplified.
 
 ## Pipeline driven by codegen
 
