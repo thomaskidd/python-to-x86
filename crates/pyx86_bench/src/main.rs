@@ -21,6 +21,10 @@ struct Cli {
     corpus_root: PathBuf,
     #[arg(long, default_value = "cargo run -q -p pyx86 --release --")]
     compiler: String,
+    /// Rust compiler used for the performance pillar baselines.
+    /// Invoked as `<rust_compiler> -O <input.rs> -o <output>`.
+    #[arg(long, default_value = "rustc")]
+    rust_compiler: String,
     #[arg(long)]
     json_out: Option<PathBuf>,
     #[arg(long)]
@@ -74,6 +78,23 @@ struct StrategyToml {
     args: Vec<ArgStrategy>,
 }
 
+#[derive(Deserialize, Debug)]
+struct BenchToml {
+    tier: u8,
+    #[serde(default = "default_bench_warmup")]
+    warmup: u32,
+    #[serde(default = "default_bench_iterations")]
+    iterations: u32,
+    #[serde(default = "default_bench_max_ratio")]
+    max_ratio: f64,
+    #[serde(rename = "input", default)]
+    inputs: Vec<ArgStrategy>,
+}
+
+fn default_bench_warmup() -> u32 { 5 }
+fn default_bench_iterations() -> u32 { 50 }
+fn default_bench_max_ratio() -> f64 { 2.0 }
+
 #[derive(Deserialize, Debug, Clone)]
 struct ArgStrategy {
     #[serde(rename = "type")]
@@ -102,6 +123,19 @@ struct Failure {
     actual: Option<String>,
 }
 
+#[derive(Serialize, Debug, Clone)]
+struct PerfResult {
+    name: String,
+    passed: bool,
+    skipped: bool,
+    input_repr: Option<String>,
+    py_median_ms: Option<f64>,
+    rs_median_ms: Option<f64>,
+    ratio: Option<f64>,
+    max_ratio: f64,
+    failure: Option<Failure>,
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let _ = rayon::ThreadPoolBuilder::new()
@@ -127,20 +161,37 @@ fn main() -> Result<()> {
         .map(|dir| run_one(dir, &cli))
         .collect();
 
+    // Performance pillar — only at tier ≥ 3 (per spec).
+    // Run sequentially to avoid CPU contention skewing the timings.
+    let perf_dir = cli.corpus_root.join("performance");
+    let perf_results: Vec<PerfResult> = if cli.tier >= 3 && perf_dir.exists() {
+        let perf_glob = format!("{}/{}", perf_dir.display(), cli.filter);
+        let mut perf_tests: Vec<PathBuf> = glob::glob(&perf_glob)?
+            .filter_map(Result::ok)
+            .filter(|p| p.is_dir() && p.join("program.py").is_file() && p.join("program.rs").is_file())
+            .collect();
+        perf_tests.sort();
+        perf_tests.iter().map(|dir| run_perf_one(dir, &cli)).collect()
+    } else {
+        Vec::new()
+    };
+
     let wall = started.elapsed().as_secs_f64();
-    print_summary(&results, wall);
+    print_summary(&results, &perf_results, wall);
 
     if let Some(path) = &cli.json_out {
         let payload = serde_json::json!({
             "tier": cli.tier,
             "wall_seconds": wall,
             "correctness": results,
+            "performance": perf_results,
         });
         fs::write(path, serde_json::to_string_pretty(&payload)?)?;
     }
 
-    let any_failed = results.iter().any(|r| !r.passed && !r.skipped);
-    if any_failed {
+    let any_corr_failed = results.iter().any(|r| !r.passed && !r.skipped);
+    let any_perf_failed = perf_results.iter().any(|r| !r.passed && !r.skipped);
+    if any_corr_failed || any_perf_failed {
         std::process::exit(1);
     }
     Ok(())
@@ -259,6 +310,223 @@ fn run_correctness(dir: &Path, cli: &Cli) -> Result<TestResult> {
         run_ms,
         failure,
     })
+}
+
+fn run_perf_one(dir: &Path, cli: &Cli) -> PerfResult {
+    let name = dir.file_name().unwrap().to_string_lossy().to_string();
+    match run_perf(dir, cli) {
+        Ok(r) => r,
+        Err(e) => PerfResult {
+            name,
+            passed: false,
+            skipped: false,
+            input_repr: None,
+            py_median_ms: None,
+            rs_median_ms: None,
+            ratio: None,
+            max_ratio: 0.0,
+            failure: Some(Failure {
+                kind: "harness".into(),
+                message: format!("{:#}", e),
+                input_repr: None,
+                expected: None,
+                actual: None,
+            }),
+        },
+    }
+}
+
+fn run_perf(dir: &Path, cli: &Cli) -> Result<PerfResult> {
+    let name = dir.file_name().unwrap().to_string_lossy().to_string();
+    let bench_toml: BenchToml = {
+        let s = fs::read_to_string(dir.join("bench.toml"))
+            .with_context(|| format!("read bench.toml in {}", dir.display()))?;
+        toml::from_str(&s)?
+    };
+
+    if bench_toml.tier > cli.tier {
+        return Ok(PerfResult {
+            name,
+            passed: true,
+            skipped: true,
+            input_repr: None,
+            py_median_ms: None,
+            rs_median_ms: None,
+            ratio: None,
+            max_ratio: bench_toml.max_ratio,
+            failure: None,
+        });
+    }
+
+    let tmp = tempfile::Builder::new()
+        .prefix(&format!("pyx86bench-perf-{}-", name))
+        .tempdir()?;
+    let py_elf = tmp.path().join(format!("{}-py.elf", name));
+    let rs_elf = tmp.path().join(format!("{}-rs.elf", name));
+
+    // Compile both implementations.
+    let py_compile = run_compiler(&cli.compiler, &dir.join("program.py"), &py_elf);
+    if !py_compile.success {
+        return Ok(PerfResult {
+            name,
+            passed: false,
+            skipped: false,
+            input_repr: None,
+            py_median_ms: None,
+            rs_median_ms: None,
+            ratio: None,
+            max_ratio: bench_toml.max_ratio,
+            failure: Some(Failure {
+                kind: "compile-py".into(),
+                message: py_compile.stderr,
+                input_repr: None,
+                expected: None,
+                actual: None,
+            }),
+        });
+    }
+    let rs_compile = compile_rust(&cli.rust_compiler, &dir.join("program.rs"), &rs_elf);
+    if !rs_compile.success {
+        return Ok(PerfResult {
+            name,
+            passed: false,
+            skipped: false,
+            input_repr: None,
+            py_median_ms: None,
+            rs_median_ms: None,
+            ratio: None,
+            max_ratio: bench_toml.max_ratio,
+            failure: Some(Failure {
+                kind: "compile-rs".into(),
+                message: rs_compile.stderr,
+                input_repr: None,
+                expected: None,
+                actual: None,
+            }),
+        });
+    }
+
+    // Generate one fixed input for the perf comparison.
+    let seed = cli.seed.unwrap_or_else(|| stable_seed(&name));
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    let inputs = generate_inputs(&bench_toml.inputs, &mut rng)?;
+    let argv: Vec<String> = format_args_argv(&inputs);
+    let input_repr = format_args_python(&inputs);
+
+    // Verify both implementations produce the same output before timing.
+    let py_out = run_subject(&py_elf, &inputs)?;
+    let rs_out = run_subject(&rs_elf, &inputs)?;
+    if py_out.stdout != rs_out.stdout || py_out.exit_code != rs_out.exit_code {
+        return Ok(PerfResult {
+            name,
+            passed: false,
+            skipped: false,
+            input_repr: Some(input_repr),
+            py_median_ms: None,
+            rs_median_ms: None,
+            ratio: None,
+            max_ratio: bench_toml.max_ratio,
+            failure: Some(Failure {
+                kind: "diff-before-timing".into(),
+                message: format!(
+                    "py and rs disagree on output before timing: py={:?} rs={:?}",
+                    py_out.stdout, rs_out.stdout
+                ),
+                input_repr: None, // already in the outer PerfResult.input_repr
+                expected: Some(py_out.stdout),
+                actual: Some(rs_out.stdout),
+            }),
+        });
+    }
+
+    // Warm up + measure.
+    let py_times = time_runs(&py_elf, &argv, bench_toml.warmup, bench_toml.iterations)?;
+    let rs_times = time_runs(&rs_elf, &argv, bench_toml.warmup, bench_toml.iterations)?;
+
+    let py_median = median_ms(&py_times);
+    let rs_median = median_ms(&rs_times);
+    let ratio = py_median / rs_median;
+    let passed = ratio <= bench_toml.max_ratio;
+
+    if cli.keep_tmp {
+        let _ = tmp.keep();
+    }
+
+    Ok(PerfResult {
+        name,
+        passed,
+        skipped: false,
+        input_repr: Some(input_repr),
+        py_median_ms: Some(py_median),
+        rs_median_ms: Some(rs_median),
+        ratio: Some(ratio),
+        max_ratio: bench_toml.max_ratio,
+        failure: if passed {
+            None
+        } else {
+            Some(Failure {
+                kind: "ratio".into(),
+                message: format!("ratio {:.2}x exceeds limit {:.2}x", ratio, bench_toml.max_ratio),
+                input_repr: None,
+                expected: None,
+                actual: None,
+            })
+        },
+    })
+}
+
+fn compile_rust(rust_compiler: &str, src: &Path, out: &Path) -> CompileStatus {
+    let parts: Vec<&str> = rust_compiler.split_whitespace().collect();
+    let Some((program, args)) = parts.split_first() else {
+        return CompileStatus { success: false, stderr: "empty --rust-compiler".into() };
+    };
+    let mut cmd = Command::new(program);
+    cmd.args(args);
+    cmd.arg("-O");
+    cmd.arg(src);
+    cmd.arg("-o").arg(out);
+    match cmd.output() {
+        Ok(o) => CompileStatus {
+            success: o.status.success(),
+            stderr: String::from_utf8_lossy(&o.stderr).into_owned(),
+        },
+        Err(e) => CompileStatus {
+            success: false,
+            stderr: format!("failed to spawn rustc `{}`: {}", program, e),
+        },
+    }
+}
+
+fn time_runs(
+    elf: &Path,
+    argv: &[String],
+    warmup: u32,
+    iterations: u32,
+) -> Result<Vec<f64>> {
+    // Discard `warmup` runs.
+    for _ in 0..warmup {
+        let _ = Command::new(elf).args(argv).output()?;
+    }
+    let mut samples = Vec::with_capacity(iterations as usize);
+    for _ in 0..iterations {
+        let start = Instant::now();
+        let _ = Command::new(elf).args(argv).output()?;
+        samples.push(start.elapsed().as_secs_f64() * 1000.0);
+    }
+    Ok(samples)
+}
+
+fn median_ms(samples: &[f64]) -> f64 {
+    let mut v: Vec<f64> = samples.to_vec();
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let n = v.len();
+    if n == 0 {
+        0.0
+    } else if n % 2 == 1 {
+        v[n / 2]
+    } else {
+        (v[n / 2 - 1] + v[n / 2]) / 2.0
+    }
 }
 
 fn skipped(name: &str) -> TestResult {
@@ -382,7 +650,7 @@ fn run_subject(elf: &Path, args: &[ArgValue]) -> Result<RunOutput> {
     })
 }
 
-fn print_summary(results: &[TestResult], wall: f64) {
+fn print_summary(results: &[TestResult], perf: &[PerfResult], wall: f64) {
     println!("correctness:");
     if results.is_empty() {
         println!("  (no tests discovered)");
@@ -416,9 +684,56 @@ fn print_summary(results: &[TestResult], wall: f64) {
     let fail = results.iter().filter(|r| !r.passed && !r.skipped).count();
     let skip = results.iter().filter(|r| r.skipped).count();
     let total = pass + fail;
+
+    if !perf.is_empty() {
+        println!();
+        println!("performance:");
+        for r in perf {
+            if r.skipped {
+                continue;
+            }
+            let mark = if r.passed { "ok  " } else { "FAIL" };
+            match (r.py_median_ms, r.rs_median_ms, r.ratio) {
+                (Some(py), Some(rs), Some(ratio)) => {
+                    println!(
+                        "  {} {:30}  in={}  py {:>6.1} ms / rs {:>6.1} ms   ratio {:>5.2}x  (≤ {:.2}x)",
+                        mark,
+                        r.name,
+                        r.input_repr.as_deref().unwrap_or("()"),
+                        py,
+                        rs,
+                        ratio,
+                        r.max_ratio,
+                    );
+                }
+                _ => {
+                    let kind = r.failure.as_ref().map(|f| f.kind.as_str()).unwrap_or("?");
+                    let msg = r
+                        .failure
+                        .as_ref()
+                        .map(|f| f.message.lines().next().unwrap_or("").to_string())
+                        .unwrap_or_default();
+                    println!("  {} {:30}  [{}] {}", mark, r.name, kind, msg);
+                }
+            }
+        }
+    }
+
+    let perf_pass = perf.iter().filter(|r| r.passed && !r.skipped).count();
+    let perf_fail = perf.iter().filter(|r| !r.passed && !r.skipped).count();
+    let perf_total = perf_pass + perf_fail;
+
     println!();
-    println!(
-        "{}/{} passed, {} failed, {} skipped. {:.2}s wall.",
-        pass, total, fail, skip, wall
-    );
+    if perf_total > 0 {
+        println!(
+            "correctness: {}/{} passed, {} failed, {} skipped.  performance: {}/{} within ratio.  {:.2}s wall.",
+            pass, total, fail, skip, perf_pass, perf_total, wall,
+        );
+    } else {
+        println!(
+            "{}/{} passed, {} failed, {} skipped. {:.2}s wall.",
+            pass, total, fail, skip, wall
+        );
+    }
+    let _ = perf_fail; // suppress dead-code warning
 }

@@ -1,0 +1,12 @@
+tier = 3
+warmup = 5
+iterations = 30
+max_ratio = 2.0
+
+# fib(90) is the largest that fits in i64; we use 80 as a brisk bench.
+# Note: with such a small n, process spawn time dominates the
+# measurement — both py and rs see the same fixed overhead, so the
+# ratio is still meaningful.
+[[input]]
+type = "i64"
+range = [80, 80]
