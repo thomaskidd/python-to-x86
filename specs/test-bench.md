@@ -40,17 +40,13 @@ Exit code: 0 if all tests pass, 1 otherwise.
   iterations = { tier1 = 1, tier2 = 10, tier3 = 1000, tier4 = 1_000_000 }
   ```
   If a key for the requested tier is absent the test is skipped at that tier.
-- `strategy.toml` — *optional*. Describes input shape for proptest. Omit when `main()` takes no args:
+- `strategy.toml` — *optional*. Describes input shape for fuzzing. Omit when `main()` takes no args:
   ```toml
   [[arg]]
   type = "i64"
   range = [-1_000_000, 1_000_000]
-  [[arg]]
-  type = "list[i64]"
-  length_range = [0, 100]
-  elem_range = [-100, 100]
   ```
-  Strategies are kept TOML, not Python, so the Rust bench can read them directly without embedding a Python interpreter.
+  Strategies are kept TOML, not Python, so the Rust bench can read them directly without embedding a Python interpreter. Currently supported types: **`i64`** (requires `range = [lo, hi]`, inclusive). Container/aggregate types (e.g. `list[i64]`) come in later slices when the compiler supports them.
 
 ### Performance — `tests/performance/<benchmark-name>/`
 
@@ -70,13 +66,15 @@ Exit code: 0 if all tests pass, 1 otherwise.
 For each program in `tests/correctness/` matching the filter and tier:
 
 1. Compile to a scratch dir: invoke `--compiler` with `<scratch>/<name>.elf` as the output. Capture stderr; non-zero exit = compile failure.
-2. Read `strategy.toml` (if present); generate `iterations[tierN]` inputs via `proptest`. With no strategy, generate one empty input set.
+2. Read `strategy.toml` (if present); generate per-tier iterations of inputs via `rand` seeded deterministically by the test name (override with `--seed`). With no strategy, generate one empty input set and run a single iteration.
 3. For each input:
-   - **Reference**: run CPython as `python3 -c "import sys; sys.path.insert(0, R'<dir>'); from program import main; print(repr(main(*ARGS)))"`. Capture stdout, exit code.
-   - **Subject**: run `<scratch>/<name>.elf` with the same args (passed positionally as JSON-encoded strings on argv). Capture stdout, exit code.
-   - Compare. Mismatch ⇒ shrink input via `proptest`'s built-in shrinking, save a `repro.json` to the scratch dir, mark the test failed.
+   - **Reference**: format the args as Python int literals into `python3 -c "import sys; sys.path.insert(0, R'<dir>'); from program import main; print(repr(main(<a>, <b>, ...)))"`. Capture stdout, exit code.
+   - **Subject**: run `<scratch>/<name>.elf` with the same args as positional argv strings. Capture stdout, exit code.
+   - Compare. Mismatch ⇒ stop iterating, record the input + expected + actual on the test result.
 
 CPython and the compiled binary are expected to print exactly the same `repr(...)`-formatted string. Both end with a single newline.
+
+Input shrinking on failure is **not yet implemented** — the bench reports the first failing input as-is. Shrinking lands once false-positive noise warrants it.
 
 ## Procedure — performance
 

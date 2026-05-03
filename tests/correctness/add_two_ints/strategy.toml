@@ -1,0 +1,10 @@
+# Stay well inside i64 range so a + b doesn't overflow — Python's
+# arbitrary-precision int wouldn't, ours does, and the diff would
+# fire on overflow even though the compiler is correct.
+[[arg]]
+type = "i64"
+range = [-1_000_000_000, 1_000_000_000]
+
+[[arg]]
+type = "i64"
+range = [-1_000_000_000, 1_000_000_000]

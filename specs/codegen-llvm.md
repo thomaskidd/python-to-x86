@@ -4,15 +4,16 @@
 
 Take the validated program (eventually: typed HIR / SSA mid-IR) and emit LLVM IR as text. Drive the final assemble + link step by shelling out to `clang`.
 
-## Current scope (v0.2)
+## Current scope (v0.3)
 
-`main()` returns an arbitrary integer expression composed of:
+`main(<a>: int, ...)` (up to 16 typed-int params) returns an integer expression composed of:
 - `int` literals (i64-range)
+- Parameter references
 - Binary `+ - * // %`
 - Unary `+x`, `-x`
 - Parentheses
 
-No parameters, no variables, no control flow yet — those are v0.3+.
+No locals, no control flow yet — those are v0.4+.
 
 ## v0.1 IR template (literal return)
 
@@ -94,6 +95,38 @@ These are pinned by the `floordiv_negatives` correctness test; CPython is the so
 ### Division-by-zero
 
 We emit raw `sdiv` / `srem`; LLVM's behaviour for `a / 0` is to raise SIGFPE on x86-64. CPython raises `ZeroDivisionError`. v0.2 has no exception support — programs that divide by zero are diagnosed by the differential test. Test programs avoid div-by-zero until exceptions land in phase 2.
+
+## v0.3 IR — function parameters and argv-driven wrapper
+
+When `py_main` has parameters, each gets an i64 SSA argument named `%p_<param-name>`. The wrapper (`@main`) receives `(argc, argv)` and parses `argv[i+1]` for each parameter via `atoll`.
+
+```llvm
+declare i64 @atoll(i8*)
+
+define i64 @py_main(i64 %p_a, i64 %p_b) {
+entry:
+  %v0 = add i64 %p_a, %p_b
+  ret i64 %v0
+}
+
+define i32 @main(i32 %argc, i8** %argv) {
+entry:
+  %slot0 = getelementptr inbounds i8*, i8** %argv, i64 1
+  %str0  = load i8*, i8** %slot0
+  %p_a   = call i64 @atoll(i8* %str0)
+  %slot1 = getelementptr inbounds i8*, i8** %argv, i64 2
+  %str1  = load i8*, i8** %slot1
+  %p_b   = call i64 @atoll(i8* %str1)
+  %r     = call i64 @py_main(i64 %p_a, i64 %p_b)
+  %fmt   = getelementptr inbounds [5 x i8], [5 x i8]* @.fmt_i64, i64 0, i64 0
+  call i32 (i8*, ...) @printf(i8* %fmt, i64 %r)
+  ret i32 0
+}
+```
+
+Naming convention: `%p_<name>` for parameters, `%v<n>` for internal SSA values, `%slot<i>` / `%str<i>` for the argv-parsing scaffold. The `p_` prefix avoids collisions when a user names a parameter like `v0`.
+
+`atoll` returns 0 on parse failure rather than reporting an error. v0.3 trusts the caller (the bench) to pass well-formed integers; argv-validation lands when we add error handling.
 
 ## Pipeline driven by codegen
 
