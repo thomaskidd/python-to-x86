@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use clap::Parser;
+use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -24,6 +25,10 @@ struct Cli {
     json_out: Option<PathBuf>,
     #[arg(long)]
     keep_tmp: bool,
+    /// RNG seed for input generation. Defaults to a per-test
+    /// deterministic seed so reruns reproduce.
+    #[arg(long)]
+    seed: Option<u64>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -61,6 +66,20 @@ fn default_iterations(tier: u8) -> u32 {
         4 => 100_000,
         _ => 0,
     }
+}
+
+#[derive(Deserialize, Debug)]
+struct StrategyToml {
+    #[serde(rename = "arg", default)]
+    args: Vec<ArgStrategy>,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+struct ArgStrategy {
+    #[serde(rename = "type")]
+    ty: String,
+    /// Inclusive `[min, max]`. Required for `i64`.
+    range: Option<[i64; 2]>,
 }
 
 #[derive(Serialize, Debug, Clone)]
@@ -158,33 +177,25 @@ fn run_correctness(dir: &Path, cli: &Cli) -> Result<TestResult> {
     };
 
     if tier_toml.tier > cli.tier {
-        return Ok(skipped(&name, "above requested tier"));
+        return Ok(skipped(&name));
     }
 
-    let has_strategy = dir.join("strategy.toml").exists();
-    if has_strategy {
-        return Ok(TestResult {
-            name,
-            passed: false,
-            skipped: false,
-            iterations: 0,
-            compile_ms: 0.0,
-            run_ms: 0.0,
-            failure: Some(Failure {
-                kind: "unsupported".into(),
-                message: "strategy.toml not yet supported by bench v1".into(),
-                input_repr: None,
-                expected: None,
-                actual: None,
-            }),
-        });
-    }
+    let strategy = if dir.join("strategy.toml").exists() {
+        let s = fs::read_to_string(dir.join("strategy.toml"))
+            .with_context(|| format!("read strategy.toml in {}", dir.display()))?;
+        let parsed: StrategyToml =
+            toml::from_str(&s).with_context(|| format!("parse strategy.toml in {}", dir.display()))?;
+        Some(parsed.args)
+    } else {
+        None
+    };
 
-    let iterations = tier_toml
-        .iter_at
-        .get(cli.tier)
-        .unwrap_or_else(|| default_iterations(cli.tier));
-    let iterations = if has_strategy { iterations } else { 1 };
+    let has_inputs = strategy.as_ref().map(|a| !a.is_empty()).unwrap_or(false);
+    let iterations = if has_inputs {
+        tier_toml.iter_at.get(cli.tier).unwrap_or_else(|| default_iterations(cli.tier))
+    } else {
+        1
+    };
 
     let tmp = tempfile::Builder::new()
         .prefix(&format!("pyx86bench-{}-", name))
@@ -212,16 +223,21 @@ fn run_correctness(dir: &Path, cli: &Cli) -> Result<TestResult> {
         });
     }
 
+    // Per-test deterministic seed (test name hash) so reruns reproduce.
+    let seed = cli.seed.unwrap_or_else(|| stable_seed(&name));
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+
     let run_start = Instant::now();
     let mut failure: Option<Failure> = None;
     for _ in 0..iterations {
-        let py = run_cpython(&dir.join("program.py"))?;
-        let su = run_subject(&elf_path)?;
+        let args = generate_inputs(strategy.as_deref().unwrap_or(&[]), &mut rng)?;
+        let py = run_cpython(&dir.join("program.py"), &args)?;
+        let su = run_subject(&elf_path, &args)?;
         if py.exit_code != su.exit_code || py.stdout != su.stdout {
             failure = Some(Failure {
                 kind: "diff".into(),
                 message: format!("py exit={}, subject exit={}", py.exit_code, su.exit_code),
-                input_repr: Some("()".into()),
+                input_repr: Some(format_args_python(&args)),
                 expected: Some(py.stdout),
                 actual: Some(su.stdout),
             });
@@ -245,7 +261,7 @@ fn run_correctness(dir: &Path, cli: &Cli) -> Result<TestResult> {
     })
 }
 
-fn skipped(name: &str, _reason: &str) -> TestResult {
+fn skipped(name: &str) -> TestResult {
     TestResult {
         name: name.into(),
         passed: true,
@@ -255,6 +271,55 @@ fn skipped(name: &str, _reason: &str) -> TestResult {
         run_ms: 0.0,
         failure: None,
     }
+}
+
+/// A single generated input: one value per arg in the strategy.
+#[derive(Debug, Clone)]
+enum ArgValue {
+    I64(i64),
+}
+
+fn generate_inputs(strategy: &[ArgStrategy], rng: &mut impl Rng) -> Result<Vec<ArgValue>> {
+    strategy
+        .iter()
+        .map(|a| match a.ty.as_str() {
+            "i64" => {
+                let [lo, hi] = a
+                    .range
+                    .ok_or_else(|| anyhow::anyhow!("i64 arg missing required `range = [lo, hi]`"))?;
+                anyhow::ensure!(lo <= hi, "i64 arg range has lo > hi: [{}, {}]", lo, hi);
+                Ok(ArgValue::I64(rng.gen_range(lo..=hi)))
+            }
+            other => anyhow::bail!("strategy arg type `{}` is not supported in v0.3", other),
+        })
+        .collect()
+}
+
+fn format_args_python(args: &[ArgValue]) -> String {
+    args.iter()
+        .map(|a| match a {
+            ArgValue::I64(v) => v.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn format_args_argv(args: &[ArgValue]) -> Vec<String> {
+    args.iter()
+        .map(|a| match a {
+            ArgValue::I64(v) => v.to_string(),
+        })
+        .collect()
+}
+
+/// FNV-1a-ish hash so the same test name gives the same default seed.
+fn stable_seed(name: &str) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in name.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
 }
 
 struct CompileStatus {
@@ -291,13 +356,15 @@ struct RunOutput {
     stdout: String,
 }
 
-fn run_cpython(src: &Path) -> Result<RunOutput> {
+fn run_cpython(src: &Path, args: &[ArgValue]) -> Result<RunOutput> {
     let dir = src.parent().context("source has no parent")?;
     let stem = src.file_stem().context("source has no stem")?.to_string_lossy();
+    let py_args = format_args_python(args);
     let snippet = format!(
-        "import sys; sys.path.insert(0, r'{}'); from {} import main; print(repr(main()))",
+        "import sys; sys.path.insert(0, r'{}'); from {} import main; print(repr(main({})))",
         dir.display(),
-        stem
+        stem,
+        py_args,
     );
     let output = Command::new("python3").arg("-c").arg(&snippet).output()?;
     Ok(RunOutput {
@@ -306,8 +373,9 @@ fn run_cpython(src: &Path) -> Result<RunOutput> {
     })
 }
 
-fn run_subject(elf: &Path) -> Result<RunOutput> {
-    let output = Command::new(elf).output()?;
+fn run_subject(elf: &Path, args: &[ArgValue]) -> Result<RunOutput> {
+    let argv = format_args_argv(args);
+    let output = Command::new(elf).args(&argv).output()?;
     Ok(RunOutput {
         exit_code: output.status.code().unwrap_or(-1),
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -331,6 +399,9 @@ fn print_summary(results: &[TestResult], wall: f64) {
             );
         } else if let Some(f) = &r.failure {
             println!("  {} {:30}  [{}] {}", mark, r.name, f.kind, f.message.lines().next().unwrap_or(""));
+            if let Some(input) = &f.input_repr {
+                println!("       input:    main({})", input);
+            }
             if let (Some(exp), Some(act)) = (&f.expected, &f.actual) {
                 println!("       expected: {}", exp.trim_end());
                 println!("       actual  : {}", act.trim_end());

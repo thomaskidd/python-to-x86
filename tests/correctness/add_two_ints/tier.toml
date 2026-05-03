@@ -1,0 +1,6 @@
+tier = 1
+
+[iter_at]
+tier1 = 5
+tier2 = 100
+tier3 = 10_000

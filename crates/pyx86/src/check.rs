@@ -1,26 +1,25 @@
+use std::collections::HashSet;
+
 use anyhow::{anyhow, bail, Result};
 use rustpython_parser::ast;
 
-use crate::hir::{BinOp, Expr, Program, UnaryOp};
+use crate::hir::{BinOp, Expr, Function, Param, Program, Type, UnaryOp};
 use crate::parser::Module;
 
-/// Validate that the module is in the v0.2 supported subset and lower
-/// it to HIR. v0.2 supports:
+const MAX_PARAMS: usize = 16;
+
+/// Validate that the module is in the supported subset and lower it
+/// to HIR. v0.3 supports:
 ///
 /// ```text
-/// def main() -> int:
-///     return <int-expr>
+/// def main(<param>: int, …) -> int:
+///     return <expr>
 /// ```
 ///
-/// where `<int-expr>` is built from:
-/// - `int` literals
-/// - binary `+ - * // %`
-/// - unary `+x`, `-x`
-/// - parenthesisation
+/// where `<expr>` is built from int literals, parameter references,
+/// binary `+ - * // %`, unary `+x/-x`, and parens.
 ///
-/// Anything else produces an `unsupported_feature` error so future
-/// slices grow this match arm by arm — never silently falling back
-/// to dynamic semantics.
+/// Anything else produces an `unsupported_feature` error.
 pub fn lower(module: &Module) -> Result<Program> {
     if module.body.len() != 1 {
         bail!(
@@ -31,7 +30,7 @@ pub fn lower(module: &Module) -> Result<Program> {
     let func = match &module.body[0] {
         ast::Stmt::FunctionDef(f) => f,
         other => bail!(
-            "unsupported_feature: expected `def main()` at the top level, found {}",
+            "unsupported_feature: expected `def main(...)` at the top level, found {}",
             stmt_kind_name(other)
         ),
     };
@@ -42,46 +41,85 @@ pub fn lower(module: &Module) -> Result<Program> {
             func.name
         );
     }
-    if !func.args.args.is_empty()
-        || !func.args.posonlyargs.is_empty()
-        || !func.args.kwonlyargs.is_empty()
-        || func.args.vararg.is_some()
-        || func.args.kwarg.is_some()
-    {
-        bail!("unsupported_feature: v0.2 `main()` must take no arguments");
+    if !func.args.posonlyargs.is_empty() || !func.args.kwonlyargs.is_empty() {
+        bail!("unsupported_feature: positional-only and keyword-only parameters are not supported");
+    }
+    if func.args.vararg.is_some() || func.args.kwarg.is_some() {
+        bail!("unsupported_feature: *args / **kwargs are not supported");
+    }
+    // `defaults()` is a method on Arguments in rustpython-ast 0.4 that
+    // returns an iterator over the default expressions. Any default at
+    // all is rejected.
+    if func.args.defaults().next().is_some() {
+        bail!("unsupported_feature: default arguments are not supported");
     }
     if !func.decorator_list.is_empty() {
         bail!("unsupported_feature: decorators are not supported");
     }
-    match func.returns.as_deref() {
-        Some(ast::Expr::Name(n)) if n.id.as_str() == "int" => {}
-        Some(_) => bail!("unsupported_feature: v0.2 only supports `-> int` return annotation"),
-        None => bail!("unsupported_feature: v0.2 requires a return annotation `-> int`"),
+    if func.args.args.len() > MAX_PARAMS {
+        bail!(
+            "unsupported_feature: at most {} parameters supported, found {}",
+            MAX_PARAMS,
+            func.args.args.len()
+        );
     }
+
+    let mut params = Vec::with_capacity(func.args.args.len());
+    let mut seen = HashSet::new();
+    for arg in &func.args.args {
+        let name = arg.def.arg.as_str().to_string();
+        if !seen.insert(name.clone()) {
+            bail!("unsupported_feature: duplicate parameter name `{}`", name);
+        }
+        let ty = parse_type_annotation(arg.def.annotation.as_deref())
+            .ok_or_else(|| anyhow!("unsupported_feature: parameter `{}` must be annotated `: int`", name))?;
+        params.push(Param { name, ty });
+    }
+
+    let return_ty = match parse_type_annotation(func.returns.as_deref()) {
+        Some(ty) => ty,
+        None => bail!("unsupported_feature: requires a return annotation `-> int`"),
+    };
 
     if func.body.len() != 1 {
         bail!(
-            "unsupported_feature: v0.2 `main()` body must be a single `return` statement, found {} stmts",
+            "unsupported_feature: `main()` body must be a single `return` statement, found {} stmts",
             func.body.len()
         );
     }
     let ret = match &func.body[0] {
         ast::Stmt::Return(r) => r,
         other => bail!(
-            "unsupported_feature: v0.2 `main()` body must be `return <expr>`, found {}",
+            "unsupported_feature: `main()` body must be `return <expr>`, found {}",
             stmt_kind_name(other)
         ),
     };
-
     let value_expr = ret
         .value
         .as_deref()
-        .ok_or_else(|| anyhow!("unsupported_feature: v0.2 main() must return a value"))?;
-    let lowered = lower_expr(value_expr)?;
-    Ok(Program { main_return: lowered })
+        .ok_or_else(|| anyhow!("unsupported_feature: `main()` must return a value"))?;
+
+    let param_names: HashSet<&str> = params.iter().map(|p| p.name.as_str()).collect();
+    let body = lower_expr(value_expr, &param_names)?;
+
+    Ok(Program {
+        main: Function {
+            name: "main".to_string(),
+            params,
+            return_ty,
+            body,
+        },
+    })
 }
 
-fn lower_expr(e: &ast::Expr) -> Result<Expr> {
+fn parse_type_annotation(ann: Option<&ast::Expr>) -> Option<Type> {
+    match ann? {
+        ast::Expr::Name(n) if n.id.as_str() == "int" => Some(Type::I64),
+        _ => None,
+    }
+}
+
+fn lower_expr(e: &ast::Expr, params: &HashSet<&str>) -> Result<Expr> {
     match e {
         ast::Expr::Constant(c) => match &c.value {
             ast::Constant::Int(big) => {
@@ -90,8 +128,19 @@ fn lower_expr(e: &ast::Expr) -> Result<Expr> {
                 })?;
                 Ok(Expr::ConstI64(v))
             }
-            _ => bail!("unsupported_feature: only integer literals are supported in v0.2"),
+            _ => bail!("unsupported_feature: only integer literals are supported"),
         },
+        ast::Expr::Name(n) => {
+            let name = n.id.as_str();
+            if params.contains(name) {
+                Ok(Expr::Param(name.to_string()))
+            } else {
+                bail!(
+                    "unsupported_feature: name `{}` is not a parameter (locals not supported until v0.4)",
+                    name
+                )
+            }
+        }
         ast::Expr::BinOp(b) => {
             let op = match b.op {
                 ast::Operator::Add => BinOp::Add,
@@ -99,38 +148,38 @@ fn lower_expr(e: &ast::Expr) -> Result<Expr> {
                 ast::Operator::Mult => BinOp::Mul,
                 ast::Operator::FloorDiv => BinOp::FloorDiv,
                 ast::Operator::Mod => BinOp::Mod,
-                ast::Operator::Div => bail!("unsupported_feature: `/` (true division) is not in v0.2 — float support is deferred"),
-                ast::Operator::Pow => bail!("unsupported_feature: `**` (exponentiation) is not in v0.2"),
-                ast::Operator::MatMult => bail!("unsupported_feature: `@` (matmul) is not in v0.2"),
+                ast::Operator::Div => bail!(
+                    "unsupported_feature: `/` (true division) requires float support, not yet in scope"
+                ),
+                ast::Operator::Pow => bail!("unsupported_feature: `**` (exponentiation) is not yet supported"),
+                ast::Operator::MatMult => bail!("unsupported_feature: `@` (matmul) is not supported"),
                 ast::Operator::LShift | ast::Operator::RShift => {
-                    bail!("unsupported_feature: bit-shift operators are not in v0.2")
+                    bail!("unsupported_feature: bit-shift operators are not yet supported")
                 }
                 ast::Operator::BitOr | ast::Operator::BitXor | ast::Operator::BitAnd => {
-                    bail!("unsupported_feature: bitwise operators are not in v0.2")
+                    bail!("unsupported_feature: bitwise operators are not yet supported")
                 }
             };
             Ok(Expr::BinOp {
                 op,
-                lhs: Box::new(lower_expr(&b.left)?),
-                rhs: Box::new(lower_expr(&b.right)?),
+                lhs: Box::new(lower_expr(&b.left, params)?),
+                rhs: Box::new(lower_expr(&b.right, params)?),
             })
         }
         ast::Expr::UnaryOp(u) => {
             let op = match u.op {
                 ast::UnaryOp::USub => UnaryOp::Neg,
                 ast::UnaryOp::UAdd => UnaryOp::Pos,
-                ast::UnaryOp::Not => bail!("unsupported_feature: boolean `not` is not in v0.2"),
-                ast::UnaryOp::Invert => {
-                    bail!("unsupported_feature: bitwise `~` is not in v0.2")
-                }
+                ast::UnaryOp::Not => bail!("unsupported_feature: boolean `not` is not yet supported"),
+                ast::UnaryOp::Invert => bail!("unsupported_feature: bitwise `~` is not yet supported"),
             };
             Ok(Expr::UnaryOp {
                 op,
-                operand: Box::new(lower_expr(&u.operand)?),
+                operand: Box::new(lower_expr(&u.operand, params)?),
             })
         }
         other => bail!(
-            "unsupported_feature: expression form `{}` is not supported in v0.2",
+            "unsupported_feature: expression form `{}` is not supported",
             expr_kind_name(other)
         ),
     }
@@ -211,86 +260,72 @@ mod tests {
         parser::parse(src, &PathBuf::from("t.py")).unwrap()
     }
 
-    fn lower_main(src: &str) -> Expr {
-        lower(&parse(src)).unwrap().main_return
+    #[test]
+    fn lowers_no_param_main() {
+        let m = parse("def main() -> int:\n    return 42\n");
+        let p = lower(&m).unwrap();
+        assert_eq!(p.main.params.len(), 0);
+        assert!(matches!(p.main.body, Expr::ConstI64(42)));
     }
 
     #[test]
-    fn lowers_int_literal() {
-        assert!(matches!(lower_main("def main() -> int:\n    return 42\n"), Expr::ConstI64(42)));
-    }
-
-    #[test]
-    fn lowers_unary_minus() {
-        let e = lower_main("def main() -> int:\n    return -42\n");
-        match e {
-            Expr::UnaryOp { op: UnaryOp::Neg, operand } => {
-                assert!(matches!(*operand, Expr::ConstI64(42)));
-            }
-            _ => panic!("expected UnaryOp::Neg, got {:?}", e),
-        }
-    }
-
-    #[test]
-    fn lowers_binary_arith() {
-        let e = lower_main("def main() -> int:\n    return 1 + 2 * 3\n");
-        // 1 + (2 * 3) — Python's BinOp tree groups by precedence
-        match e {
+    fn lowers_two_param_main() {
+        let m = parse("def main(a: int, b: int) -> int:\n    return a + b\n");
+        let p = lower(&m).unwrap();
+        assert_eq!(p.main.params.len(), 2);
+        assert_eq!(p.main.params[0].name, "a");
+        assert_eq!(p.main.params[1].name, "b");
+        match &p.main.body {
             Expr::BinOp { op: BinOp::Add, lhs, rhs } => {
-                assert!(matches!(*lhs, Expr::ConstI64(1)));
-                assert!(matches!(*rhs, Expr::BinOp { op: BinOp::Mul, .. }));
+                assert!(matches!(**lhs, Expr::Param(ref n) if n == "a"));
+                assert!(matches!(**rhs, Expr::Param(ref n) if n == "b"));
             }
-            _ => panic!("expected Add at top, got {:?}", e),
+            other => panic!("expected Add of params, got {:?}", other),
         }
     }
 
     #[test]
-    fn lowers_floordiv_and_mod() {
-        let e = lower_main("def main() -> int:\n    return 100 // 7\n");
-        assert!(matches!(e, Expr::BinOp { op: BinOp::FloorDiv, .. }));
-        let e = lower_main("def main() -> int:\n    return 100 % 7\n");
-        assert!(matches!(e, Expr::BinOp { op: BinOp::Mod, .. }));
+    fn rejects_unannotated_param() {
+        let m = parse("def main(a) -> int:\n    return a\n");
+        let err = lower(&m).unwrap_err();
+        assert!(format!("{}", err).contains("annotated"));
     }
 
     #[test]
-    fn rejects_true_division() {
-        let m = parse("def main() -> int:\n    return 7 / 2\n");
+    fn rejects_non_int_param_annotation() {
+        let m = parse("def main(a: str) -> int:\n    return 0\n");
         let err = lower(&m).unwrap_err();
-        assert!(format!("{}", err).contains("true division"));
+        assert!(format!("{}", err).contains("annotated"));
     }
 
     #[test]
-    fn rejects_pow() {
-        let m = parse("def main() -> int:\n    return 2 ** 8\n");
+    fn rejects_unknown_name_reference() {
+        let m = parse("def main(a: int) -> int:\n    return a + b\n");
         let err = lower(&m).unwrap_err();
-        assert!(format!("{}", err).contains("exponentiation"));
+        let msg = format!("{}", err);
+        assert!(msg.contains("`b`") && msg.contains("not a parameter"));
     }
 
     #[test]
-    fn rejects_bitwise() {
-        let m = parse("def main() -> int:\n    return 1 | 2\n");
+    fn rejects_default_arguments() {
+        let m = parse("def main(a: int = 0) -> int:\n    return a\n");
         let err = lower(&m).unwrap_err();
-        assert!(format!("{}", err).contains("bitwise"));
+        assert!(format!("{}", err).contains("default"));
+    }
+
+    #[test]
+    fn rejects_too_many_params() {
+        let names: Vec<String> = (0..MAX_PARAMS + 1).map(|i| format!("p{}: int", i)).collect();
+        let src = format!("def main({}) -> int:\n    return 0\n", names.join(", "));
+        let m = parse(&src);
+        let err = lower(&m).unwrap_err();
+        assert!(format!("{}", err).contains("at most"));
     }
 
     #[test]
     fn rejects_missing_return_annotation() {
-        let m = parse("def main():\n    return 0\n");
+        let m = parse("def main(a: int):\n    return a\n");
         let err = lower(&m).unwrap_err();
         assert!(format!("{}", err).contains("return annotation"));
-    }
-
-    #[test]
-    fn rejects_non_main_function() {
-        let m = parse("def foo() -> int:\n    return 1\n");
-        let err = lower(&m).unwrap_err();
-        assert!(format!("{}", err).contains("`main`"));
-    }
-
-    #[test]
-    fn rejects_variable_reference() {
-        let m = parse("def main() -> int:\n    return x\n");
-        let err = lower(&m).unwrap_err();
-        assert!(format!("{}", err).contains("Name"));
     }
 }

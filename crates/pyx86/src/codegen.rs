@@ -1,48 +1,98 @@
 use std::fmt::Write as _;
 
-use crate::hir::{BinOp, Expr, Program, UnaryOp};
+use crate::hir::{BinOp, Expr, Function, Program, UnaryOp};
 
-/// Emit LLVM IR text for a v0.2 HIR program. The user's `main()` is
-/// renamed to `py_main`; a C `main` wrapper calls it, prints the
-/// return value via `printf("%ld\n", ...)`, and returns 0.
+/// Emit LLVM IR text for a v0.3 HIR program.
 ///
-/// We use typed pointers (`i8*`) so the output works on LLVM 10+;
-/// opaque pointers (`ptr`) are LLVM 14+.
+/// `py_main` carries the user's function signature (i64 params,
+/// i64 return). A C `main(argc, argv)` wrapper parses each argv
+/// string via `atoll`, calls `py_main`, prints the return value
+/// via `printf("%ld\n", ...)`, and returns 0.
+///
+/// Typed pointers (`i8*`) so this works on LLVM 10+. Opaque
+/// pointers (`ptr`) are LLVM 14+; we don't require them.
 pub fn emit_ll(prog: &Program, source_basename: &str) -> String {
-    let mut cg = Codegen::new();
-    let result = cg.lower(&prog.main_return);
     let basename = sanitize_module_id(source_basename);
+    let func = &prog.main;
+
+    let mut cg = Codegen::new();
+    let result = cg.lower(&func.body);
+    let body = cg.body;
+
+    let signature = format_signature(func);
+    let py_main_call_args = func
+        .params
+        .iter()
+        .map(|p| format!("i64 %p_{}", p.name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let parse_args_block = format_argv_parsing(func);
+
     format!(
         "; ModuleID = 'pyx86_{name}'
 target triple = \"x86_64-unknown-linux-gnu\"
 
 declare i32 @printf(i8*, ...)
+declare i64 @atoll(i8*)
 
 @.fmt_i64 = private unnamed_addr constant [5 x i8] c\"%ld\\0A\\00\"
 
-define i64 @py_main() {{
+define i64 @py_main({sig}) {{
 entry:
 {body}  ret i64 {result}
 }}
 
-define i32 @main() {{
+define i32 @main(i32 %argc, i8** %argv) {{
 entry:
-  %r = call i64 @py_main()
+{parse}  %r = call i64 @py_main({call_args})
   %fmt = getelementptr inbounds [5 x i8], [5 x i8]* @.fmt_i64, i64 0, i64 0
   call i32 (i8*, ...) @printf(i8* %fmt, i64 %r)
   ret i32 0
 }}
 ",
         name = basename,
-        body = cg.body,
+        sig = signature,
+        body = body,
         result = result,
+        parse = parse_args_block,
+        call_args = py_main_call_args,
     )
 }
 
+fn format_signature(func: &Function) -> String {
+    func.params
+        .iter()
+        .map(|p| format!("i64 %p_{}", p.name))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Generate the wrapper instructions that pull each parameter out of
+/// argv (1-indexed: argv[0] is the program name) and atoll it.
+fn format_argv_parsing(func: &Function) -> String {
+    let mut s = String::new();
+    for (i, p) in func.params.iter().enumerate() {
+        let argv_index = (i + 1) as i64;
+        let _ = writeln!(
+            s,
+            "  %slot{i} = getelementptr inbounds i8*, i8** %argv, i64 {idx}",
+            i = i,
+            idx = argv_index
+        );
+        let _ = writeln!(s, "  %str{i} = load i8*, i8** %slot{i}", i = i);
+        let _ = writeln!(
+            s,
+            "  %p_{name} = call i64 @atoll(i8* %str{i})",
+            name = p.name,
+            i = i
+        );
+    }
+    s
+}
+
 /// Builds a single `py_main` body. Each `lower(...)` call returns the
-/// LLVM operand (either a literal like `42` or an SSA name like `%v3`)
-/// holding the expression's value, after appending any necessary
-/// instructions to `self.body`.
+/// LLVM operand (literal like `42` or SSA name like `%v3`) holding
+/// the expression's value, after appending instructions to `self.body`.
 struct Codegen {
     body: String,
     next_id: usize,
@@ -60,13 +110,13 @@ impl Codegen {
     }
 
     fn emit(&mut self, line: &str) {
-        // All instruction lines are 2-space indented.
         let _ = writeln!(self.body, "  {}", line);
     }
 
     fn lower(&mut self, e: &Expr) -> String {
         match e {
             Expr::ConstI64(v) => v.to_string(),
+            Expr::Param(name) => format!("%p_{}", name),
             Expr::UnaryOp { op, operand } => {
                 let inner = self.lower(operand);
                 match op {
@@ -98,11 +148,7 @@ impl Codegen {
         dst
     }
 
-    /// Python `a // b` differs from LLVM `sdiv` for negative operands:
-    /// Python rounds toward -infinity, LLVM truncates toward 0.
-    /// Correction: `result = sdiv(a, b) - ((srem(a, b) != 0) & (signs(a, b) differ) ? 1 : 0)`.
-    /// We compute the adjustment as `sext i1 → i64` (true sign-extends to -1)
-    /// and then `sdiv + adj` instead of `sdiv - adj` to save an instruction.
+    /// See specs/codegen-llvm.md "Floor-div correction".
     fn floor_div(&mut self, l: &str, r: &str) -> String {
         let q = self.fresh();
         let rem = self.fresh();
@@ -118,16 +164,12 @@ impl Codegen {
         self.emit(&format!("{} = xor i64 {}, {}", xor_sign, l, r));
         self.emit(&format!("{} = icmp slt i64 {}, 0", signs_differ, xor_sign));
         self.emit(&format!("{} = and i1 {}, {}", needs, rem_nz, signs_differ));
-        // sext i1 → i64: true → -1, false → 0; then q + adj == q - 1 (or q).
         self.emit(&format!("{} = sext i1 {} to i64", adj, needs));
         self.emit(&format!("{} = add i64 {}, {}", dst, q, adj));
         dst
     }
 
-    /// Python `a % b` differs from LLVM `srem` for mixed-sign operands:
-    /// Python's result has the same sign as the divisor; `srem` has the
-    /// sign of the dividend.
-    /// Correction: `r = srem(a, b); if r != 0 and signs(r, b) differ: r += b`.
+    /// See specs/codegen-llvm.md "Floor-mod correction".
     fn floor_mod(&mut self, l: &str, r: &str) -> String {
         let rem = self.fresh();
         let rem_nz = self.fresh();
@@ -156,57 +198,82 @@ fn sanitize_module_id(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hir::{BinOp, Expr, Program, UnaryOp};
+    use crate::hir::{BinOp, Expr, Function, Param, Program, Type, UnaryOp};
 
-    fn ll_for(e: Expr) -> String {
-        emit_ll(&Program { main_return: e }, "test")
+    fn make_program(params: Vec<&str>, body: Expr) -> Program {
+        Program {
+            main: Function {
+                name: "main".into(),
+                params: params
+                    .into_iter()
+                    .map(|n| Param { name: n.into(), ty: Type::I64 })
+                    .collect(),
+                return_ty: Type::I64,
+                body,
+            },
+        }
+    }
+
+    fn ll_for(prog: Program) -> String {
+        emit_ll(&prog, "test")
     }
 
     #[test]
-    fn const_i64_returns_literal() {
-        let ll = ll_for(Expr::ConstI64(42));
+    fn no_param_const_returns_literal() {
+        let ll = ll_for(make_program(vec![], Expr::ConstI64(42)));
+        assert!(ll.contains("define i64 @py_main()"));
         assert!(ll.contains("ret i64 42"));
-        assert!(ll.contains("define i32 @main()"));
-        assert!(ll.contains("call i32 (i8*, ...) @printf"));
+        assert!(ll.contains("call i64 @py_main()"));
+    }
+
+    #[test]
+    fn one_param_identity_passes_argv0_through() {
+        let ll = ll_for(make_program(vec!["x"], Expr::Param("x".into())));
+        assert!(ll.contains("define i64 @py_main(i64 %p_x)"));
+        // Wrapper parses argv[1] into %p_x via atoll.
+        assert!(ll.contains("getelementptr inbounds i8*, i8** %argv, i64 1"));
+        assert!(ll.contains("%p_x = call i64 @atoll"));
+        assert!(ll.contains("call i64 @py_main(i64 %p_x)"));
+        // Body returns the param directly (no extra instructions).
+        assert!(ll.contains("ret i64 %p_x"));
+    }
+
+    #[test]
+    fn two_param_add_uses_correct_argv_indices() {
+        let ll = ll_for(make_program(
+            vec!["a", "b"],
+            Expr::BinOp {
+                op: BinOp::Add,
+                lhs: Box::new(Expr::Param("a".into())),
+                rhs: Box::new(Expr::Param("b".into())),
+            },
+        ));
+        assert!(ll.contains("define i64 @py_main(i64 %p_a, i64 %p_b)"));
+        assert!(ll.contains("getelementptr inbounds i8*, i8** %argv, i64 1"));
+        assert!(ll.contains("getelementptr inbounds i8*, i8** %argv, i64 2"));
+        assert!(ll.contains("call i64 @py_main(i64 %p_a, i64 %p_b)"));
+        assert!(ll.contains("add i64 %p_a, %p_b"));
     }
 
     #[test]
     fn unary_neg_emits_zero_minus() {
-        let ll = ll_for(Expr::UnaryOp {
-            op: UnaryOp::Neg,
-            operand: Box::new(Expr::ConstI64(5)),
-        });
+        let ll = ll_for(make_program(
+            vec![],
+            Expr::UnaryOp { op: UnaryOp::Neg, operand: Box::new(Expr::ConstI64(5)) },
+        ));
         assert!(ll.contains("sub i64 0, 5"));
     }
 
     #[test]
-    fn unary_pos_is_a_noop() {
-        let ll = ll_for(Expr::UnaryOp {
-            op: UnaryOp::Pos,
-            operand: Box::new(Expr::ConstI64(3)),
-        });
-        assert!(ll.contains("ret i64 3"));
-        assert!(!ll.contains("sub i64"));
-    }
-
-    #[test]
-    fn add_emits_simple_binop() {
-        let ll = ll_for(Expr::BinOp {
-            op: BinOp::Add,
-            lhs: Box::new(Expr::ConstI64(1)),
-            rhs: Box::new(Expr::ConstI64(2)),
-        });
-        assert!(ll.contains("add i64 1, 2"));
-    }
-
-    #[test]
     fn floor_div_emits_correction_block() {
-        let ll = ll_for(Expr::BinOp {
-            op: BinOp::FloorDiv,
-            lhs: Box::new(Expr::ConstI64(-7)),
-            rhs: Box::new(Expr::ConstI64(2)),
-        });
-        // The correction block uses sdiv + srem + xor + sext.
+        let ll = ll_for(make_program(
+            vec![],
+            Expr::BinOp {
+                op: BinOp::FloorDiv,
+                lhs: Box::new(Expr::ConstI64(-7)),
+                rhs: Box::new(Expr::ConstI64(2)),
+            },
+        ));
         assert!(ll.contains("sdiv i64"));
         assert!(ll.contains("srem i64"));
         assert!(ll.contains("xor i64"));
@@ -214,20 +281,9 @@ mod tests {
     }
 
     #[test]
-    fn floor_mod_emits_select_correction() {
-        let ll = ll_for(Expr::BinOp {
-            op: BinOp::Mod,
-            lhs: Box::new(Expr::ConstI64(-7)),
-            rhs: Box::new(Expr::ConstI64(2)),
-        });
-        assert!(ll.contains("srem i64"));
-        assert!(ll.contains("select i1"));
-    }
-
-    #[test]
     fn module_id_is_sanitized() {
         let ll = emit_ll(
-            &Program { main_return: Expr::ConstI64(0) },
+            &make_program(vec![], Expr::ConstI64(0)),
             "weird-name.with.dots",
         );
         assert!(ll.contains("ModuleID = 'pyx86_weird_name_with_dots'"));

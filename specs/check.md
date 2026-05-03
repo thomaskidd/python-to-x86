@@ -16,17 +16,18 @@ In later slices this module evolves into a full type-inference pass and is renam
 ## Current accepted shape
 
 ```text
-def main() -> int:
+def main(<param>: int, …) -> int:
     return <expr>
 ```
 
-with `<expr>` built from:
+with up to 16 typed `int` parameters, and `<expr>` built from:
 - integer literals (must fit i64)
+- parameter references (`Name` nodes that resolve to a declared param)
 - binary operators `+ - * // %`
 - unary operators `+x`, `-x`
 - parentheses (transparent in the AST)
 
-Anything else — different function name, parameters, decorators, missing/wrong return annotation, multiple top-level statements, unsupported expression forms, division by `/`, exponentiation, bitwise, names, calls, comprehensions, etc. — produces `unsupported_feature: <reason>`.
+Anything else — different function name, untyped/non-int parameters, default args, decorators, missing/wrong return annotation, local variable assignment, multiple top-level statements, unsupported expression forms, division by `/`, exponentiation, bitwise, calls, comprehensions, etc. — produces `unsupported_feature: <reason>`. References to names that aren't parameters (locals) are explicitly rejected with a "locals not supported until v0.4" hint.
 
 ## Why not infer types here
 

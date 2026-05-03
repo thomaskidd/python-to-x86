@@ -1,0 +1,13 @@
+# Tight bounds: (a+b)*c shouldn't overflow even at worst case.
+# Worst case: 1e6 * 1e3 = 1e9, well within i64.
+[[arg]]
+type = "i64"
+range = [-1_000_000, 1_000_000]
+
+[[arg]]
+type = "i64"
+range = [-1_000_000, 1_000_000]
+
+[[arg]]
+type = "i64"
+range = [-1_000, 1_000]
