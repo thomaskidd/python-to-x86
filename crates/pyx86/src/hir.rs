@@ -134,6 +134,10 @@ pub enum BinOp {
     BitXor,
     Shl,
     Shr,
+    /// `a ** b` for integer exponent. For negative exp, Python returns
+    /// a float; we don't have float yet, so we return 0 in that case
+    /// — a documented divergence. Overflow wraps (vs Python bigint).
+    Pow,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

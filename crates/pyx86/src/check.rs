@@ -255,9 +255,7 @@ fn lower_block(
                     ast::Operator::Div => bail!(
                         "unsupported_feature: `/=` (true division) is not yet supported"
                     ),
-                    ast::Operator::Pow => bail!(
-                        "unsupported_feature: `**=` is not yet supported"
-                    ),
+                    ast::Operator::Pow => BinOp::Pow,
                     ast::Operator::MatMult => bail!(
                         "unsupported_feature: `@=` (matmul) is not supported"
                     ),
@@ -387,7 +385,7 @@ fn lower_expr(e: &ast::Expr, scope: &HashSet<String>, signatures: &SignatureTabl
                 ast::Operator::Div => bail!(
                     "unsupported_feature: `/` (true division) requires float support, not yet in scope"
                 ),
-                ast::Operator::Pow => bail!("unsupported_feature: `**` (exponentiation) is not yet supported"),
+                ast::Operator::Pow => BinOp::Pow,
                 ast::Operator::MatMult => bail!("unsupported_feature: `@` (matmul) is not supported"),
                 ast::Operator::LShift => BinOp::Shl,
                 ast::Operator::RShift => BinOp::Shr,

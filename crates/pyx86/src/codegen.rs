@@ -47,7 +47,7 @@ declare i64 @atoll(i8*)
 
 @.fmt_i64 = private unnamed_addr constant [5 x i8] c\"%ld\\0A\\00\"
 
-{defs}define i32 @main(i32 %argc, i8** %argv) {{
+{runtime}{defs}define i32 @main(i32 %argc, i8** %argv) {{
 entry:
 {parse}  %r = call i64 @py_main({call_args})
   %fmt = getelementptr inbounds [5 x i8], [5 x i8]* @.fmt_i64, i64 0, i64 0
@@ -56,11 +56,65 @@ entry:
 }}
 ",
         name = basename,
+        runtime = RUNTIME_HELPERS,
         defs = function_defs,
         parse = parse_args_block,
         call_args = py_main_call_args,
     )
 }
+
+/// Runtime helpers emitted in every module. Internal-linkage so LLVM
+/// drops them via DCE if unused. mem2reg + inlining at -O2 will
+/// inline small calls (pow with a constant exponent) and keep the
+/// body as a real function for general use.
+const RUNTIME_HELPERS: &str = "\
+; pyx86_pow(base, exp) — integer ** by binary exponentiation.
+; For exp < 0 we return 0 (Python returns a float there; we have no
+; float type yet — documented divergence). For exp == 0 we return 1
+; (Python: 0**0 == 1, matches).
+define internal i64 @pyx86_pow(i64 %base, i64 %exp) {
+entry:
+  %neg = icmp slt i64 %exp, 0
+  br i1 %neg, label %neg_exit, label %init
+neg_exit:
+  ret i64 0
+init:
+  %r.addr = alloca i64
+  %b.addr = alloca i64
+  %e.addr = alloca i64
+  store i64 1, i64* %r.addr
+  store i64 %base, i64* %b.addr
+  store i64 %exp, i64* %e.addr
+  br label %loop_header
+loop_header:
+  %e0 = load i64, i64* %e.addr
+  %done = icmp eq i64 %e0, 0
+  br i1 %done, label %loop_exit, label %loop_body
+loop_body:
+  %e1 = load i64, i64* %e.addr
+  %odd_bit = and i64 %e1, 1
+  %is_odd = icmp ne i64 %odd_bit, 0
+  br i1 %is_odd, label %mul_r, label %skip_mul
+mul_r:
+  %r0 = load i64, i64* %r.addr
+  %b0 = load i64, i64* %b.addr
+  %r1 = mul i64 %r0, %b0
+  store i64 %r1, i64* %r.addr
+  br label %skip_mul
+skip_mul:
+  %b1 = load i64, i64* %b.addr
+  %b2 = mul i64 %b1, %b1
+  store i64 %b2, i64* %b.addr
+  %e2 = load i64, i64* %e.addr
+  %e3 = ashr i64 %e2, 1
+  store i64 %e3, i64* %e.addr
+  br label %loop_header
+loop_exit:
+  %r_final = load i64, i64* %r.addr
+  ret i64 %r_final
+}
+
+";
 
 fn format_signature(func: &Function) -> String {
     func.params
@@ -323,6 +377,17 @@ impl Codegen {
                     // for shift count >= bit width. Test programs stay within [0, 63].
                     BinOp::Shl => self.simple_binop("shl", &l, &r),
                     BinOp::Shr => self.simple_binop("ashr", &l, &r),
+                    BinOp::Pow => {
+                        // Always lower to a call into the runtime
+                        // helper. LLVM inlines small uses; otherwise
+                        // it stays a function call.
+                        let dst = self.fresh();
+                        self.emit(&format!(
+                            "{} = call i64 @pyx86_pow(i64 {}, i64 {})",
+                            dst, l, r
+                        ));
+                        dst
+                    }
                 }
             }
             Expr::Cmp { .. } | Expr::CmpChain { .. } | Expr::Not(_) => {
