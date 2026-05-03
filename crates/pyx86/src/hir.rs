@@ -89,6 +89,17 @@ pub enum Expr {
     /// i64 operands) or as a direct i1 for nested Cmp/Not. Always
     /// produces i64 0 or 1.
     Not(Box<Expr>),
+    /// Python `and` / `or` with short-circuit value semantics:
+    /// - `a and b` = a if a is falsy else b
+    /// - `a or  b` = a if a is truthy else b
+    /// Lowered as a branch on `a`'s truthiness, with `b` evaluated
+    /// only on the branch where it's used. Each chains naturally:
+    /// `a and b and c` parses as nested BoolOp(And, BoolOp(And, a, b), c).
+    BoolOp {
+        op: BoolOp,
+        lhs: Box<Expr>,
+        rhs: Box<Expr>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,4 +125,10 @@ pub enum CmpOp {
     Ge,
     Eq,
     Ne,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoolOp {
+    And,
+    Or,
 }

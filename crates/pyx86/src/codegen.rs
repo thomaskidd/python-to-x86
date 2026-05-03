@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::fmt::Write as _;
 
-use crate::hir::{BinOp, CmpOp, Expr, Function, Program, Stmt, UnaryOp};
+use crate::hir::{BinOp, BoolOp, CmpOp, Expr, Function, Program, Stmt, UnaryOp};
 
 /// Emit LLVM IR text for a v0.5 HIR program (`if`/`elif`/`else`,
 /// comparisons, early `return`, `not`, truthy int conditions).
@@ -311,11 +311,68 @@ impl Codegen {
                 self.emit(&format!("{} = zext i1 {} to i64", dst, i1));
                 dst
             }
+            Expr::BoolOp { op, lhs, rhs } => self.lower_bool_op_value(*op, lhs, rhs),
         }
+    }
+
+    /// Lower `a and b` / `a or b` in value context, with proper
+    /// short-circuit value semantics (returns the actual operand
+    /// value, not just a 0/1 — Python's `5 and 7 == 7`).
+    ///
+    /// Strategy: evaluate `lhs` into a temp slot. If it short-circuits
+    /// (and: lhs falsy; or: lhs truthy) we keep it; otherwise we
+    /// overwrite the slot with `rhs`. We use a per-call fresh stack
+    /// slot so nested BoolOps don't collide.
+    fn lower_bool_op_value(&mut self, op: BoolOp, lhs: &Expr, rhs: &Expr) -> String {
+        // Allocate a temp slot. To avoid generating allocas late in
+        // the function (which mem2reg handles fine but is unusual),
+        // we just emit it inline; LLVM will hoist allocas to entry
+        // and mem2reg will collapse them.
+        let slot_id = self.next_id;
+        self.next_id += 1;
+        let slot = format!("%bool.{}.addr", slot_id);
+        self.emit(&format!("{} = alloca i64", slot));
+
+        let lhs_op = self.lower(lhs);
+        self.emit(&format!("store i64 {}, i64* {}", lhs_op, slot));
+
+        let cond = self.fresh();
+        self.emit(&format!("{} = icmp ne i64 {}, 0", cond, lhs_op));
+
+        let id = self.next_block_id;
+        self.next_block_id += 1;
+        let eval_rhs_lbl = format!("bool.eval_rhs.{}", id);
+        let merge_lbl = format!("bool.merge.{}", id);
+
+        // For AND: short-circuit when lhs is FALSY (skip rhs); evaluate rhs only when TRUTHY.
+        // For OR:  short-circuit when lhs is TRUTHY (skip rhs); evaluate rhs only when FALSY.
+        let (truthy_label, falsy_label) = match op {
+            BoolOp::And => (eval_rhs_lbl.as_str(), merge_lbl.as_str()),
+            BoolOp::Or => (merge_lbl.as_str(), eval_rhs_lbl.as_str()),
+        };
+        self.emit(&format!(
+            "br i1 {}, label %{}, label %{}",
+            cond, truthy_label, falsy_label
+        ));
+        self.block_terminated = true;
+
+        self.open_block(&eval_rhs_lbl);
+        let rhs_op = self.lower(rhs);
+        self.emit(&format!("store i64 {}, i64* {}", rhs_op, slot));
+        self.emit(&format!("br label %{}", merge_lbl));
+        self.block_terminated = true;
+
+        self.open_block(&merge_lbl);
+        let dst = self.fresh();
+        self.emit(&format!("{} = load i64, i64* {}", dst, slot));
+        dst
     }
 
     /// Lower an expression in a condition (i1) context. Comparisons /
     /// not return i1 directly; everything else gets a `!= 0` coercion.
+    /// BoolOps fall through to the value-context path then `!= 0`,
+    /// which composes the short-circuit branches with the outer
+    /// truthiness check; LLVM cleans up.
     fn lower_cond(&mut self, e: &Expr) -> String {
         match e {
             Expr::Cmp { .. } | Expr::CmpChain { .. } | Expr::Not(_) => self.lower_i1(e),
