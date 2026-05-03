@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/pyx86",
     "crates/pyx86_bench",
 ]
 
