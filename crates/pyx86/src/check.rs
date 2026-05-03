@@ -714,6 +714,218 @@ fn lower_expr(e: &ast::Expr, scope: &Scope, signatures: &SignatureTable) -> Resu
                 Expr::TupleLit { elements },
             ))
         }
+        ast::Expr::ListComp(comp) => {
+            // [<elt> for <target> in <iter> (if <cond>)*]
+            // Only one generator supported in v0.21.
+            if comp.generators.len() != 1 {
+                bail!(
+                    "unsupported_feature: nested generators in list comprehensions are not supported"
+                );
+            }
+            let gen = &comp.generators[0];
+            if gen.is_async {
+                bail!("unsupported_feature: async comprehensions are not supported");
+            }
+            let target_name = match &gen.target {
+                ast::Expr::Name(n) => n.id.as_str().to_string(),
+                _ => bail!(
+                    "unsupported_feature: comprehension target must be a simple name"
+                ),
+            };
+
+            // Determine target's type from the iter.
+            let is_range_call = matches!(
+                &gen.iter,
+                ast::Expr::Call(c) if matches!(c.func.as_ref(), ast::Expr::Name(n) if n.id.as_str() == "range")
+            );
+
+            // Build a fresh inner scope so loop var + accumulator don't leak.
+            let mut inner_scope = scope.clone();
+
+            // Synthesise unique names for accumulator and (if iterating
+            // over a list) helper vars. Use the global scope size as a
+            // unique suffix.
+            let uniq = scope.len();
+            let acc_name = format!("__compr_acc_{}", uniq);
+            let lst_name = format!("__compr_lst_{}", uniq);
+            let idx_name = format!("__compr_idx_{}", uniq);
+
+            // Lower the iter and figure out the element type.
+            let elem_ty: Type;
+            let iter_lowered: Option<TypedExpr>;
+            let start_stop_step: Option<(TypedExpr, TypedExpr, TypedExpr)>;
+            if is_range_call {
+                let (start, stop, step) =
+                    parse_and_lower_range(&gen.iter, &inner_scope, signatures)?;
+                let step_value = match &step.expr {
+                    Expr::ConstI64(v) => *v,
+                    _ => bail!("unsupported_feature: range step must be a constant int literal"),
+                };
+                if step_value <= 0 {
+                    bail!("unsupported_feature: range step must be a positive int literal");
+                }
+                elem_ty = Type::I64;
+                iter_lowered = None;
+                start_stop_step = Some((start, stop, step));
+                inner_scope.insert(target_name.clone(), Type::I64);
+            } else {
+                let iter = lower_expr(&gen.iter, &inner_scope, signatures)?;
+                let elem = match iter.ty {
+                    Type::List(id) => id.elem(),
+                    other => bail!(
+                        "unsupported_feature: comprehension iter must be range(...) or list[T] (got {})",
+                        other.name()
+                    ),
+                };
+                elem_ty = elem;
+                iter_lowered = Some(iter);
+                start_stop_step = None;
+                inner_scope.insert(target_name.clone(), elem);
+            }
+
+            // Lower the elt expression in the inner scope.
+            let elt_lowered = lower_expr(&comp.elt, &inner_scope, signatures)?;
+            let result_elem_ty = elt_lowered.ty;
+            let acc_list_id = ListId::intern(result_elem_ty);
+            let acc_ty = Type::List(acc_list_id);
+
+            // Lower any `if` clauses (Python supports multiple, AND-ed).
+            // Combine into a single Bool expression with ad-hoc And.
+            let mut filter_cond: Option<TypedExpr> = None;
+            for if_e in &gen.ifs {
+                let c = lower_expr(if_e, &inner_scope, signatures)?;
+                let c = coerce(c, Type::Bool)?;
+                filter_cond = Some(match filter_cond {
+                    None => c,
+                    Some(prev) => TypedExpr::new(
+                        Type::Bool,
+                        Expr::BoolOp {
+                            op: BoolOp::And,
+                            lhs: Box::new(coerce(prev, Type::I64)?),
+                            rhs: Box::new(coerce(c, Type::I64)?),
+                        },
+                    ),
+                });
+            }
+            // Renormalise filter_cond back to Bool for the If statement.
+            let filter_cond_bool = filter_cond.map(|c| coerce(c, Type::Bool).unwrap());
+
+            // Build the body of the loop:
+            //   one_elem = [elt]
+            //   if cond: acc = acc + one_elem
+            //   else: skip
+            let one_elem_list = TypedExpr::new(
+                acc_ty,
+                Expr::ListLit { elements: vec![elt_lowered] },
+            );
+            let append = Stmt::Let {
+                name: acc_name.clone(),
+                value: TypedExpr::new(
+                    acc_ty,
+                    Expr::ListConcat {
+                        lhs: Box::new(TypedExpr::new(acc_ty, Expr::Var(acc_name.clone()))),
+                        rhs: Box::new(one_elem_list),
+                    },
+                ),
+            };
+            let body_stmt = match filter_cond_bool {
+                Some(cond) => Stmt::If {
+                    cond,
+                    then_body: vec![append],
+                    else_body: vec![],
+                },
+                None => append,
+            };
+
+            // Build the surrounding `for` desugar.
+            let mut stmts: Vec<Stmt> = Vec::new();
+            // acc = []
+            stmts.push(Stmt::Let {
+                name: acc_name.clone(),
+                value: TypedExpr::new(
+                    acc_ty,
+                    Expr::ListLit { elements: Vec::new() },
+                ),
+            });
+
+            if let Some((start, stop, step)) = start_stop_step {
+                // for target in range(...):
+                stmts.push(Stmt::Let { name: target_name.clone(), value: start });
+                let cond = TypedExpr::new(
+                    Type::Bool,
+                    Expr::Cmp {
+                        op: CmpOp::Lt,
+                        lhs: Box::new(TypedExpr::new(Type::I64, Expr::Var(target_name.clone()))),
+                        rhs: Box::new(stop),
+                    },
+                );
+                let mut wbody = vec![body_stmt];
+                wbody.push(Stmt::Let {
+                    name: target_name.clone(),
+                    value: TypedExpr::new(
+                        Type::I64,
+                        Expr::BinOp {
+                            op: BinOp::Add,
+                            lhs: Box::new(TypedExpr::new(Type::I64, Expr::Var(target_name.clone()))),
+                            rhs: Box::new(step),
+                        },
+                    ),
+                });
+                stmts.push(Stmt::While { cond, body: wbody });
+            } else {
+                // for target in <list>:
+                let iter = iter_lowered.unwrap();
+                let iter_ty = iter.ty;
+                stmts.push(Stmt::Let { name: lst_name.clone(), value: iter });
+                stmts.push(Stmt::Let {
+                    name: idx_name.clone(),
+                    value: TypedExpr::new(Type::I64, Expr::ConstI64(0)),
+                });
+                let lst_ref = TypedExpr::new(iter_ty, Expr::Var(lst_name.clone()));
+                let cond = TypedExpr::new(
+                    Type::Bool,
+                    Expr::Cmp {
+                        op: CmpOp::Lt,
+                        lhs: Box::new(TypedExpr::new(Type::I64, Expr::Var(idx_name.clone()))),
+                        rhs: Box::new(TypedExpr::new(
+                            Type::I64,
+                            Expr::ListLen { list: Box::new(lst_ref.clone()) },
+                        )),
+                    },
+                );
+                let mut wbody = vec![Stmt::Let {
+                    name: target_name.clone(),
+                    value: TypedExpr::new(
+                        elem_ty,
+                        Expr::ListIndex {
+                            list: Box::new(lst_ref),
+                            index: Box::new(TypedExpr::new(Type::I64, Expr::Var(idx_name.clone()))),
+                        },
+                    ),
+                }];
+                wbody.push(body_stmt);
+                wbody.push(Stmt::Let {
+                    name: idx_name.clone(),
+                    value: TypedExpr::new(
+                        Type::I64,
+                        Expr::BinOp {
+                            op: BinOp::Add,
+                            lhs: Box::new(TypedExpr::new(Type::I64, Expr::Var(idx_name))),
+                            rhs: Box::new(TypedExpr::new(Type::I64, Expr::ConstI64(1))),
+                        },
+                    ),
+                });
+                stmts.push(Stmt::While { cond, body: wbody });
+            }
+
+            return Ok(TypedExpr::new(
+                acc_ty,
+                Expr::DoBlock {
+                    stmts,
+                    result: Box::new(TypedExpr::new(acc_ty, Expr::Var(acc_name))),
+                },
+            ));
+        }
         ast::Expr::List(l) => {
             // List literal: `[a, b, c]`. All elements must be coercible
             // to a common type. Empty `[]` produces a List of element

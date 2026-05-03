@@ -487,6 +487,10 @@ impl Codegen {
             Expr::ListIndex { list, index } => self.lower_list_index(list, index, te.ty),
             Expr::ListLen { list } => self.lower_list_len(list),
             Expr::ListConcat { lhs, rhs } => self.lower_list_concat(lhs, rhs, te.ty),
+            Expr::DoBlock { stmts, result } => {
+                self.lower_block(stmts);
+                self.lower(result)
+            }
         }
     }
 
@@ -1151,25 +1155,74 @@ fn format_f64_literal(v: f64) -> String {
 fn collect_locals(body: &[Stmt]) -> Vec<(String, Type)> {
     let mut out: Vec<(String, Type)> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
-    fn walk(stmts: &[Stmt], out: &mut Vec<(String, Type)>, seen: &mut HashSet<String>) {
-        for s in stmts {
-            match s {
-                Stmt::Let { name, value } => {
-                    if seen.insert(name.clone()) {
-                        out.push((name.clone(), value.ty));
-                    }
+    walk_stmts(body, &mut out, &mut seen);
+    out
+}
+
+fn walk_stmts(stmts: &[Stmt], out: &mut Vec<(String, Type)>, seen: &mut HashSet<String>) {
+    for s in stmts {
+        match s {
+            Stmt::Let { name, value } => {
+                if seen.insert(name.clone()) {
+                    out.push((name.clone(), value.ty));
                 }
-                Stmt::Return { .. } | Stmt::Break | Stmt::Continue => {}
-                Stmt::If { then_body, else_body, .. } => {
-                    walk(then_body, out, seen);
-                    walk(else_body, out, seen);
-                }
-                Stmt::While { body, .. } => walk(body, out, seen),
+                walk_expr(value, out, seen);
+            }
+            Stmt::Return { value } => walk_expr(value, out, seen),
+            Stmt::Break | Stmt::Continue => {}
+            Stmt::If { cond, then_body, else_body } => {
+                walk_expr(cond, out, seen);
+                walk_stmts(then_body, out, seen);
+                walk_stmts(else_body, out, seen);
+            }
+            Stmt::While { cond, body } => {
+                walk_expr(cond, out, seen);
+                walk_stmts(body, out, seen);
             }
         }
     }
-    walk(body, &mut out, &mut seen);
-    out
+}
+
+fn walk_expr(te: &TypedExpr, out: &mut Vec<(String, Type)>, seen: &mut HashSet<String>) {
+    match &te.expr {
+        Expr::ConstI64(_) | Expr::ConstF64(_) | Expr::ConstBool(_) | Expr::Var(_) => {}
+        Expr::BinOp { lhs, rhs, .. }
+        | Expr::Cmp { lhs, rhs, .. }
+        | Expr::BoolOp { lhs, rhs, .. }
+        | Expr::ListConcat { lhs, rhs } => {
+            walk_expr(lhs, out, seen);
+            walk_expr(rhs, out, seen);
+        }
+        Expr::UnaryOp { operand, .. } | Expr::Not(operand) | Expr::Coerce { inner: operand } => {
+            walk_expr(operand, out, seen);
+        }
+        Expr::CmpChain { first, rest } => {
+            walk_expr(first, out, seen);
+            for (_, e) in rest {
+                walk_expr(e, out, seen);
+            }
+        }
+        Expr::Call { args, .. } => {
+            for a in args {
+                walk_expr(a, out, seen);
+            }
+        }
+        Expr::TupleLit { elements } | Expr::ListLit { elements } => {
+            for e in elements {
+                walk_expr(e, out, seen);
+            }
+        }
+        Expr::TupleIndex { tuple, .. } => walk_expr(tuple, out, seen),
+        Expr::ListIndex { list, index } => {
+            walk_expr(list, out, seen);
+            walk_expr(index, out, seen);
+        }
+        Expr::ListLen { list } => walk_expr(list, out, seen),
+        Expr::DoBlock { stmts, result } => {
+            walk_stmts(stmts, out, seen);
+            walk_expr(result, out, seen);
+        }
+    }
 }
 
 fn sanitize_module_id(s: &str) -> String {
