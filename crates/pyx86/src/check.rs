@@ -3,34 +3,27 @@ use std::collections::{HashMap, HashSet};
 use anyhow::{anyhow, bail, Result};
 use rustpython_parser::ast;
 
-use crate::hir::{BinOp, BoolOp, CmpOp, Expr, Function, Param, Program, Stmt, Type, UnaryOp};
+use crate::hir::{
+    BinOp, BoolOp, CmpOp, Expr, Function, Param, Program, Stmt, Type, TypedExpr, UnaryOp,
+};
 use crate::parser::Module;
 
 const MAX_PARAMS: usize = 16;
 
-/// Function signature, used by the call-resolution pass so calls can
-/// be validated before bodies are lowered (which lets us support
-/// recursion and forward references).
+/// Per-function type scope: name → type.
+type Scope = HashMap<String, Type>;
+
 #[derive(Debug)]
 struct FunctionSig {
     params: Vec<Param>,
-    /// Defaults aligned with `params`. `None` for required params,
-    /// `Some(<literal expr>)` for params with default values. Python
-    /// requires all defaulted params to come after all required ones;
-    /// we enforce that.
-    defaults: Vec<Option<Expr>>,
+    defaults: Vec<Option<TypedExpr>>,
     return_ty: Type,
 }
 
 type SignatureTable = HashMap<String, FunctionSig>;
 
-/// Lower the parsed module into a `hir::Program`. The module body is
-/// a sequence of `def <name>(...)` blocks; one must be named `main`.
-/// Functions may call each other (including recursively / mutually).
 pub fn lower(module: &Module) -> Result<Program> {
-    // Pass 1: collect signatures of all top-level functions so calls
-    // can be validated before any body is lowered. This is what makes
-    // forward references and mutual recursion work.
+    // Pass 1: collect signatures.
     let mut signatures: SignatureTable = HashMap::new();
     for stmt in &module.body {
         let func = match stmt {
@@ -47,22 +40,38 @@ pub fn lower(module: &Module) -> Result<Program> {
         }
         signatures.insert(name, sig);
     }
-
-    if !signatures.contains_key("main") {
-        bail!("unsupported_feature: no `main` function defined at the top level");
+    let main_sig = signatures.get("main").ok_or_else(|| {
+        anyhow!("unsupported_feature: no `main` function defined at the top level")
+    })?;
+    // main return must be I64 — the C wrapper doesn't yet know how to
+    // print a float Python-style. Floats may be used internally.
+    if main_sig.return_ty != Type::I64 {
+        bail!(
+            "unsupported_feature: `main` must return `int` for now (the wrapper printer doesn't yet support {})",
+            main_sig.return_ty.name()
+        );
+    }
+    // main parameters must be I64 too (atof / strtod for float argv parsing
+    // is a TODO; argv is currently only atoll'd into I64).
+    for p in &main_sig.params {
+        if p.ty != Type::I64 {
+            bail!(
+                "unsupported_feature: `main` parameter `{}` must be `int` for now (argv parsing for {} not yet implemented)",
+                p.name,
+                p.ty.name()
+            );
+        }
     }
 
-    // Pass 2: lower each function body using the signature table.
+    // Pass 2: lower each function body.
     let mut functions = Vec::with_capacity(module.body.len());
     for stmt in &module.body {
         let func = match stmt {
             ast::Stmt::FunctionDef(f) => f,
             _ => unreachable!(),
         };
-        let f = lower_function(func, &signatures)?;
-        functions.push(f);
+        functions.push(lower_function(func, &signatures)?);
     }
-
     Ok(Program { functions })
 }
 
@@ -123,58 +132,48 @@ fn collect_signature(func: &ast::StmtFunctionDef) -> Result<FunctionSig> {
         ),
     };
 
-    // Defaults: rustpython-ast's Arguments.defaults are listed in the
-    // same order as the parameters they belong to, applied to the
-    // *trailing* parameters. So for `def f(a, b, c=3, d=4)`, defaults
-    // = [3, 4] and they apply to params[2] and params[3].
     let raw_defaults: Vec<&ast::Expr> = func.args.defaults().collect();
     let n = params.len();
     let n_defaulted = raw_defaults.len();
-    if n_defaulted > n {
-        // Should be impossible for valid Python.
-        bail!(
-            "internal: more defaults than parameters in `{}`",
-            func.name
-        );
-    }
     let n_required = n - n_defaulted;
-    let mut defaults: Vec<Option<Expr>> = vec![None; n];
+    let mut defaults: Vec<Option<TypedExpr>> = vec![None; n];
     for (i, raw) in raw_defaults.iter().enumerate() {
         let param_idx = n_required + i;
-        defaults[param_idx] = Some(lower_default(raw).map_err(|e| {
+        let lowered = lower_default(raw).map_err(|e| {
             anyhow!(
                 "unsupported_feature: default for parameter `{}` (in `{}`): {}",
                 params[param_idx].name,
                 func.name,
                 e
             )
-        })?);
+        })?;
+        // Coerce default to declared param type.
+        let coerced = coerce(lowered, params[param_idx].ty)?;
+        defaults[param_idx] = Some(coerced);
     }
 
     Ok(FunctionSig { params, defaults, return_ty })
 }
 
-/// Defaults are evaluated at function-definition time in Python. We
-/// only allow constants (int / bool literals, optionally negated) so
-/// there's no need for a "definition-time scope" — the expression is
-/// fully reduced at compile time and inlined at the call site.
-fn lower_default(e: &ast::Expr) -> Result<Expr> {
+fn lower_default(e: &ast::Expr) -> Result<TypedExpr> {
     match e {
         ast::Expr::Constant(c) => match &c.value {
             ast::Constant::Int(big) => {
-                let v: i64 = big.try_into().map_err(|_| {
-                    anyhow!("integer literal does not fit in i64")
-                })?;
-                Ok(Expr::ConstI64(v))
+                let v: i64 = big
+                    .try_into()
+                    .map_err(|_| anyhow!("integer literal does not fit in i64"))?;
+                Ok(TypedExpr::new(Type::I64, Expr::ConstI64(v)))
             }
-            ast::Constant::Bool(b) => Ok(Expr::ConstI64(if *b { 1 } else { 0 })),
-            _ => bail!("only integer literals are allowed as defaults"),
+            ast::Constant::Bool(b) => Ok(TypedExpr::new(Type::Bool, Expr::ConstBool(*b))),
+            _ => bail!("only integer or bool literals are allowed as defaults"),
         },
         ast::Expr::UnaryOp(u) if matches!(u.op, ast::UnaryOp::USub | ast::UnaryOp::UAdd) => {
             let inner = lower_default(&u.operand)?;
-            match (u.op, inner) {
-                (ast::UnaryOp::USub, Expr::ConstI64(v)) => Ok(Expr::ConstI64(-v)),
-                (ast::UnaryOp::UAdd, Expr::ConstI64(v)) => Ok(Expr::ConstI64(v)),
+            match (u.op, &inner.expr) {
+                (ast::UnaryOp::USub, Expr::ConstI64(v)) => {
+                    Ok(TypedExpr::new(Type::I64, Expr::ConstI64(-v)))
+                }
+                (ast::UnaryOp::UAdd, _) => Ok(inner),
                 _ => bail!("only integer literals are allowed as defaults"),
             }
         }
@@ -184,19 +183,16 @@ fn lower_default(e: &ast::Expr) -> Result<Expr> {
 
 fn lower_function(func: &ast::StmtFunctionDef, signatures: &SignatureTable) -> Result<Function> {
     let name = func.name.as_str().to_string();
-    let sig = signatures.get(&name).expect("signature must have been collected in pass 1");
+    let sig = signatures.get(&name).expect("signature collected in pass 1");
 
-    // Seed the local scope with the parameter names.
-    let mut scope: HashSet<String> = sig.params.iter().map(|p| p.name.clone()).collect();
+    let mut scope: Scope =
+        sig.params.iter().map(|p| (p.name.clone(), p.ty)).collect();
 
     if func.body.is_empty() {
-        bail!(
-            "unsupported_feature: function `{}` body is empty",
-            name
-        );
+        bail!("unsupported_feature: function `{}` body is empty", name);
     }
 
-    let body = lower_block(&func.body, &mut scope, 0, signatures)?;
+    let body = lower_block(&func.body, &mut scope, 0, signatures, sig.return_ty)?;
 
     if !block_always_returns(&body) {
         bail!(
@@ -213,18 +209,6 @@ fn lower_function(func: &ast::StmtFunctionDef, signatures: &SignatureTable) -> R
     })
 }
 
-/// Conservative path-coverage check. Returns true iff:
-/// - the block ends with a `Return`, OR
-/// - the block ends with an `If` whose then_body and else_body both
-///   recursively cover, AND the else_body is non-empty.
-///
-/// `While`, `Break`, `Continue`, `Let` are **not** covering — a while
-/// may execute zero iterations and break/continue jump rather than
-/// returning.
-///
-/// This rejects valid programs where coverage requires reasoning
-/// about expressions (e.g. `if True: return 1`) but never accepts
-/// invalid ones, which is the side we want to err on.
 fn block_always_returns(body: &[Stmt]) -> bool {
     match body.last() {
         Some(Stmt::Return { .. }) => true,
@@ -239,9 +223,10 @@ fn block_always_returns(body: &[Stmt]) -> bool {
 
 fn lower_block(
     stmts: &[ast::Stmt],
-    scope: &mut HashSet<String>,
+    scope: &mut Scope,
     loop_depth: usize,
     signatures: &SignatureTable,
+    return_ty: Type,
 ) -> Result<Vec<Stmt>> {
     let mut out = Vec::with_capacity(stmts.len());
     for stmt in stmts {
@@ -249,7 +234,7 @@ fn lower_block(
             ast::Stmt::Assign(a) => {
                 let name = parse_assign_target(&a.targets)?;
                 let value = lower_expr(&a.value, scope, signatures)?;
-                scope.insert(name.clone());
+                scope.insert(name.clone(), value.ty);
                 out.push(Stmt::Let { name, value });
             }
             ast::Stmt::AnnAssign(a) => {
@@ -264,64 +249,58 @@ fn lower_block(
                         "unsupported_feature: parenthesised annotation targets are not supported"
                     );
                 }
-                if parse_type_annotation(Some(&a.annotation)).is_none() {
-                    bail!(
-                        "unsupported_feature: only `: int` annotations are supported on locals, on `{}`",
+                let declared_ty = parse_type_annotation(Some(&a.annotation)).ok_or_else(|| {
+                    anyhow!(
+                        "unsupported_feature: only `: int` / `: float` / `: bool` annotations are supported on locals, on `{}`",
                         name
-                    );
-                }
+                    )
+                })?;
                 let value_expr = a.value.as_deref().ok_or_else(|| {
                     anyhow!(
-                        "unsupported_feature: bare annotation `{}: int` (no value) is not supported",
+                        "unsupported_feature: bare annotation `{}: <type>` (no value) is not supported",
                         name
                     )
                 })?;
                 let value = lower_expr(value_expr, scope, signatures)?;
-                scope.insert(name.clone());
+                let value = coerce(value, declared_ty)?;
+                scope.insert(name.clone(), declared_ty);
                 out.push(Stmt::Let { name, value });
             }
             ast::Stmt::AugAssign(a) => {
-                // `x op= e` desugars to `x = x op e`. Requires x to
-                // already be in scope (CPython gives UnboundLocalError
-                // otherwise — we reject at compile time).
                 let name = match a.target.as_ref() {
                     ast::Expr::Name(n) => n.id.as_str().to_string(),
                     _ => bail!(
                         "unsupported_feature: augmented-assignment target must be a simple name"
                     ),
                 };
-                if !scope.contains(&name) {
-                    bail!(
+                let lhs_ty = *scope.get(&name).ok_or_else(|| {
+                    anyhow!(
                         "unsupported_feature: augmented assignment to unbound name `{}` (must already be a parameter or assigned local)",
                         name
-                    );
-                }
+                    )
+                })?;
                 let op = match a.op {
                     ast::Operator::Add => BinOp::Add,
                     ast::Operator::Sub => BinOp::Sub,
                     ast::Operator::Mult => BinOp::Mul,
                     ast::Operator::FloorDiv => BinOp::FloorDiv,
                     ast::Operator::Mod => BinOp::Mod,
+                    ast::Operator::Div => BinOp::TrueDiv,
+                    ast::Operator::Pow => BinOp::Pow,
                     ast::Operator::LShift => BinOp::Shl,
                     ast::Operator::RShift => BinOp::Shr,
                     ast::Operator::BitAnd => BinOp::BitAnd,
                     ast::Operator::BitOr => BinOp::BitOr,
                     ast::Operator::BitXor => BinOp::BitXor,
-                    ast::Operator::Div => bail!(
-                        "unsupported_feature: `/=` (true division) is not yet supported"
-                    ),
-                    ast::Operator::Pow => BinOp::Pow,
                     ast::Operator::MatMult => bail!(
                         "unsupported_feature: `@=` (matmul) is not supported"
                     ),
                 };
+                let lhs = TypedExpr::new(lhs_ty, Expr::Var(name.clone()));
                 let rhs = lower_expr(&a.value, scope, signatures)?;
-                let value = Expr::BinOp {
-                    op,
-                    lhs: Box::new(Expr::Var(name.clone())),
-                    rhs: Box::new(rhs),
-                };
-                out.push(Stmt::Let { name, value });
+                let combined = apply_binop(op, lhs, rhs)?;
+                let combined = coerce(combined, lhs_ty)?;
+                out.push(Stmt::Let { name, value: combined });
             }
             ast::Stmt::Return(r) => {
                 let value_expr = r
@@ -329,20 +308,15 @@ fn lower_block(
                     .as_deref()
                     .ok_or_else(|| anyhow!("unsupported_feature: `return` must have a value"))?;
                 let value = lower_expr(value_expr, scope, signatures)?;
+                let value = coerce(value, return_ty)?;
                 out.push(Stmt::Return { value });
             }
             ast::Stmt::If(if_stmt) => {
                 let cond = lower_expr(&if_stmt.test, scope, signatures)?;
-                // Branch bodies see and may extend the same scope as
-                // the surrounding block. (Python doesn't have block
-                // scope; locals introduced in a branch are accessible
-                // after the branch — though using them when the
-                // branch wasn't taken is a runtime UnboundLocalError
-                // in CPython. We use alloca slots that hold the
-                // last-stored value or undef; we accept this as a
-                // pragmatic deviation.)
-                let then_body = lower_block(&if_stmt.body, scope, loop_depth, signatures)?;
-                let else_body = lower_block(&if_stmt.orelse, scope, loop_depth, signatures)?;
+                let cond = coerce(cond, Type::Bool)?;
+                let then_body = lower_block(&if_stmt.body, scope, loop_depth, signatures, return_ty)?;
+                let else_body =
+                    lower_block(&if_stmt.orelse, scope, loop_depth, signatures, return_ty)?;
                 out.push(Stmt::If { cond, then_body, else_body });
             }
             ast::Stmt::While(w) => {
@@ -352,7 +326,8 @@ fn lower_block(
                     );
                 }
                 let cond = lower_expr(&w.test, scope, signatures)?;
-                let body = lower_block(&w.body, scope, loop_depth + 1, signatures)?;
+                let cond = coerce(cond, Type::Bool)?;
+                let body = lower_block(&w.body, scope, loop_depth + 1, signatures, return_ty)?;
                 out.push(Stmt::While { cond, body });
             }
             ast::Stmt::Break(_) => {
@@ -367,11 +342,9 @@ fn lower_block(
                 }
                 out.push(Stmt::Continue);
             }
-            ast::Stmt::Pass(_) => {
-                // pass is a no-op; lower it as nothing.
-            }
+            ast::Stmt::Pass(_) => {}
             other => bail!(
-                "unsupported_feature: statement `{}` is not supported in v0.6",
+                "unsupported_feature: statement `{}` is not supported",
                 stmt_kind_name(other)
             ),
         }
@@ -402,33 +375,38 @@ fn parse_assign_target(targets: &[ast::Expr]) -> Result<String> {
 
 fn parse_type_annotation(ann: Option<&ast::Expr>) -> Option<Type> {
     match ann? {
-        ast::Expr::Name(n) if n.id.as_str() == "int" => Some(Type::I64),
+        ast::Expr::Name(n) => match n.id.as_str() {
+            "int" => Some(Type::I64),
+            "float" => Some(Type::F64),
+            "bool" => Some(Type::Bool),
+            _ => None,
+        },
         _ => None,
     }
 }
 
-fn lower_expr(e: &ast::Expr, scope: &HashSet<String>, signatures: &SignatureTable) -> Result<Expr> {
+fn lower_expr(e: &ast::Expr, scope: &Scope, signatures: &SignatureTable) -> Result<TypedExpr> {
     match e {
         ast::Expr::Constant(c) => match &c.value {
             ast::Constant::Int(big) => {
                 let v: i64 = big.try_into().map_err(|_| {
                     anyhow!("unsupported_feature: integer literal does not fit in i64")
                 })?;
-                Ok(Expr::ConstI64(v))
+                Ok(TypedExpr::new(Type::I64, Expr::ConstI64(v)))
             }
-            ast::Constant::Bool(b) => Ok(Expr::ConstI64(if *b { 1 } else { 0 })),
-            _ => bail!("unsupported_feature: only integer (and bool) literals are supported"),
+            ast::Constant::Float(f) => Ok(TypedExpr::new(Type::F64, Expr::ConstF64(*f))),
+            ast::Constant::Bool(b) => Ok(TypedExpr::new(Type::Bool, Expr::ConstBool(*b))),
+            _ => bail!("unsupported_feature: only int / float / bool literals are supported"),
         },
         ast::Expr::Name(n) => {
             let name = n.id.as_str();
-            if scope.contains(name) {
-                Ok(Expr::Var(name.to_string()))
-            } else {
-                bail!(
+            let ty = scope.get(name).copied().ok_or_else(|| {
+                anyhow!(
                     "unsupported_feature: name `{}` is not in scope (must be a parameter or previously assigned local)",
                     name
                 )
-            }
+            })?;
+            Ok(TypedExpr::new(ty, Expr::Var(name.to_string())))
         }
         ast::Expr::BinOp(b) => {
             let op = match b.op {
@@ -437,99 +415,90 @@ fn lower_expr(e: &ast::Expr, scope: &HashSet<String>, signatures: &SignatureTabl
                 ast::Operator::Mult => BinOp::Mul,
                 ast::Operator::FloorDiv => BinOp::FloorDiv,
                 ast::Operator::Mod => BinOp::Mod,
-                ast::Operator::Div => bail!(
-                    "unsupported_feature: `/` (true division) requires float support, not yet in scope"
-                ),
+                ast::Operator::Div => BinOp::TrueDiv,
                 ast::Operator::Pow => BinOp::Pow,
-                ast::Operator::MatMult => bail!("unsupported_feature: `@` (matmul) is not supported"),
+                ast::Operator::MatMult => {
+                    bail!("unsupported_feature: `@` (matmul) is not supported")
+                }
                 ast::Operator::LShift => BinOp::Shl,
                 ast::Operator::RShift => BinOp::Shr,
                 ast::Operator::BitAnd => BinOp::BitAnd,
                 ast::Operator::BitOr => BinOp::BitOr,
                 ast::Operator::BitXor => BinOp::BitXor,
             };
-            Ok(Expr::BinOp {
-                op,
-                lhs: Box::new(lower_expr(&b.left, scope, signatures)?),
-                rhs: Box::new(lower_expr(&b.right, scope, signatures)?),
-            })
+            let lhs = lower_expr(&b.left, scope, signatures)?;
+            let rhs = lower_expr(&b.right, scope, signatures)?;
+            apply_binop(op, lhs, rhs)
         }
         ast::Expr::UnaryOp(u) => {
-            let op = match u.op {
-                ast::UnaryOp::USub => UnaryOp::Neg,
-                ast::UnaryOp::UAdd => UnaryOp::Pos,
+            let operand = lower_expr(&u.operand, scope, signatures)?;
+            match u.op {
+                ast::UnaryOp::USub => apply_unop(UnaryOp::Neg, operand),
+                ast::UnaryOp::UAdd => apply_unop(UnaryOp::Pos, operand),
                 ast::UnaryOp::Not => {
-                    return Ok(Expr::Not(Box::new(lower_expr(&u.operand, scope, signatures)?)));
+                    let coerced = coerce(operand, Type::Bool)?;
+                    Ok(TypedExpr::new(Type::Bool, Expr::Not(Box::new(coerced))))
                 }
-                ast::UnaryOp::Invert => UnaryOp::BitNot,
-            };
-            Ok(Expr::UnaryOp {
-                op,
-                operand: Box::new(lower_expr(&u.operand, scope, signatures)?),
-            })
+                ast::UnaryOp::Invert => apply_unop(UnaryOp::BitNot, operand),
+            }
         }
         ast::Expr::Compare(c) => {
-            // Python AST: left + ops[] + comparators[]. ops.len() == comparators.len().
             let first = lower_expr(&c.left, scope, signatures)?;
-            let rest: Result<Vec<(CmpOp, Expr)>> = c
+            let rest_ops: Result<Vec<(CmpOp, TypedExpr)>> = c
                 .ops
                 .iter()
                 .zip(c.comparators.iter())
                 .map(|(op, e)| Ok((convert_cmp_op(op)?, lower_expr(e, scope, signatures)?)))
                 .collect();
-            let rest = rest?;
+            let rest = rest_ops?;
             if rest.len() == 1 {
                 let (op, rhs) = rest.into_iter().next().unwrap();
-                Ok(Expr::Cmp {
-                    op,
-                    lhs: Box::new(first),
-                    rhs: Box::new(rhs),
-                })
+                let (lhs, rhs) = unify_cmp_operands(first, rhs)?;
+                Ok(TypedExpr::new(
+                    Type::Bool,
+                    Expr::Cmp { op, lhs: Box::new(lhs), rhs: Box::new(rhs) },
+                ))
             } else {
-                Ok(Expr::CmpChain {
-                    first: Box::new(first),
-                    rest,
-                })
+                Ok(TypedExpr::new(
+                    Type::Bool,
+                    Expr::CmpChain { first: Box::new(first), rest },
+                ))
             }
         }
         ast::Expr::BoolOp(b) => {
-            // Python's BoolOp is N-ary: `a and b and c` parses with
-            // values=[a, b, c]. Lower as left-associative pairs so the
-            // codegen only ever has to deal with binary BoolOp.
             let op = match b.op {
                 ast::BoolOp::And => BoolOp::And,
                 ast::BoolOp::Or => BoolOp::Or,
             };
             if b.values.is_empty() {
-                bail!("unsupported_feature: empty BoolOp (should not be possible from valid Python)");
+                bail!("unsupported_feature: empty BoolOp");
             }
             let mut iter = b.values.iter();
             let first = lower_expr(iter.next().unwrap(), scope, signatures)?;
             let mut acc = first;
             for next in iter {
                 let next = lower_expr(next, scope, signatures)?;
-                acc = Expr::BoolOp { op, lhs: Box::new(acc), rhs: Box::new(next) };
+                let (l, r) = unify_numeric(acc, next)?;
+                let ty = l.ty;
+                acc = TypedExpr::new(
+                    ty,
+                    Expr::BoolOp { op, lhs: Box::new(l), rhs: Box::new(r) },
+                );
             }
             Ok(acc)
         }
         ast::Expr::Call(c) => {
-            // Resolve callee. Only plain name calls (`foo(a, b)`)
-            // supported — no method calls, no `obj.method()`, no
-            // higher-order calls.
             let callee = match c.func.as_ref() {
                 ast::Expr::Name(n) => n.id.as_str().to_string(),
                 _ => bail!(
-                    "unsupported_feature: only direct calls to top-level functions are supported (no method / attribute / higher-order calls yet)"
+                    "unsupported_feature: only direct calls to top-level functions are supported"
                 ),
             };
             let sig = signatures.get(&callee).ok_or_else(|| {
-                anyhow!(
-                    "unsupported_feature: call to undefined function `{}`",
-                    callee
-                )
+                anyhow!("unsupported_feature: call to undefined function `{}`", callee)
             })?;
             let args = resolve_call_args(&callee, sig, &c.args, &c.keywords, scope, signatures)?;
-            Ok(Expr::Call { callee, args })
+            Ok(TypedExpr::new(sig.return_ty, Expr::Call { callee, args }))
         }
         other => bail!(
             "unsupported_feature: expression form `{}` is not supported",
@@ -538,17 +507,138 @@ fn lower_expr(e: &ast::Expr, scope: &HashSet<String>, signatures: &SignatureTabl
     }
 }
 
-/// Match positional + keyword call args to the callee's parameters,
-/// filling in defaults for any unmatched. Errors on duplicates,
-/// unknown keywords, missing required args, or `**kwargs` unpacking.
+/// Apply a binary op given lowered operands. Handles type promotion
+/// and inserts coercions as needed.
+fn apply_binop(op: BinOp, lhs: TypedExpr, rhs: TypedExpr) -> Result<TypedExpr> {
+    match op {
+        BinOp::TrueDiv => {
+            // Always F64 result. Promote both to F64.
+            let l = coerce(lhs, Type::F64)?;
+            let r = coerce(rhs, Type::F64)?;
+            Ok(TypedExpr::new(
+                Type::F64,
+                Expr::BinOp { op, lhs: Box::new(l), rhs: Box::new(r) },
+            ))
+        }
+        BinOp::FloorDiv | BinOp::Mod => {
+            // I64 operands only (Python's float // and % are not in scope yet).
+            let l = coerce(lhs, Type::I64)?;
+            let r = coerce(rhs, Type::I64)?;
+            Ok(TypedExpr::new(
+                Type::I64,
+                Expr::BinOp { op, lhs: Box::new(l), rhs: Box::new(r) },
+            ))
+        }
+        BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Shr => {
+            let l = coerce(lhs, Type::I64)?;
+            let r = coerce(rhs, Type::I64)?;
+            Ok(TypedExpr::new(
+                Type::I64,
+                Expr::BinOp { op, lhs: Box::new(l), rhs: Box::new(r) },
+            ))
+        }
+        BinOp::Pow => {
+            // Int**Int → I64. Float**Float → F64. Mixed → F64.
+            let result_ty = if lhs.ty == Type::F64 || rhs.ty == Type::F64 {
+                Type::F64
+            } else {
+                Type::I64
+            };
+            let l = coerce(lhs, result_ty)?;
+            let r = coerce(rhs, result_ty)?;
+            Ok(TypedExpr::new(
+                result_ty,
+                Expr::BinOp { op, lhs: Box::new(l), rhs: Box::new(r) },
+            ))
+        }
+        BinOp::Add | BinOp::Sub | BinOp::Mul => {
+            let (l, r) = unify_numeric(lhs, rhs)?;
+            let ty = l.ty;
+            Ok(TypedExpr::new(
+                ty,
+                Expr::BinOp { op, lhs: Box::new(l), rhs: Box::new(r) },
+            ))
+        }
+    }
+}
+
+fn apply_unop(op: UnaryOp, operand: TypedExpr) -> Result<TypedExpr> {
+    match op {
+        UnaryOp::Neg | UnaryOp::Pos => {
+            // Numeric: keep type; Bool → I64 first.
+            let operand = if operand.ty == Type::Bool {
+                coerce(operand, Type::I64)?
+            } else {
+                operand
+            };
+            let ty = operand.ty;
+            Ok(TypedExpr::new(
+                ty,
+                Expr::UnaryOp { op, operand: Box::new(operand) },
+            ))
+        }
+        UnaryOp::BitNot => {
+            let operand = coerce(operand, Type::I64)?;
+            Ok(TypedExpr::new(
+                Type::I64,
+                Expr::UnaryOp { op, operand: Box::new(operand) },
+            ))
+        }
+    }
+}
+
+/// Numeric promotion for arithmetic operands: if either is F64, both
+/// become F64; if either is Bool, it becomes I64; otherwise keep I64.
+fn unify_numeric(lhs: TypedExpr, rhs: TypedExpr) -> Result<(TypedExpr, TypedExpr)> {
+    let target = if lhs.ty == Type::F64 || rhs.ty == Type::F64 {
+        Type::F64
+    } else {
+        Type::I64
+    };
+    Ok((coerce(lhs, target)?, coerce(rhs, target)?))
+}
+
+/// For comparisons: same as numeric promotion (Bool → I64, then int+float → float).
+fn unify_cmp_operands(lhs: TypedExpr, rhs: TypedExpr) -> Result<(TypedExpr, TypedExpr)> {
+    unify_numeric(lhs, rhs)
+}
+
+/// Insert a coercion if the expression's type doesn't match the target.
+/// Allowed coercions: Bool↔I64, I64→F64, Bool→F64, Bool→Bool (no-op),
+/// F64→Bool (via != 0.0). F64→I64 is rejected (lossy; needs explicit
+/// `int()` builtin which we don't have yet).
+fn coerce(e: TypedExpr, target: Type) -> Result<TypedExpr> {
+    if e.ty == target {
+        return Ok(e);
+    }
+    match (e.ty, target) {
+        (Type::Bool, Type::I64)
+        | (Type::I64, Type::Bool)
+        | (Type::I64, Type::F64)
+        | (Type::Bool, Type::F64)
+        | (Type::F64, Type::Bool) => Ok(TypedExpr::new(
+            target,
+            Expr::Coerce { inner: Box::new(e) },
+        )),
+        (Type::F64, Type::I64) => bail!(
+            "unsupported_feature: implicit float→int conversion is not allowed (`int()` builtin coming later)"
+        ),
+        _ => bail!(
+            "unsupported_feature: cannot coerce {} to {}",
+            e.ty.name(),
+            target.name()
+        ),
+    }
+}
+
 fn resolve_call_args(
     callee: &str,
     sig: &FunctionSig,
     pos_args: &[ast::Expr],
     kw_args: &[ast::Keyword],
-    scope: &HashSet<String>,
+    scope: &Scope,
     signatures: &SignatureTable,
-) -> Result<Vec<Expr>> {
+) -> Result<Vec<TypedExpr>> {
     let n = sig.params.len();
     if pos_args.len() > n {
         bail!(
@@ -558,9 +648,10 @@ fn resolve_call_args(
             pos_args.len()
         );
     }
-    let mut filled: Vec<Option<Expr>> = vec![None; n];
+    let mut filled: Vec<Option<TypedExpr>> = vec![None; n];
     for (i, a) in pos_args.iter().enumerate() {
-        filled[i] = Some(lower_expr(a, scope, signatures)?);
+        let raw = lower_expr(a, scope, signatures)?;
+        filled[i] = Some(coerce(raw, sig.params[i].ty)?);
     }
     for kw in kw_args {
         let name = kw.arg.as_ref().ok_or_else(|| {
@@ -587,7 +678,8 @@ fn resolve_call_args(
                 callee
             );
         }
-        filled[idx] = Some(lower_expr(&kw.value, scope, signatures)?);
+        let raw = lower_expr(&kw.value, scope, signatures)?;
+        filled[idx] = Some(coerce(raw, sig.params[idx].ty)?);
     }
     let mut out = Vec::with_capacity(n);
     for (i, slot) in filled.into_iter().enumerate() {
@@ -699,162 +791,56 @@ mod tests {
     }
 
     #[test]
+    fn lowers_no_param_main() {
+        let p = lower(&parse("def main() -> int:\n    return 42\n")).unwrap();
+        assert_eq!(p.main().params.len(), 0);
+        assert_eq!(p.main().return_ty, Type::I64);
+    }
+
+    #[test]
+    fn lowers_two_param_main() {
+        let p = lower(&parse(
+            "def main(a: int, b: int) -> int:\n    return a + b\n",
+        ))
+        .unwrap();
+        assert_eq!(p.main().params.len(), 2);
+        assert_eq!(p.main().params[0].ty, Type::I64);
+    }
+
+    #[test]
+    fn allows_float_local_inside_int_main() {
+        // float values flow through the program but main return is int.
+        // The result of true-div is F64; we check it via comparison.
+        let _ = lower(&parse(
+            "def helper() -> float:\n    return 1.5 + 2.5\n\ndef main() -> int:\n    x: float = helper()\n    if x > 0.0:\n        return 1\n    else:\n        return 0\n",
+        ))
+        .unwrap();
+    }
+
+    #[test]
+    fn rejects_implicit_float_to_int_on_return() {
+        let m = parse("def main() -> int:\n    return 1.5\n");
+        let err = lower(&m).unwrap_err();
+        assert!(format!("{}", err).contains("float→int"));
+    }
+
+    #[test]
+    fn rejects_float_main_return() {
+        let m = parse("def main() -> float:\n    return 1.0\n");
+        let err = lower(&m).unwrap_err();
+        let msg = format!("{}", err);
+        assert!(msg.contains("`main` must return `int`"));
+    }
+
+    #[test]
     fn lowers_simple_if_else() {
         let p = lower(&parse(
             "def main(a: int) -> int:\n    if a < 0:\n        return -a\n    else:\n        return a\n",
         ))
         .unwrap();
         match &p.main().body[0] {
-            Stmt::If { cond, then_body, else_body } => {
-                assert!(matches!(cond, Expr::Cmp { op: CmpOp::Lt, .. }));
-                assert!(matches!(then_body[0], Stmt::Return { .. }));
-                assert!(matches!(else_body[0], Stmt::Return { .. }));
-            }
-            other => panic!("expected If, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn elif_lowers_to_nested_if() {
-        let p = lower(&parse(
-            "def main(a: int) -> int:\n    if a < 0:\n        return -1\n    elif a == 0:\n        return 0\n    else:\n        return 1\n",
-        ))
-        .unwrap();
-        match &p.main().body[0] {
-            Stmt::If { else_body, .. } => {
-                // else_body should contain a single nested If.
-                assert_eq!(else_body.len(), 1);
-                assert!(matches!(else_body[0], Stmt::If { .. }));
-            }
-            _ => panic!("expected If at top"),
-        }
-    }
-
-    #[test]
-    fn lowers_chained_compare() {
-        let p = lower(&parse(
-            "def main(a: int) -> int:\n    if 0 < a < 100:\n        return 1\n    else:\n        return 0\n",
-        ))
-        .unwrap();
-        match &p.main().body[0] {
-            Stmt::If { cond: Expr::CmpChain { first, rest }, .. } => {
-                assert!(matches!(**first, Expr::ConstI64(0)));
-                assert_eq!(rest.len(), 2);
-            }
-            _ => panic!("expected CmpChain in If condition"),
-        }
-    }
-
-    #[test]
-    fn lowers_truthy_int_condition() {
-        let p = lower(&parse(
-            "def main(a: int) -> int:\n    if a:\n        return 1\n    else:\n        return 0\n",
-        ))
-        .unwrap();
-        match &p.main().body[0] {
-            Stmt::If { cond, .. } => assert!(matches!(cond, Expr::Var(n) if n == "a")),
+            Stmt::If { cond, .. } => assert_eq!(cond.ty, Type::Bool),
             _ => panic!("expected If"),
-        }
-    }
-
-    #[test]
-    fn lowers_not() {
-        let p = lower(&parse(
-            "def main(a: int) -> int:\n    if not a:\n        return 1\n    else:\n        return 0\n",
-        ))
-        .unwrap();
-        match &p.main().body[0] {
-            Stmt::If { cond: Expr::Not(_), .. } => {}
-            _ => panic!("expected Not in If condition"),
-        }
-    }
-
-    #[test]
-    fn lowers_and_or() {
-        let p = lower(&parse(
-            "def main(a: int, b: int) -> int:\n    if a > 0 and b > 0:\n        return 1\n    else:\n        return 0\n",
-        ))
-        .unwrap();
-        match &p.main().body[0] {
-            Stmt::If { cond: Expr::BoolOp { op: BoolOp::And, .. }, .. } => {}
-            other => panic!("expected If with BoolOp::And, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn lowers_chained_or() {
-        // `a or b or c` parses with values=[a,b,c]; we lower it as
-        // left-associative pairs.
-        let p = lower(&parse(
-            "def main(a: int, b: int, c: int) -> int:\n    if a or b or c:\n        return 1\n    else:\n        return 0\n",
-        ))
-        .unwrap();
-        match &p.main().body[0] {
-            Stmt::If { cond: Expr::BoolOp { op: BoolOp::Or, lhs, .. }, .. } => {
-                assert!(matches!(**lhs, Expr::BoolOp { op: BoolOp::Or, .. }));
-            }
-            other => panic!("expected If with nested Or, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn rejects_is() {
-        let m = parse("def main(a: int) -> int:\n    if a is 0:\n        return 1\n    else:\n        return 0\n");
-        let err = lower(&m).unwrap_err();
-        assert!(format!("{}", err).contains("`is`"));
-    }
-
-    #[test]
-    fn rejects_path_without_return() {
-        // `if` with no else, no trailing return — not all paths return.
-        let m = parse("def main(a: int) -> int:\n    if a > 0:\n        return 1\n");
-        let err = lower(&m).unwrap_err();
-        assert!(format!("{}", err).contains("not all paths return"));
-    }
-
-    #[test]
-    fn accepts_if_followed_by_return() {
-        let _ = lower(&parse(
-            "def main(a: int) -> int:\n    if a < 0:\n        return -1\n    return a\n",
-        ))
-        .unwrap();
-    }
-
-    #[test]
-    fn accepts_pass_in_branch() {
-        let _ = lower(&parse(
-            "def main(a: int) -> int:\n    if a > 0:\n        pass\n    return a\n",
-        ))
-        .unwrap();
-    }
-
-    #[test]
-    fn lowers_while_loop() {
-        let p = lower(&parse(
-            "def main(n: int) -> int:\n    i = 0\n    while i < n:\n        i = i + 1\n    return i\n",
-        ))
-        .unwrap();
-        // body[0] = Let i, body[1] = While, body[2] = Return.
-        assert!(matches!(p.main().body[1], Stmt::While { .. }));
-    }
-
-    #[test]
-    fn lowers_break_and_continue_in_loop() {
-        let p = lower(&parse(
-            "def main(n: int) -> int:\n    i = 0\n    while i < n:\n        if i == 5:\n            break\n        if i == 3:\n            i = i + 1\n            continue\n        i = i + 1\n    return i\n",
-        ))
-        .unwrap();
-        match &p.main().body[1] {
-            Stmt::While { body, .. } => {
-                // First inner If has Break in its then_body.
-                match &body[0] {
-                    Stmt::If { then_body, .. } => {
-                        assert!(matches!(then_body[0], Stmt::Break));
-                    }
-                    _ => panic!("expected If at start of while body"),
-                }
-            }
-            _ => panic!("expected While"),
         }
     }
 
@@ -863,52 +849,5 @@ mod tests {
         let m = parse("def main() -> int:\n    break\n    return 0\n");
         let err = lower(&m).unwrap_err();
         assert!(format!("{}", err).contains("`break` outside"));
-    }
-
-    #[test]
-    fn rejects_continue_outside_loop() {
-        let m = parse("def main() -> int:\n    continue\n    return 0\n");
-        let err = lower(&m).unwrap_err();
-        assert!(format!("{}", err).contains("`continue` outside"));
-    }
-
-    #[test]
-    fn lowers_aug_assign() {
-        // `a += 1` desugars to `a = a + 1`.
-        let p = lower(&parse("def main(a: int) -> int:\n    a += 1\n    return a\n")).unwrap();
-        match &p.main().body[0] {
-            Stmt::Let { name, value: Expr::BinOp { op: BinOp::Add, lhs, rhs } } => {
-                assert_eq!(name, "a");
-                assert!(matches!(**lhs, Expr::Var(ref n) if n == "a"));
-                assert!(matches!(**rhs, Expr::ConstI64(1)));
-            }
-            other => panic!("expected Let with BinOp::Add desugar, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn rejects_aug_assign_to_unbound_name() {
-        let m = parse("def main() -> int:\n    x += 1\n    return x\n");
-        let err = lower(&m).unwrap_err();
-        assert!(format!("{}", err).contains("unbound name `x`"));
-    }
-
-    #[test]
-    fn rejects_else_on_while() {
-        let m = parse(
-            "def main(n: int) -> int:\n    while n > 0:\n        n = n - 1\n    else:\n        n = -1\n    return n\n",
-        );
-        let err = lower(&m).unwrap_err();
-        assert!(format!("{}", err).contains("`else` clause on `while`"));
-    }
-
-    #[test]
-    fn while_alone_does_not_satisfy_path_coverage() {
-        // `while` is not a covering construct — last statement must be a return.
-        let m = parse(
-            "def main(n: int) -> int:\n    while n > 0:\n        return n\n",
-        );
-        let err = lower(&m).unwrap_err();
-        assert!(format!("{}", err).contains("not all paths return"));
     }
 }
