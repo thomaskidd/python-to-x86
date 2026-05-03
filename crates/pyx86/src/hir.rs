@@ -11,23 +11,42 @@
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Type {
+    I8,
+    I16,
+    I32,
     /// 64-bit signed integer. The default int type and what
-    /// `: int` annotations mean. Wraps on overflow (no arbitrary precision).
+    /// `: int` annotations mean. Wraps on overflow.
     I64,
     /// IEEE-754 double-precision float. What `: float` means.
     F64,
     /// Internal type produced by comparisons, `not`, boolean literals.
-    /// Lowered as LLVM `i1`. Coerced to/from I64 via zext / icmp-ne-0.
+    /// Lowered as LLVM `i1`.
     Bool,
 }
 
 impl Type {
     pub fn name(self) -> &'static str {
         match self {
+            Type::I8 => "i8",
+            Type::I16 => "i16",
+            Type::I32 => "i32",
             Type::I64 => "int",
             Type::F64 => "float",
             Type::Bool => "bool",
         }
+    }
+    /// Width of the integer type in bits, or None for non-int types.
+    pub fn int_width(self) -> Option<u8> {
+        match self {
+            Type::I8 => Some(8),
+            Type::I16 => Some(16),
+            Type::I32 => Some(32),
+            Type::I64 => Some(64),
+            _ => None,
+        }
+    }
+    pub fn is_int(self) -> bool {
+        self.int_width().is_some()
     }
 }
 

@@ -1,0 +1,4 @@
+# x*x fits in i32 (signed range ±2.1e9) when x is in ±46340.
+[[arg]]
+type = "i64"
+range = [-46340, 46340]

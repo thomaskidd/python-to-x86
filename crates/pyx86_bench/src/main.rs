@@ -642,11 +642,22 @@ fn run_cpython(src: &Path, args: &[ArgValue]) -> Result<RunOutput> {
     let dir = src.parent().context("source has no parent")?;
     let stem = src.file_stem().context("source has no stem")?.to_string_lossy();
     let py_args = format_args_python(args);
+    // Inject a `stubs/` dir at the top of sys.path so `from pyx86.types
+    // import i32` (etc.) works in CPython. The project layout assumes
+    // `<corpus_root>/../stubs/pyx86/types.py` exists. We compute that
+    // relative to the program's parent dir: ../../stubs (since corpus is
+    // tests/correctness/<name>/program.py).
+    let stubs_dir = src
+        .ancestors()
+        .nth(4) // program.py -> name/ -> correctness/ -> tests/ -> project root
+        .map(|p| p.join("stubs"))
+        .unwrap_or_else(|| dir.join("..").join("..").join("..").join("stubs"));
     let snippet = format!(
-        "import sys; sys.path.insert(0, r'{}'); from {} import main; print(repr(main({})))",
-        dir.display(),
-        stem,
-        py_args,
+        "import sys; sys.path.insert(0, r'{stubs}'); sys.path.insert(0, r'{dir}'); from {stem} import main; print(repr(main({args})))",
+        stubs = stubs_dir.display(),
+        dir = dir.display(),
+        stem = stem,
+        args = py_args,
     );
     let output = Command::new("python3").arg("-c").arg(&snippet).output()?;
     Ok(RunOutput {
