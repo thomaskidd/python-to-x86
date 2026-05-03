@@ -4,16 +4,19 @@
 
 Take the validated program (eventually: typed HIR / SSA mid-IR) and emit LLVM IR as text. Drive the final assemble + link step by shelling out to `clang`.
 
-## v0.1 scope
+## Current scope (v0.2)
 
-The first slice supports only one shape of program:
+`main()` returns an arbitrary integer expression composed of:
+- `int` literals (i64-range)
+- Binary `+ - * // %`
+- Unary `+x`, `-x`
+- Parentheses
 
-```python
-def main() -> int:
-    return <int literal>
-```
+No parameters, no variables, no control flow yet — those are v0.3+.
 
-The codegen for this slice emits, conceptually:
+## v0.1 IR template (literal return)
+
+For the simplest case, `def main() -> int: return <int literal>`, codegen emits:
 
 ```llvm
 ; ModuleID = 'pyx86_<source basename>'
@@ -42,6 +45,55 @@ Key points:
 - The C `main` is the wrapper: it calls `py_main`, prints the return value via `printf("%ld\n", r)`, and returns 0.
 - `printf` is from libc; `clang` links libc by default. No custom runtime crate is needed for this slice.
 - We use **typed pointers (`i8*`)** rather than opaque pointers (`ptr`) so the IR is accepted by LLVM 10 through 18+. Opaque pointers are LLVM 14+ only; if/when we drop support for older LLVMs, the IR can be simplified.
+
+## v0.2 IR — expression lowering
+
+`Expr` is lowered post-order; each `lower(...)` call returns the LLVM operand (a literal like `42` or an SSA name like `%v3`) holding the expression's value, and appends any necessary instructions.
+
+### Trivially translated ops
+
+| HIR op | LLVM |
+|---|---|
+| `Add` / `Sub` / `Mul` | `add` / `sub` / `mul` `i64` |
+| `UnaryOp::Neg` | `sub i64 0, <operand>` |
+| `UnaryOp::Pos` | passthrough (no instruction) |
+
+### Floor-div correction (`a // b`)
+
+LLVM `sdiv` truncates toward zero; Python `//` floors toward -∞. They diverge for mixed-sign operands (`-7 // 2 == -4` in Python; `sdiv(-7, 2) == -3`).
+
+Correction: `result = sdiv(a, b) + adj`, where `adj = -1` iff the remainder is non-zero AND the operand signs differ:
+
+```llvm
+%q     = sdiv i64 %a, %b
+%rem   = srem i64 %a, %b
+%nz    = icmp ne i64 %rem, 0
+%xor   = xor i64 %a, %b
+%diff  = icmp slt i64 %xor, 0      ; signs differ ⇔ xor < 0
+%need  = and i1 %nz, %diff
+%adj   = sext i1 %need to i64       ; true → -1, false → 0
+%out   = add i64 %q, %adj
+```
+
+### Floor-mod correction (`a % b`)
+
+LLVM `srem` returns a value with the dividend's sign; Python `%` returns one with the divisor's sign. Correction: take `srem`, and add `b` iff the remainder is non-zero AND its sign differs from `b`'s.
+
+```llvm
+%rem   = srem i64 %a, %b
+%nz    = icmp ne i64 %rem, 0
+%xor   = xor i64 %rem, %b
+%diff  = icmp slt i64 %xor, 0
+%need  = and i1 %nz, %diff
+%adj   = select i1 %need, i64 %b, i64 0
+%out   = add i64 %rem, %adj
+```
+
+These are pinned by the `floordiv_negatives` correctness test; CPython is the source of truth.
+
+### Division-by-zero
+
+We emit raw `sdiv` / `srem`; LLVM's behaviour for `a / 0` is to raise SIGFPE on x86-64. CPython raises `ZeroDivisionError`. v0.2 has no exception support — programs that divide by zero are diagnosed by the differential test. Test programs avoid div-by-zero until exceptions land in phase 2.
 
 ## Pipeline driven by codegen
 
