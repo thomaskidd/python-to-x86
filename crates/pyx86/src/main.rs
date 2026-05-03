@@ -50,7 +50,7 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
     let source = std::fs::read_to_string(&cli.input)
         .map_err(|e| anyhow::anyhow!("read {}: {}", cli.input.display(), e))?;
     let module = parser::parse(&source, &cli.input)?;
-    let program = check::lower(&module)?;
+    let program = check::lower(&module, &cli.input)?;
 
     let basename = cli
         .input
