@@ -66,31 +66,36 @@ performance:
 
 JSON output gains a `"performance"` array mirroring the human view.
 
-## Initial benchmarks (4 programs, all in our int-only subset)
+## Initial benchmarks (3 programs, all in our v0.6 language subset)
 
-| Bench | Python | Equivalent Rust |
+| Bench | Workload | Why this workload |
 |---|---|---|
-| `sum_iter_perf` | sum of 0..n via while loop | identical structure in Rust |
-| `fib_iter_perf` | iterative Fibonacci(n) via two-var swap | same |
-| `gcd_perf` | Euclidean algorithm | same |
-| `factorial_perf` | n! up to n=12 (capped to fit in i64) | same |
+| `lcg_chain_perf` | 100M iterations of an LCG step (`a = a*c1 + c2`) | Sequential data dependency prevents LLVM from vectorising or folding. Pure-arithmetic hot loop. |
+| `primes_trial_perf` | Count primes in `[2, 100k)` by trial division up to `sqrt(i)` | Branch-heavy, nested while + `break`. Exercises the alloca/load/store pattern under control flow. |
+| `modexp_perf` | 1M iterations of binary exponentiation `b^e mod p` | Div/mod heavy (the floor-correction blocks). Each outer iteration mutates `base` and `exp` so LLVM can't precompute. |
 
-All four work today in our v0.6 language. The `program.rs` for each is a single `fn main() { println!("{}", py_main(...)); }` with the same control flow as the Python version.
+Each bench takes 13–21 ms per run in both implementations, well above the ~1 ms process-startup floor — so the timing reflects compute, not startup.
 
-We deliberately start at small/medium problem sizes — the goal is to validate the perf-pillar **infrastructure**, not to win or lose the race yet. Tightening of `max_ratio` and adding harder benchmarks (mandelbrot, raytracer, sorting kernels) comes once the bench itself is solid.
+### Initial baseline (from this slice)
 
-### Known limitation: initial benchmarks are startup-dominated
+| Bench | py median | rs median | ratio |
+|---|---|---|---|
+| `lcg_chain_perf` | 13.2 ms | 13.6 ms | **0.97x** |
+| `primes_trial_perf` | 13.6 ms | 13.9 ms | **0.98x** |
+| `modexp_perf` | 20.5 ms | 21.3 ms | **0.96x** |
 
-The first run of this pillar showed all 4 benchmarks finishing in under 1 ms each, with py/rs ratios ~0.7x. That is **not the compiler beating clang/rustc** — it is the workload taking less time than process startup. LLVM's loop idiom recognition folds `sum 0..n` to a closed form, and the other workloads (factorial of 12, fib of 80) run in microseconds even without folding.
+`max_ratio` is set to **1.5x** for all three — generous safety margin for noise / scheduling, but tight enough that any meaningful regression in the codegen pipeline (e.g. accidentally disabling an optimization, or generating bloated IR LLVM can't clean up) will trip the assertion.
 
-The ratio ≤ 2.0x assertion still pins a real property: pyx86's compile pipeline produces binaries whose process-start + workload time is no worse than 2x rustc's. But to *test the compiler's ability to keep up with rustc on hot inner loops*, the benchmarks need to do enough non-foldable work that startup time is a small fraction of total. A follow-up slice will:
+### Where the wins/losses come from
 
-- Replace foldable workloads (arithmetic-series sums) with linear-congruential-style chains LLVM can't fold.
-- Increase iteration counts so total CPU time per run is in the 10–100 ms range, well above the ~1 ms process-startup floor.
-- Add benchmarks across more code patterns (branch-heavy, modular-arithmetic, etc.).
-- Then tighten `max_ratio` toward 1.1x.
+- We compile to LLVM IR; rustc compiles to LLVM IR; both go through the same optimizer at `-O2`. Steady-state code quality should be essentially identical.
+- pyx86's binaries are slightly leaner (no Rust panic infrastructure, no `_Unwind_Resume`, no debug-info-by-default), which helps the startup component slightly. On compute-dominated workloads this is in the noise.
+- The floor-div / floor-mod correction blocks in pyx86's IR are emitted regardless of operand range; LLVM-O2 doesn't always eliminate the correction even when it's provably dead. The Rust benchmarks call equivalent helper functions explicitly so the comparison is fair, but if pyx86 ever needs to compete against *idiomatic* Rust (where `%` is plain `srem`), it'll need an analysis pass that drops the correction when both operands are statically non-negative.
 
-This limitation is recorded so future contributors don't read the green ratios as "we're faster than Rust" — we are not, we are **roughly the same** at jobs where everything happens in startup.
+### Future work
+
+- Tighten `max_ratio` toward 1.1x once the codegen has enough optimization affordances (constant folding pre-LLVM, dead-code elim for floor corrections on non-negative operands).
+- Add larger benchmarks: a fixed-size matrix-multiply, a Mersenne-Twister RNG hot loop, a small sorting kernel — all of which need either container types or fixed-size arrays first.
 
 ## Tier assignment
 

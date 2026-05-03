@@ -1,0 +1,14 @@
+tier = 3
+warmup = 3
+iterations = 10
+max_ratio = 1.5
+
+# 1M outer iterations × ~6 inner iterations (log2 64) ~= 6M
+# (mul, mod) pairs. ~50–200 ms range.
+[[input]]
+type = "i64"
+range = [12345, 12345]
+
+[[input]]
+type = "i64"
+range = [37, 37]
