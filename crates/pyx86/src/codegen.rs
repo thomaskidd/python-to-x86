@@ -79,6 +79,15 @@ declare i32 @sprintf(i8*, i8*, ...)
 declare i8* @malloc(i64)
 declare i32 @memcmp(i8*, i8*, i64)
 declare void @llvm.memcpy.p0i8.p0i8.i64(i8*, i8*, i64, i1)
+declare double @llvm.sqrt.f64(double)
+declare double @llvm.sin.f64(double)
+declare double @llvm.cos.f64(double)
+declare double @llvm.exp.f64(double)
+declare double @llvm.log.f64(double)
+declare double @llvm.floor.f64(double)
+declare double @llvm.ceil.f64(double)
+declare double @llvm.fabs.f64(double)
+declare double @tan(double)
 
 @.fmt_i64 = private unnamed_addr constant [5 x i8] c\"%ld\\0A\\00\"
 @.fmt_f64_g = private unnamed_addr constant [6 x i8] c\"%.17g\\00\"
@@ -528,6 +537,7 @@ impl Codegen {
             Expr::StrConcat { lhs, rhs } => self.lower_str_concat(lhs, rhs),
             Expr::StrLen { s } => self.lower_str_len(s),
             Expr::StrEq { lhs, rhs, negated } => self.lower_str_eq(lhs, rhs, *negated),
+            Expr::MathCall { intrinsic, arg } => self.lower_math_call(intrinsic, arg),
         }
     }
 
@@ -1103,6 +1113,19 @@ impl Codegen {
         s1
     }
 
+    fn lower_math_call(&mut self, intrinsic: &str, arg: &TypedExpr) -> String {
+        let v = self.lower(arg);
+        let dst = self.fresh();
+        // The needed declaration is added once by the wrapper module (we
+        // emit declarations for all math intrinsics regardless of use;
+        // LLVM strips unused decls).
+        self.emit(&format!(
+            "{} = call double @{}(double {})",
+            dst, intrinsic, v
+        ));
+        dst
+    }
+
     fn lower_str_lit(&mut self, s: &str) -> String {
         let idx = STR_LITS.with(|sl| {
             let mut sl = sl.borrow_mut();
@@ -1403,6 +1426,7 @@ fn walk_expr(te: &TypedExpr, out: &mut Vec<(String, Type)>, seen: &mut HashSet<S
             walk_expr(rhs, out, seen);
         }
         Expr::StrLen { s } => walk_expr(s, out, seen),
+        Expr::MathCall { arg, .. } => walk_expr(arg, out, seen),
     }
 }
 
