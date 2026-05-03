@@ -1,26 +1,46 @@
-//! High-level IR. Grows slice by slice; v0.5 adds control flow + comparisons.
+//! Typed high-level IR.
+//!
+//! Each expression carries its result type (`TypedExpr.ty`). The
+//! check pass infers the type bottom-up and inserts `Coerce` nodes
+//! when an expression used in a context expecting type T has type
+//! U ≠ T (e.g. an i64 used where a Bool is required for `if`, or a
+//! Bool used in arithmetic).
+//!
+//! Codegen dispatches on `ty` to choose between integer and float
+//! LLVM ops, choose alloca element type, etc.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Type {
+    /// 64-bit signed integer. The default int type and what
+    /// `: int` annotations mean. Wraps on overflow (no arbitrary precision).
     I64,
+    /// IEEE-754 double-precision float. What `: float` means.
+    F64,
+    /// Internal type produced by comparisons, `not`, boolean literals.
+    /// Lowered as LLVM `i1`. Coerced to/from I64 via zext / icmp-ne-0.
+    Bool,
+}
+
+impl Type {
+    pub fn name(self) -> &'static str {
+        match self {
+            Type::I64 => "int",
+            Type::F64 => "float",
+            Type::Bool => "bool",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct Param {
     pub name: String,
-    /// Always Type::I64 in v0.5.
-    #[allow(dead_code)]
     pub ty: Type,
 }
 
 #[derive(Debug, Clone)]
 pub struct Function {
-    /// Always "main" in v0.5.
-    #[allow(dead_code)]
     pub name: String,
     pub params: Vec<Param>,
-    /// Always Type::I64 in v0.5.
-    #[allow(dead_code)]
     pub return_ty: Type,
     pub body: Vec<Stmt>,
 }
@@ -29,8 +49,7 @@ pub struct Function {
 pub struct Program {
     /// All user-defined functions in declaration order. Exactly one
     /// is named "main" — that's the entry point invoked by the C
-    /// `main(argc, argv)` wrapper. Others may be called from any
-    /// function (including recursively / mutually).
+    /// `main(argc, argv)` wrapper.
     pub functions: Vec<Function>,
 }
 
@@ -45,81 +64,57 @@ impl Program {
 
 #[derive(Debug, Clone)]
 pub enum Stmt {
-    Let {
-        name: String,
-        value: Expr,
-    },
-    Return {
-        value: Expr,
-    },
+    Let { name: String, value: TypedExpr },
+    Return { value: TypedExpr },
     If {
-        cond: Expr,
+        cond: TypedExpr,
         then_body: Vec<Stmt>,
-        /// Empty Vec when there is no `else` clause.
         else_body: Vec<Stmt>,
     },
-    While {
-        cond: Expr,
-        body: Vec<Stmt>,
-    },
-    /// Exit the innermost enclosing `While`. Check ensures it only
-    /// appears inside one.
+    While { cond: TypedExpr, body: Vec<Stmt> },
     Break,
-    /// Jump to the next iteration of the innermost enclosing `While`.
     Continue,
+}
+
+/// An expression annotated with its result type. Operands inside `expr`
+/// are themselves `TypedExpr`s — types propagate through the tree.
+#[derive(Debug, Clone)]
+pub struct TypedExpr {
+    pub ty: Type,
+    pub expr: Expr,
+}
+
+impl TypedExpr {
+    pub fn new(ty: Type, expr: Expr) -> Self {
+        Self { ty, expr }
+    }
 }
 
 #[derive(Debug, Clone)]
 pub enum Expr {
     ConstI64(i64),
+    ConstF64(f64),
+    ConstBool(bool),
     /// Reference to a parameter or previously assigned local.
     Var(String),
-    BinOp {
-        op: BinOp,
-        lhs: Box<Expr>,
-        rhs: Box<Expr>,
-    },
-    UnaryOp {
-        op: UnaryOp,
-        operand: Box<Expr>,
-    },
-    /// A single comparison: `a <op> b` → produces i64 0 or 1 (zext of the i1).
-    Cmp {
-        op: CmpOp,
-        lhs: Box<Expr>,
-        rhs: Box<Expr>,
-    },
-    /// Python-style chained comparison `a < b < c < d`. The vector
-    /// holds the operators and the right-hand operand of each pair;
-    /// `first` is the leftmost operand. All sub-expressions are
-    /// pure (no calls, no side effects in v0.5), so codegen lowers
-    /// each operand once per appearance and AND's the i1 results.
-    CmpChain {
-        first: Box<Expr>,
-        rest: Vec<(CmpOp, Expr)>,
-    },
-    /// Logical `not`. Codegen treats inner as truthy-if-nonzero (for
-    /// i64 operands) or as a direct i1 for nested Cmp/Not. Always
-    /// produces i64 0 or 1.
-    Not(Box<Expr>),
-    /// Python `and` / `or` with short-circuit value semantics:
-    /// - `a and b` = a if a is falsy else b
-    /// - `a or  b` = a if a is truthy else b
-    /// Lowered as a branch on `a`'s truthiness, with `b` evaluated
-    /// only on the branch where it's used. Each chains naturally:
-    /// `a and b and c` parses as nested BoolOp(And, BoolOp(And, a, b), c).
-    BoolOp {
-        op: BoolOp,
-        lhs: Box<Expr>,
-        rhs: Box<Expr>,
-    },
-    /// Call to a user-defined function by name. `check.rs` ensures the
-    /// callee exists and the argument count matches its signature.
-    /// All callees return i64 in the current language subset.
-    Call {
-        callee: String,
-        args: Vec<Expr>,
-    },
+    BinOp { op: BinOp, lhs: Box<TypedExpr>, rhs: Box<TypedExpr> },
+    UnaryOp { op: UnaryOp, operand: Box<TypedExpr> },
+    Cmp { op: CmpOp, lhs: Box<TypedExpr>, rhs: Box<TypedExpr> },
+    /// Python-style chained comparison `a < b < c < d`. All sub-expressions
+    /// are pure in the current language subset; codegen evaluates each
+    /// operand once per appearance and AND's the i1 results.
+    CmpChain { first: Box<TypedExpr>, rest: Vec<(CmpOp, TypedExpr)> },
+    /// Logical `not`. Always produces Bool.
+    Not(Box<TypedExpr>),
+    /// `and` / `or` with short-circuit value semantics. Result type is
+    /// the unified type of the two branches (currently always I64;
+    /// once floats land it can be F64 too).
+    BoolOp { op: BoolOp, lhs: Box<TypedExpr>, rhs: Box<TypedExpr> },
+    Call { callee: String, args: Vec<TypedExpr> },
+    /// Insert a type conversion. The inner.ty is the source type;
+    /// the surrounding TypedExpr.ty is the target. Codegen emits the
+    /// appropriate LLVM coercion (zext, sext, sitofp, fptosi, icmp-ne-0).
+    Coerce { inner: Box<TypedExpr> },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,16 +122,19 @@ pub enum BinOp {
     Add,
     Sub,
     Mul,
+    /// Integer floor-division `//`. Operates on I64 only.
     FloorDiv,
+    /// Integer floor-mod `%`. Operates on I64 only (for now; Python
+    /// also defines float `%` but we don't yet need it).
     Mod,
+    /// True division `/`. Always produces F64 even on int operands.
+    TrueDiv,
     BitAnd,
     BitOr,
     BitXor,
     Shl,
     Shr,
-    /// `a ** b` for integer exponent. For negative exp, Python returns
-    /// a float; we don't have float yet, so we return 0 in that case
-    /// — a documented divergence. Overflow wraps (vs Python bigint).
+    /// `a ** b`. Int**Int via runtime helper; float**float via libm pow.
     Pow,
 }
 
@@ -144,7 +142,7 @@ pub enum BinOp {
 pub enum UnaryOp {
     Neg,
     Pos,
-    /// Bitwise not (`~x`). LLVM `xor i64 %x, -1`.
+    /// Bitwise not (`~x`). I64 only; LLVM `xor i64 %x, -1`.
     BitNot,
 }
 
