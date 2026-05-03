@@ -43,20 +43,18 @@ pub fn lower(module: &Module) -> Result<Program> {
     let main_sig = signatures.get("main").ok_or_else(|| {
         anyhow!("unsupported_feature: no `main` function defined at the top level")
     })?;
-    // main return must be I64 — the C wrapper doesn't yet know how to
-    // print a float Python-style. Floats may be used internally.
-    if main_sig.return_ty != Type::I64 {
+    // main return must be int or float — bool isn't a useful CLI return
+    // (and we don't have a printer for it).
+    if !matches!(main_sig.return_ty, Type::I64 | Type::F64) {
         bail!(
-            "unsupported_feature: `main` must return `int` for now (the wrapper printer doesn't yet support {})",
+            "unsupported_feature: `main` must return `int` or `float`, found {}",
             main_sig.return_ty.name()
         );
     }
-    // main parameters must be I64 too (atof / strtod for float argv parsing
-    // is a TODO; argv is currently only atoll'd into I64).
     for p in &main_sig.params {
-        if p.ty != Type::I64 {
+        if !matches!(p.ty, Type::I64 | Type::F64) {
             bail!(
-                "unsupported_feature: `main` parameter `{}` must be `int` for now (argv parsing for {} not yet implemented)",
+                "unsupported_feature: `main` parameter `{}` must be `int` or `float`, found {}",
                 p.name,
                 p.ty.name()
             );

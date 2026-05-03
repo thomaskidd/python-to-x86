@@ -101,6 +101,8 @@ struct ArgStrategy {
     ty: String,
     /// Inclusive `[min, max]`. Required for `i64`.
     range: Option<[i64; 2]>,
+    /// Inclusive `[min, max]`. Required for `f64`.
+    range_f: Option<[f64; 2]>,
 }
 
 #[derive(Serialize, Debug, Clone)]
@@ -545,6 +547,7 @@ fn skipped(name: &str) -> TestResult {
 #[derive(Debug, Clone)]
 enum ArgValue {
     I64(i64),
+    F64(f64),
 }
 
 fn generate_inputs(strategy: &[ArgStrategy], rng: &mut impl Rng) -> Result<Vec<ArgValue>> {
@@ -558,7 +561,14 @@ fn generate_inputs(strategy: &[ArgStrategy], rng: &mut impl Rng) -> Result<Vec<A
                 anyhow::ensure!(lo <= hi, "i64 arg range has lo > hi: [{}, {}]", lo, hi);
                 Ok(ArgValue::I64(rng.gen_range(lo..=hi)))
             }
-            other => anyhow::bail!("strategy arg type `{}` is not supported in v0.3", other),
+            "f64" => {
+                let [lo, hi] = a.range_f.ok_or_else(|| {
+                    anyhow::anyhow!("f64 arg missing required `range_f = [lo, hi]`")
+                })?;
+                anyhow::ensure!(lo <= hi, "f64 arg range has lo > hi: [{}, {}]", lo, hi);
+                Ok(ArgValue::F64(rng.gen_range(lo..=hi)))
+            }
+            other => anyhow::bail!("strategy arg type `{}` is not supported", other),
         })
         .collect()
 }
@@ -567,6 +577,9 @@ fn format_args_python(args: &[ArgValue]) -> String {
     args.iter()
         .map(|a| match a {
             ArgValue::I64(v) => v.to_string(),
+            // Use {:?} so integer-valued floats get the trailing `.0`,
+            // matching Python's float literal syntax for the snippet.
+            ArgValue::F64(v) => format!("{:?}", v),
         })
         .collect::<Vec<_>>()
         .join(", ")
@@ -576,6 +589,7 @@ fn format_args_argv(args: &[ArgValue]) -> Vec<String> {
     args.iter()
         .map(|a| match a {
             ArgValue::I64(v) => v.to_string(),
+            ArgValue::F64(v) => format!("{:?}", v),
         })
         .collect()
 }
