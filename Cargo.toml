@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/pyx86_bench",
+]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.75"
+license = "MIT OR Apache-2.0"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
