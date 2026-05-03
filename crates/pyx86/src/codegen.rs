@@ -33,9 +33,7 @@ pub fn emit_ll(prog: &Program, source_basename: &str) -> String {
     let print_block = match main_fn.return_ty {
         Type::I64 => "  %fmt = getelementptr inbounds [5 x i8], [5 x i8]* @.fmt_i64, i64 0, i64 0\n  call i32 (i8*, ...) @printf(i8* %fmt, i64 %r)".to_string(),
         Type::F64 => "  call void @pyx86_print_f64(double %r)".to_string(),
-        // Check restricts main return to I64 or F64. The other cases
-        // are unreachable but keep the match exhaustive.
-        Type::I8 | Type::I16 | Type::I32 | Type::Bool => {
+        Type::I8 | Type::I16 | Type::I32 | Type::Bool | Type::Tuple(_) => {
             unreachable!("check rejects non-(I64|F64) main return types")
         }
     };
@@ -191,14 +189,24 @@ loop_exit:
 
 ";
 
-fn llvm_ty(ty: Type) -> &'static str {
+fn llvm_ty(ty: Type) -> String {
     match ty {
-        Type::I8 => "i8",
-        Type::I16 => "i16",
-        Type::I32 => "i32",
-        Type::I64 => "i64",
-        Type::F64 => "double",
-        Type::Bool => "i1",
+        Type::I8 => "i8".to_string(),
+        Type::I16 => "i16".to_string(),
+        Type::I32 => "i32".to_string(),
+        Type::I64 => "i64".to_string(),
+        Type::F64 => "double".to_string(),
+        Type::Bool => "i1".to_string(),
+        Type::Tuple(id) => {
+            let inner = id.with_elems(|elems| {
+                elems
+                    .iter()
+                    .map(|t| llvm_ty(*t))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            });
+            format!("{{ {} }}", inner)
+        }
     }
 }
 
@@ -239,7 +247,7 @@ fn format_argv_parsing(func: &Function) -> String {
                     i = i
                 );
             }
-            Type::I8 | Type::I16 | Type::I32 | Type::Bool => {
+            Type::I8 | Type::I16 | Type::I32 | Type::Bool | Type::Tuple(_) => {
                 unreachable!("check rejects non-(I64|F64) main params")
             }
         }
@@ -455,6 +463,8 @@ impl Codegen {
             Expr::Not(inner) => self.lower_not(inner),
             Expr::BoolOp { op, lhs, rhs } => self.lower_bool_op(*op, lhs, rhs, te.ty),
             Expr::Call { callee, args } => self.lower_call(callee, args, te.ty),
+            Expr::TupleLit { elements } => self.lower_tuple_lit(elements, te.ty),
+            Expr::TupleIndex { tuple, index } => self.lower_tuple_index(tuple, *index, te.ty),
         }
     }
 
@@ -775,6 +785,35 @@ impl Codegen {
         self.open_block(&merge_lbl);
         let dst = self.fresh();
         self.emit(&format!("{} = load {ty}, {ty}* {}", dst, slot, ty = ty_str));
+        dst
+    }
+
+    /// Build a tuple value via repeated `insertvalue`.
+    /// `{ undef, ... }` → insertvalue at each index.
+    fn lower_tuple_lit(&mut self, elements: &[TypedExpr], tuple_ty: Type) -> String {
+        let tuple_llvm_ty = llvm_ty(tuple_ty);
+        let mut acc = format!("undef");
+        for (i, elem) in elements.iter().enumerate() {
+            let elem_op = self.lower(elem);
+            let elem_ty = llvm_ty(elem.ty);
+            let dst = self.fresh();
+            self.emit(&format!(
+                "{} = insertvalue {} {}, {} {}, {}",
+                dst, tuple_llvm_ty, acc, elem_ty, elem_op, i
+            ));
+            acc = dst;
+        }
+        acc
+    }
+
+    fn lower_tuple_index(&mut self, tuple: &TypedExpr, index: usize, _result_ty: Type) -> String {
+        let tuple_op = self.lower(tuple);
+        let tuple_llvm_ty = llvm_ty(tuple.ty);
+        let dst = self.fresh();
+        self.emit(&format!(
+            "{} = extractvalue {} {}, {}",
+            dst, tuple_llvm_ty, tuple_op, index
+        ));
         dst
     }
 

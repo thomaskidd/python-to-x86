@@ -4,7 +4,7 @@ use anyhow::{anyhow, bail, Result};
 use rustpython_parser::ast;
 
 use crate::hir::{
-    BinOp, BoolOp, CmpOp, Expr, Function, Param, Program, Stmt, Type, TypedExpr, UnaryOp,
+    BinOp, BoolOp, CmpOp, Expr, Function, Param, Program, Stmt, TupleId, Type, TypedExpr, UnaryOp,
 };
 use crate::parser::Module;
 
@@ -36,22 +36,25 @@ pub fn lower(module: &Module) -> Result<Program> {
                 signatures.insert(name, sig);
             }
             ast::Stmt::ImportFrom(im) => {
-                // The only allowed import (currently) is `from pyx86.types
-                // import …`. The names are accepted as type annotations
-                // directly; the import is only documentary.
+                // Allowed: `from pyx86.types import …` (type-name documentation)
+                //          `from __future__ import annotations` (lets test
+                //              programs use PEP 585 syntax under Python 3.8)
                 let module_name = im
                     .module
                     .as_ref()
                     .map(|s| s.as_str())
                     .unwrap_or("");
-                if module_name != "pyx86.types" {
-                    bail!(
-                        "unsupported_feature: only `from pyx86.types import …` imports are supported (found `from {} import …`)",
+                match module_name {
+                    "pyx86.types" | "__future__" => {
+                        // Accepted; we don't act on the imports — type names
+                        // are resolved directly and we ignore Python's lazy-
+                        // annotation semantics.
+                    }
+                    _ => bail!(
+                        "unsupported_feature: only `from pyx86.types import …` and `from __future__ import …` imports are supported at module level (found `from {} import …`)",
                         module_name
-                    );
+                    ),
                 }
-                // Accept the names but don't track them — type annotations
-                // resolve i8/i16/i32 directly.
             }
             other => bail!(
                 "unsupported_feature: only `def` and `from pyx86.types import …` are allowed at the top level, found {}",
@@ -462,16 +465,29 @@ fn parse_type_annotation(ann: Option<&ast::Expr>) -> Option<Type> {
             "int" => Some(Type::I64),
             "float" => Some(Type::F64),
             "bool" => Some(Type::Bool),
-            // C-width int types — equivalent to `from pyx86.types import i8`,
-            // but we accept the names directly as built-ins. The import
-            // statement is allowed at module level for documentation but
-            // doesn't gate the names.
             "i8" => Some(Type::I8),
             "i16" => Some(Type::I16),
             "i32" => Some(Type::I32),
             "i64" => Some(Type::I64),
             _ => None,
         },
+        // `tuple[int, float, int]` — Subscript with the tuple of element
+        // types as the slice. CPython parses this as Subscript(Name("tuple"), Tuple([...])).
+        ast::Expr::Subscript(s) => {
+            match s.value.as_ref() {
+                ast::Expr::Name(n) if n.id.as_str() == "tuple" => {}
+                _ => return None,
+            }
+            let elem_exprs: Vec<&ast::Expr> = match s.slice.as_ref() {
+                ast::Expr::Tuple(t) => t.elts.iter().collect(),
+                single => vec![single],
+            };
+            let mut elems = Vec::with_capacity(elem_exprs.len());
+            for e in elem_exprs {
+                elems.push(parse_type_annotation(Some(e))?);
+            }
+            Some(Type::Tuple(TupleId::intern(elems)))
+        }
         _ => None,
     }
 }
@@ -598,6 +614,75 @@ fn lower_expr(e: &ast::Expr, scope: &Scope, signatures: &SignatureTable) -> Resu
             })?;
             let args = resolve_call_args(&callee, sig, &c.args, &c.keywords, scope, signatures)?;
             Ok(TypedExpr::new(sig.return_ty, Expr::Call { callee, args }))
+        }
+        ast::Expr::Tuple(t) => {
+            let elements: Result<Vec<TypedExpr>> = t
+                .elts
+                .iter()
+                .map(|e| lower_expr(e, scope, signatures))
+                .collect();
+            let elements = elements?;
+            let elem_types: Vec<Type> = elements.iter().map(|e| e.ty).collect();
+            let id = TupleId::intern(elem_types);
+            Ok(TypedExpr::new(
+                Type::Tuple(id),
+                Expr::TupleLit { elements },
+            ))
+        }
+        ast::Expr::Subscript(s) => {
+            let value = lower_expr(&s.value, scope, signatures)?;
+            let id = match value.ty {
+                Type::Tuple(id) => id,
+                other => bail!(
+                    "unsupported_feature: subscripting non-tuple type {} is not supported",
+                    other.name()
+                ),
+            };
+            let index_value = match s.slice.as_ref() {
+                ast::Expr::Constant(c) => match &c.value {
+                    ast::Constant::Int(big) => {
+                        let v: i64 = big
+                            .try_into()
+                            .map_err(|_| anyhow!("tuple index doesn't fit in i64"))?;
+                        v
+                    }
+                    _ => bail!("unsupported_feature: tuple index must be an integer literal"),
+                },
+                ast::Expr::UnaryOp(u) if matches!(u.op, ast::UnaryOp::USub) => {
+                    match u.operand.as_ref() {
+                        ast::Expr::Constant(c) => match &c.value {
+                            ast::Constant::Int(big) => {
+                                let v: i64 = big
+                                    .try_into()
+                                    .map_err(|_| anyhow!("tuple index doesn't fit in i64"))?;
+                                -v
+                            }
+                            _ => bail!("unsupported_feature: tuple index must be an integer literal"),
+                        },
+                        _ => bail!("unsupported_feature: tuple index must be an integer literal"),
+                    }
+                }
+                _ => bail!(
+                    "unsupported_feature: tuple index must be a constant integer literal"
+                ),
+            };
+            let n = id.with_elems(|elems| elems.len()) as i64;
+            let idx = if index_value < 0 { n + index_value } else { index_value };
+            if idx < 0 || idx >= n {
+                bail!(
+                    "unsupported_feature: tuple index {} out of range for {}",
+                    index_value,
+                    value.ty.name()
+                );
+            }
+            let elem_ty = id.with_elems(|elems| elems[idx as usize]);
+            Ok(TypedExpr::new(
+                elem_ty,
+                Expr::TupleIndex {
+                    tuple: Box::new(value),
+                    index: idx as usize,
+                },
+            ))
         }
         other => bail!(
             "unsupported_feature: expression form `{}` is not supported",
