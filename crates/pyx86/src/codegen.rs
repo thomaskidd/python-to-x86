@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 
@@ -5,8 +6,16 @@ use crate::hir::{
     BinOp, BoolOp, CmpOp, Expr, Function, Program, Stmt, Type, TypedExpr, UnaryOp,
 };
 
+thread_local! {
+    /// Per-emit_ll() collection of string literals encountered during
+    /// codegen. Each gets a unique global symbol `@.str.<idx>`. Cleared
+    /// at the start of every emit_ll call.
+    static STR_LITS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+}
+
 pub fn emit_ll(prog: &Program, source_basename: &str) -> String {
     let basename = sanitize_module_id(source_basename);
+    STR_LITS.with(|s| s.borrow_mut().clear());
 
     let mut function_defs = String::new();
     for func in &prog.functions {
@@ -22,6 +31,25 @@ pub fn emit_ll(prog: &Program, source_basename: &str) -> String {
         );
     }
 
+    // Emit string-literal globals. Each literal is `[N x i8] c"<bytes>\00"`.
+    // The struct view used at runtime drops the trailing NUL from len.
+    let mut str_globals = String::new();
+    STR_LITS.with(|s| {
+        for (i, lit) in s.borrow().iter().enumerate() {
+            // Encode bytes with hex escape for non-printable, leave printable
+            // as-is. We've already restricted literals to ASCII-without-quotes-
+            // or-backslashes, so no escape needed in the body.
+            let n = lit.len() + 1; // include trailing NUL
+            let _ = writeln!(
+                str_globals,
+                "@.str.{} = private unnamed_addr constant [{n} x i8] c\"{body}\\00\"",
+                i,
+                n = n,
+                body = lit
+            );
+        }
+    });
+
     let main_fn = prog.main();
     let py_main_call_args = main_fn
         .params
@@ -33,7 +61,7 @@ pub fn emit_ll(prog: &Program, source_basename: &str) -> String {
     let print_block = match main_fn.return_ty {
         Type::I64 => "  %fmt = getelementptr inbounds [5 x i8], [5 x i8]* @.fmt_i64, i64 0, i64 0\n  call i32 (i8*, ...) @printf(i8* %fmt, i64 %r)".to_string(),
         Type::F64 => "  call void @pyx86_print_f64(double %r)".to_string(),
-        Type::I8 | Type::I16 | Type::I32 | Type::Bool | Type::Tuple(_) | Type::List(_) => {
+        Type::I8 | Type::I16 | Type::I32 | Type::Bool | Type::Tuple(_) | Type::List(_) | Type::Str => {
             unreachable!("check rejects non-(I64|F64) main return types")
         }
     };
@@ -49,11 +77,14 @@ declare double @llvm.pow.f64(double, double)
 declare i64 @strlen(i8*)
 declare i32 @sprintf(i8*, i8*, ...)
 declare i8* @malloc(i64)
+declare i32 @memcmp(i8*, i8*, i64)
+declare void @llvm.memcpy.p0i8.p0i8.i64(i8*, i8*, i64, i1)
 
 @.fmt_i64 = private unnamed_addr constant [5 x i8] c\"%ld\\0A\\00\"
 @.fmt_f64_g = private unnamed_addr constant [6 x i8] c\"%.17g\\00\"
 @.fmt_str_nl = private unnamed_addr constant [4 x i8] c\"%s\\0A\\00\"
 
+{str_globals}
 {runtime}{defs}define i32 @main(i32 %argc, i8** %argv) {{
 entry:
 {parse}  %r = call {ret_ty} @py_main({call_args})
@@ -68,6 +99,7 @@ entry:
         parse = parse_args_block,
         call_args = py_main_call_args,
         print_block = print_block,
+        str_globals = str_globals,
     )
 }
 
@@ -209,10 +241,10 @@ fn llvm_ty(ty: Type) -> String {
             format!("{{ {} }}", inner)
         }
         Type::List(id) => {
-            // { i64 len, T* data }
             let elem = llvm_ty(id.elem());
             format!("{{ i64, {}* }}", elem)
         }
+        Type::Str => "{ i64, i8* }".to_string(),
     }
 }
 
@@ -224,7 +256,8 @@ fn type_byte_size(ty: Type) -> u64 {
         Type::I32 => 4,
         Type::I64 | Type::F64 => 8,
         Type::Tuple(id) => id.with_elems(|elems| elems.iter().map(|t| type_byte_size(*t)).sum()),
-        Type::List(_) => 16, // { i64, ptr } — 16 bytes on x86-64
+        Type::List(_) => 16,
+        Type::Str => 16,
     }
 }
 
@@ -265,7 +298,7 @@ fn format_argv_parsing(func: &Function) -> String {
                     i = i
                 );
             }
-            Type::I8 | Type::I16 | Type::I32 | Type::Bool | Type::Tuple(_) | Type::List(_) => {
+            Type::I8 | Type::I16 | Type::I32 | Type::Bool | Type::Tuple(_) | Type::List(_) | Type::Str => {
                 unreachable!("check rejects non-(I64|F64) main params")
             }
         }
@@ -491,6 +524,10 @@ impl Codegen {
                 self.lower_block(stmts);
                 self.lower(result)
             }
+            Expr::StrLit(s) => self.lower_str_lit(s),
+            Expr::StrConcat { lhs, rhs } => self.lower_str_concat(lhs, rhs),
+            Expr::StrLen { s } => self.lower_str_len(s),
+            Expr::StrEq { lhs, rhs, negated } => self.lower_str_eq(lhs, rhs, *negated),
         }
     }
 
@@ -1066,6 +1103,144 @@ impl Codegen {
         s1
     }
 
+    fn lower_str_lit(&mut self, s: &str) -> String {
+        let idx = STR_LITS.with(|sl| {
+            let mut sl = sl.borrow_mut();
+            // Dedupe: if literal already exists, reuse its id.
+            for (i, existing) in sl.iter().enumerate() {
+                if existing == s {
+                    return i;
+                }
+            }
+            let id = sl.len();
+            sl.push(s.to_string());
+            id
+        });
+        let len = s.len() as i64;
+        let n = s.len() + 1;
+        let data = self.fresh();
+        // Get a `i8*` to the global's first byte.
+        self.emit(&format!(
+            "{} = getelementptr inbounds [{n} x i8], [{n} x i8]* @.str.{}, i64 0, i64 0",
+            data,
+            idx,
+            n = n
+        ));
+        // Build {len, data} struct.
+        let s0 = self.fresh();
+        self.emit(&format!(
+            "{} = insertvalue {{ i64, i8* }} undef, i64 {}, 0",
+            s0, len
+        ));
+        let s1 = self.fresh();
+        self.emit(&format!(
+            "{} = insertvalue {{ i64, i8* }} {}, i8* {}, 1",
+            s1, s0, data
+        ));
+        s1
+    }
+
+    fn lower_str_concat(&mut self, lhs: &TypedExpr, rhs: &TypedExpr) -> String {
+        let l = self.lower(lhs);
+        let r = self.lower(rhs);
+        let lhs_len = self.fresh();
+        self.emit(&format!("{} = extractvalue {{ i64, i8* }} {}, 0", lhs_len, l));
+        let lhs_data = self.fresh();
+        self.emit(&format!("{} = extractvalue {{ i64, i8* }} {}, 1", lhs_data, l));
+        let rhs_len = self.fresh();
+        self.emit(&format!("{} = extractvalue {{ i64, i8* }} {}, 0", rhs_len, r));
+        let rhs_data = self.fresh();
+        self.emit(&format!("{} = extractvalue {{ i64, i8* }} {}, 1", rhs_data, r));
+        let total = self.fresh();
+        self.emit(&format!("{} = add i64 {}, {}", total, lhs_len, rhs_len));
+        let new_data = self.fresh();
+        self.emit(&format!("{} = call i8* @malloc(i64 {})", new_data, total));
+        // memcpy(new_data, lhs_data, lhs_len)
+        self.emit(&format!(
+            "call void @llvm.memcpy.p0i8.p0i8.i64(i8* {}, i8* {}, i64 {}, i1 false)",
+            new_data, lhs_data, lhs_len
+        ));
+        let mid = self.fresh();
+        self.emit(&format!(
+            "{} = getelementptr i8, i8* {}, i64 {}",
+            mid, new_data, lhs_len
+        ));
+        // memcpy(new_data + lhs_len, rhs_data, rhs_len)
+        self.emit(&format!(
+            "call void @llvm.memcpy.p0i8.p0i8.i64(i8* {}, i8* {}, i64 {}, i1 false)",
+            mid, rhs_data, rhs_len
+        ));
+        let s0 = self.fresh();
+        self.emit(&format!(
+            "{} = insertvalue {{ i64, i8* }} undef, i64 {}, 0",
+            s0, total
+        ));
+        let s1 = self.fresh();
+        self.emit(&format!(
+            "{} = insertvalue {{ i64, i8* }} {}, i8* {}, 1",
+            s1, s0, new_data
+        ));
+        s1
+    }
+
+    fn lower_str_len(&mut self, s: &TypedExpr) -> String {
+        let v = self.lower(s);
+        let dst = self.fresh();
+        self.emit(&format!("{} = extractvalue {{ i64, i8* }} {}, 0", dst, v));
+        dst
+    }
+
+    fn lower_str_eq(&mut self, lhs: &TypedExpr, rhs: &TypedExpr, negated: bool) -> String {
+        let l = self.lower(lhs);
+        let r = self.lower(rhs);
+        let lhs_len = self.fresh();
+        self.emit(&format!("{} = extractvalue {{ i64, i8* }} {}, 0", lhs_len, l));
+        let rhs_len = self.fresh();
+        self.emit(&format!("{} = extractvalue {{ i64, i8* }} {}, 0", rhs_len, r));
+
+        let result_addr = self.fresh();
+        self.emit(&format!("{} = alloca i1", result_addr));
+        // Default: not equal (i1 0)
+        self.emit(&format!("store i1 0, i1* {}", result_addr));
+
+        let len_eq = self.fresh();
+        self.emit(&format!("{} = icmp eq i64 {}, {}", len_eq, lhs_len, rhs_len));
+
+        let id = self.next_block_id;
+        self.next_block_id += 1;
+        let memcmp_lbl = format!("streq.memcmp.{}", id);
+        let merge_lbl = format!("streq.merge.{}", id);
+        self.emit(&format!("br i1 {}, label %{}, label %{}", len_eq, memcmp_lbl, merge_lbl));
+        self.block_terminated = true;
+
+        self.open_block(&memcmp_lbl);
+        let lhs_data = self.fresh();
+        self.emit(&format!("{} = extractvalue {{ i64, i8* }} {}, 1", lhs_data, l));
+        let rhs_data = self.fresh();
+        self.emit(&format!("{} = extractvalue {{ i64, i8* }} {}, 1", rhs_data, r));
+        let cmp_res = self.fresh();
+        self.emit(&format!(
+            "{} = call i32 @memcmp(i8* {}, i8* {}, i64 {})",
+            cmp_res, lhs_data, rhs_data, lhs_len
+        ));
+        let eq = self.fresh();
+        self.emit(&format!("{} = icmp eq i32 {}, 0", eq, cmp_res));
+        self.emit(&format!("store i1 {}, i1* {}", eq, result_addr));
+        self.emit(&format!("br label %{}", merge_lbl));
+        self.block_terminated = true;
+
+        self.open_block(&merge_lbl);
+        let result = self.fresh();
+        self.emit(&format!("{} = load i1, i1* {}", result, result_addr));
+        if negated {
+            let neg = self.fresh();
+            self.emit(&format!("{} = xor i1 {}, true", neg, result));
+            neg
+        } else {
+            result
+        }
+    }
+
     fn lower_list_len(&mut self, list: &TypedExpr) -> String {
         let list_op = self.lower(list);
         let list_llvm = llvm_ty(list.ty);
@@ -1222,6 +1397,12 @@ fn walk_expr(te: &TypedExpr, out: &mut Vec<(String, Type)>, seen: &mut HashSet<S
             walk_stmts(stmts, out, seen);
             walk_expr(result, out, seen);
         }
+        Expr::StrLit(_) => {}
+        Expr::StrConcat { lhs, rhs } | Expr::StrEq { lhs, rhs, .. } => {
+            walk_expr(lhs, out, seen);
+            walk_expr(rhs, out, seen);
+        }
+        Expr::StrLen { s } => walk_expr(s, out, seen),
     }
 }
 
