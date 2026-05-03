@@ -486,6 +486,7 @@ impl Codegen {
             Expr::ListLit { elements } => self.lower_list_lit(elements, te.ty),
             Expr::ListIndex { list, index } => self.lower_list_index(list, index, te.ty),
             Expr::ListLen { list } => self.lower_list_len(list),
+            Expr::ListConcat { lhs, rhs } => self.lower_list_concat(lhs, rhs, te.ty),
         }
     }
 
@@ -915,6 +916,150 @@ impl Codegen {
         let dst = self.fresh();
         self.emit(&format!("{} = load {ety}, {ety}* {}", dst, p, ety = elem_llvm));
         dst
+    }
+
+    fn lower_list_concat(&mut self, lhs: &TypedExpr, rhs: &TypedExpr, list_ty: Type) -> String {
+        let id = match list_ty {
+            Type::List(id) => id,
+            _ => panic!("internal: list_concat with non-list result type"),
+        };
+        let elem_ty = id.elem();
+        let elem_llvm = llvm_ty(elem_ty);
+        let elem_size = type_byte_size(elem_ty);
+        let list_llvm = llvm_ty(list_ty);
+
+        let lhs_op = self.lower(lhs);
+        let rhs_op = self.lower(rhs);
+
+        // Pull len + data from each.
+        let lhs_len = self.fresh();
+        self.emit(&format!("{} = extractvalue {ty} {}, 0", lhs_len, lhs_op, ty = list_llvm));
+        let lhs_data = self.fresh();
+        self.emit(&format!("{} = extractvalue {ty} {}, 1", lhs_data, lhs_op, ty = list_llvm));
+        let rhs_len = self.fresh();
+        self.emit(&format!("{} = extractvalue {ty} {}, 0", rhs_len, rhs_op, ty = list_llvm));
+        let rhs_data = self.fresh();
+        self.emit(&format!("{} = extractvalue {ty} {}, 1", rhs_data, rhs_op, ty = list_llvm));
+
+        // Total length and bytes.
+        let total_len = self.fresh();
+        self.emit(&format!("{} = add i64 {}, {}", total_len, lhs_len, rhs_len));
+        let total_bytes = self.fresh();
+        self.emit(&format!("{} = mul i64 {}, {}", total_bytes, total_len, elem_size));
+
+        // Allocate.
+        let raw = self.fresh();
+        self.emit(&format!("{} = call i8* @malloc(i64 {})", raw, total_bytes));
+        let new_data = self.fresh();
+        self.emit(&format!("{} = bitcast i8* {} to {}*", new_data, raw, elem_llvm));
+
+        // Copy lhs: for i in 0..lhs_len: new_data[i] = lhs_data[i]
+        // Use a loop. We need fresh block ids.
+        let id_n = self.next_block_id;
+        self.next_block_id += 3;
+        let copy_lhs_hdr = format!("concat.lhs_hdr.{}", id_n);
+        let copy_lhs_body = format!("concat.lhs_body.{}", id_n);
+        let copy_lhs_done = format!("concat.lhs_done.{}", id_n);
+
+        let i_addr = self.fresh();
+        self.emit(&format!("{} = alloca i64", i_addr));
+        self.emit(&format!("store i64 0, i64* {}", i_addr));
+        self.emit(&format!("br label %{}", copy_lhs_hdr));
+        self.block_terminated = true;
+
+        self.open_block(&copy_lhs_hdr);
+        let i = self.fresh();
+        self.emit(&format!("{} = load i64, i64* {}", i, i_addr));
+        let cmp = self.fresh();
+        self.emit(&format!("{} = icmp slt i64 {}, {}", cmp, i, lhs_len));
+        self.emit(&format!(
+            "br i1 {}, label %{}, label %{}",
+            cmp, copy_lhs_body, copy_lhs_done
+        ));
+        self.block_terminated = true;
+
+        self.open_block(&copy_lhs_body);
+        let src_p = self.fresh();
+        self.emit(&format!(
+            "{} = getelementptr {ety}, {ety}* {}, i64 {}",
+            src_p, lhs_data, i, ety = elem_llvm
+        ));
+        let val = self.fresh();
+        self.emit(&format!("{} = load {ety}, {ety}* {}", val, src_p, ety = elem_llvm));
+        let dst_p = self.fresh();
+        self.emit(&format!(
+            "{} = getelementptr {ety}, {ety}* {}, i64 {}",
+            dst_p, new_data, i, ety = elem_llvm
+        ));
+        self.emit(&format!("store {ety} {}, {ety}* {}", val, dst_p, ety = elem_llvm));
+        let i_next = self.fresh();
+        self.emit(&format!("{} = add i64 {}, 1", i_next, i));
+        self.emit(&format!("store i64 {}, i64* {}", i_next, i_addr));
+        self.emit(&format!("br label %{}", copy_lhs_hdr));
+        self.block_terminated = true;
+
+        self.open_block(&copy_lhs_done);
+
+        // Copy rhs: for j in 0..rhs_len: new_data[lhs_len + j] = rhs_data[j]
+        let id_n2 = self.next_block_id;
+        self.next_block_id += 3;
+        let copy_rhs_hdr = format!("concat.rhs_hdr.{}", id_n2);
+        let copy_rhs_body = format!("concat.rhs_body.{}", id_n2);
+        let copy_rhs_done = format!("concat.rhs_done.{}", id_n2);
+
+        let j_addr = self.fresh();
+        self.emit(&format!("{} = alloca i64", j_addr));
+        self.emit(&format!("store i64 0, i64* {}", j_addr));
+        self.emit(&format!("br label %{}", copy_rhs_hdr));
+        self.block_terminated = true;
+
+        self.open_block(&copy_rhs_hdr);
+        let j = self.fresh();
+        self.emit(&format!("{} = load i64, i64* {}", j, j_addr));
+        let cmp2 = self.fresh();
+        self.emit(&format!("{} = icmp slt i64 {}, {}", cmp2, j, rhs_len));
+        self.emit(&format!(
+            "br i1 {}, label %{}, label %{}",
+            cmp2, copy_rhs_body, copy_rhs_done
+        ));
+        self.block_terminated = true;
+
+        self.open_block(&copy_rhs_body);
+        let src_p2 = self.fresh();
+        self.emit(&format!(
+            "{} = getelementptr {ety}, {ety}* {}, i64 {}",
+            src_p2, rhs_data, j, ety = elem_llvm
+        ));
+        let val2 = self.fresh();
+        self.emit(&format!("{} = load {ety}, {ety}* {}", val2, src_p2, ety = elem_llvm));
+        let dst_off = self.fresh();
+        self.emit(&format!("{} = add i64 {}, {}", dst_off, lhs_len, j));
+        let dst_p2 = self.fresh();
+        self.emit(&format!(
+            "{} = getelementptr {ety}, {ety}* {}, i64 {}",
+            dst_p2, new_data, dst_off, ety = elem_llvm
+        ));
+        self.emit(&format!("store {ety} {}, {ety}* {}", val2, dst_p2, ety = elem_llvm));
+        let j_next = self.fresh();
+        self.emit(&format!("{} = add i64 {}, 1", j_next, j));
+        self.emit(&format!("store i64 {}, i64* {}", j_next, j_addr));
+        self.emit(&format!("br label %{}", copy_rhs_hdr));
+        self.block_terminated = true;
+
+        self.open_block(&copy_rhs_done);
+
+        // Build the result struct.
+        let s0 = self.fresh();
+        self.emit(&format!(
+            "{} = insertvalue {ty} undef, i64 {}, 0",
+            s0, total_len, ty = list_llvm
+        ));
+        let s1 = self.fresh();
+        self.emit(&format!(
+            "{} = insertvalue {ty} {}, {}* {}, 1",
+            s1, s0, elem_llvm, new_data, ty = list_llvm
+        ));
+        s1
     }
 
     fn lower_list_len(&mut self, list: &TypedExpr) -> String {
