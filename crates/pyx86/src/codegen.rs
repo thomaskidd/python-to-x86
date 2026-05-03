@@ -14,20 +14,29 @@ use crate::hir::{BinOp, BoolOp, CmpOp, Expr, Function, Program, Stmt, UnaryOp};
 /// Typed pointers (`i8*`, `i64*`) so this works on LLVM 10+.
 pub fn emit_ll(prog: &Program, source_basename: &str) -> String {
     let basename = sanitize_module_id(source_basename);
-    let func = &prog.main;
 
-    let mut cg = Codegen::new();
-    cg.lower_function(func);
-    let body = cg.body;
+    // Emit each user function as `define i64 @py_<name>(...) { ... }`.
+    let mut function_defs = String::new();
+    for func in &prog.functions {
+        let mut cg = Codegen::new();
+        cg.lower_function(func);
+        let _ = writeln!(
+            function_defs,
+            "define i64 @py_{name}({sig}) {{\n{body}}}\n",
+            name = func.name,
+            sig = format_signature(func),
+            body = cg.body,
+        );
+    }
 
-    let signature = format_signature(func);
-    let py_main_call_args = func
+    let main_fn = prog.main();
+    let py_main_call_args = main_fn
         .params
         .iter()
         .map(|p| format!("i64 %p_{}", p.name))
         .collect::<Vec<_>>()
         .join(", ");
-    let parse_args_block = format_argv_parsing(func);
+    let parse_args_block = format_argv_parsing(main_fn);
 
     format!(
         "; ModuleID = 'pyx86_{name}'
@@ -38,10 +47,7 @@ declare i64 @atoll(i8*)
 
 @.fmt_i64 = private unnamed_addr constant [5 x i8] c\"%ld\\0A\\00\"
 
-define i64 @py_main({sig}) {{
-{body}}}
-
-define i32 @main(i32 %argc, i8** %argv) {{
+{defs}define i32 @main(i32 %argc, i8** %argv) {{
 entry:
 {parse}  %r = call i64 @py_main({call_args})
   %fmt = getelementptr inbounds [5 x i8], [5 x i8]* @.fmt_i64, i64 0, i64 0
@@ -50,8 +56,7 @@ entry:
 }}
 ",
         name = basename,
-        sig = signature,
-        body = body,
+        defs = function_defs,
         parse = parse_args_block,
         call_args = py_main_call_args,
     )
@@ -327,6 +332,20 @@ impl Codegen {
                 dst
             }
             Expr::BoolOp { op, lhs, rhs } => self.lower_bool_op_value(*op, lhs, rhs),
+            Expr::Call { callee, args } => {
+                let arg_ops: Vec<String> = args.iter().map(|a| self.lower(a)).collect();
+                let dst = self.fresh();
+                let call_args = arg_ops
+                    .iter()
+                    .map(|op| format!("i64 {}", op))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                self.emit(&format!(
+                    "{} = call i64 @py_{}({})",
+                    dst, callee, call_args
+                ));
+                dst
+            }
         }
     }
 
@@ -544,7 +563,7 @@ mod tests {
 
     fn make_program(params: Vec<&str>, body: Vec<Stmt>) -> Program {
         Program {
-            main: Function {
+            functions: vec![Function {
                 name: "main".into(),
                 params: params
                     .into_iter()
@@ -552,7 +571,7 @@ mod tests {
                     .collect(),
                 return_ty: Type::I64,
                 body,
-            },
+            }],
         }
     }
 

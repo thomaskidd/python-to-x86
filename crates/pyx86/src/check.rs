@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::{anyhow, bail, Result};
 use rustpython_parser::ast;
@@ -8,98 +8,153 @@ use crate::parser::Module;
 
 const MAX_PARAMS: usize = 16;
 
-/// Lower the parsed module into a `hir::Program`. v0.5 supports:
-///
-/// - `def main(<param>: int, …) -> int:` (up to 16 typed-int params)
-/// - body composed of:
-///   - `<name> [: int] = <expr>`     (assignment, plain or annotated)
-///   - `if <cond>: <body> [elif …]* [else: <body>]`
-///   - `return <expr>`
-/// - expressions:
-///   - int literals
-///   - variable references (param or local)
-///   - binary `+ - * // %`
-///   - unary `+x`, `-x`, `not x`
-///   - comparison `< <= > >= == !=` (chained allowed)
-///
-/// Anything else produces an `unsupported_feature` error.
-pub fn lower(module: &Module) -> Result<Program> {
-    if module.body.len() != 1 {
-        bail!(
-            "unsupported_feature: expected exactly one top-level definition, found {}",
-            module.body.len()
-        );
-    }
-    let func = match &module.body[0] {
-        ast::Stmt::FunctionDef(f) => f,
-        other => bail!(
-            "unsupported_feature: expected `def main(...)` at the top level, found {}",
-            stmt_kind_name(other)
-        ),
-    };
+/// Function signature, used by the call-resolution pass so calls can
+/// be validated before bodies are lowered (which lets us support
+/// recursion and forward references).
+#[derive(Debug)]
+struct FunctionSig {
+    params: Vec<Param>,
+    return_ty: Type,
+}
 
-    if func.name.as_str() != "main" {
+type SignatureTable = HashMap<String, FunctionSig>;
+
+/// Lower the parsed module into a `hir::Program`. The module body is
+/// a sequence of `def <name>(...)` blocks; one must be named `main`.
+/// Functions may call each other (including recursively / mutually).
+pub fn lower(module: &Module) -> Result<Program> {
+    // Pass 1: collect signatures of all top-level functions so calls
+    // can be validated before any body is lowered. This is what makes
+    // forward references and mutual recursion work.
+    let mut signatures: SignatureTable = HashMap::new();
+    for stmt in &module.body {
+        let func = match stmt {
+            ast::Stmt::FunctionDef(f) => f,
+            other => bail!(
+                "unsupported_feature: only `def` is allowed at the top level, found {}",
+                stmt_kind_name(other)
+            ),
+        };
+        let sig = collect_signature(func)?;
+        let name = func.name.as_str().to_string();
+        if signatures.contains_key(&name) {
+            bail!("unsupported_feature: duplicate top-level function `{}`", name);
+        }
+        signatures.insert(name, sig);
+    }
+
+    if !signatures.contains_key("main") {
+        bail!("unsupported_feature: no `main` function defined at the top level");
+    }
+
+    // Pass 2: lower each function body using the signature table.
+    let mut functions = Vec::with_capacity(module.body.len());
+    for stmt in &module.body {
+        let func = match stmt {
+            ast::Stmt::FunctionDef(f) => f,
+            _ => unreachable!(),
+        };
+        let f = lower_function(func, &signatures)?;
+        functions.push(f);
+    }
+
+    Ok(Program { functions })
+}
+
+fn collect_signature(func: &ast::StmtFunctionDef) -> Result<FunctionSig> {
+    if !func.args.posonlyargs.is_empty() || !func.args.kwonlyargs.is_empty() {
         bail!(
-            "unsupported_feature: top-level function must be `main`, found `{}`",
+            "unsupported_feature: positional-only and keyword-only parameters are not supported (in `{}`)",
             func.name
         );
     }
-    if !func.args.posonlyargs.is_empty() || !func.args.kwonlyargs.is_empty() {
-        bail!("unsupported_feature: positional-only and keyword-only parameters are not supported");
-    }
     if func.args.vararg.is_some() || func.args.kwarg.is_some() {
-        bail!("unsupported_feature: *args / **kwargs are not supported");
+        bail!(
+            "unsupported_feature: *args / **kwargs are not supported (in `{}`)",
+            func.name
+        );
     }
     if func.args.defaults().next().is_some() {
-        bail!("unsupported_feature: default arguments are not supported");
+        bail!(
+            "unsupported_feature: default arguments are not supported (in `{}`)",
+            func.name
+        );
     }
     if !func.decorator_list.is_empty() {
-        bail!("unsupported_feature: decorators are not supported");
+        bail!(
+            "unsupported_feature: decorators are not supported (in `{}`)",
+            func.name
+        );
     }
     if func.args.args.len() > MAX_PARAMS {
         bail!(
-            "unsupported_feature: at most {} parameters supported, found {}",
+            "unsupported_feature: at most {} parameters supported, found {} (in `{}`)",
             MAX_PARAMS,
-            func.args.args.len()
+            func.args.args.len(),
+            func.name
         );
     }
 
     let mut params = Vec::with_capacity(func.args.args.len());
-    let mut scope: HashSet<String> = HashSet::new();
+    let mut seen = HashSet::new();
     for arg in &func.args.args {
         let name = arg.def.arg.as_str().to_string();
-        if !scope.insert(name.clone()) {
-            bail!("unsupported_feature: duplicate parameter name `{}`", name);
+        if !seen.insert(name.clone()) {
+            bail!(
+                "unsupported_feature: duplicate parameter name `{}` (in `{}`)",
+                name,
+                func.name
+            );
         }
-        let ty = parse_type_annotation(arg.def.annotation.as_deref())
-            .ok_or_else(|| anyhow!("unsupported_feature: parameter `{}` must be annotated `: int`", name))?;
+        let ty = parse_type_annotation(arg.def.annotation.as_deref()).ok_or_else(|| {
+            anyhow!(
+                "unsupported_feature: parameter `{}` must be annotated `: int` (in `{}`)",
+                name,
+                func.name
+            )
+        })?;
         params.push(Param { name, ty });
     }
 
     let return_ty = match parse_type_annotation(func.returns.as_deref()) {
         Some(ty) => ty,
-        None => bail!("unsupported_feature: requires a return annotation `-> int`"),
+        None => bail!(
+            "unsupported_feature: function `{}` requires a return annotation `-> int`",
+            func.name
+        ),
     };
 
+    Ok(FunctionSig { params, return_ty })
+}
+
+fn lower_function(func: &ast::StmtFunctionDef, signatures: &SignatureTable) -> Result<Function> {
+    let name = func.name.as_str().to_string();
+    let sig = signatures.get(&name).expect("signature must have been collected in pass 1");
+
+    // Seed the local scope with the parameter names.
+    let mut scope: HashSet<String> = sig.params.iter().map(|p| p.name.clone()).collect();
+
     if func.body.is_empty() {
-        bail!("unsupported_feature: function body is empty");
-    }
-
-    let body = lower_block(&func.body, &mut scope, 0)?;
-
-    if !block_always_returns(&body) {
         bail!(
-            "unsupported_feature: not all paths return a value (the function body, or both branches of every trailing `if`, must end with `return`)"
+            "unsupported_feature: function `{}` body is empty",
+            name
         );
     }
 
-    Ok(Program {
-        main: Function {
-            name: "main".to_string(),
-            params,
-            return_ty,
-            body,
-        },
+    let body = lower_block(&func.body, &mut scope, 0, signatures)?;
+
+    if !block_always_returns(&body) {
+        bail!(
+            "unsupported_feature: not all paths return a value in `{}` (the function body, or both branches of every trailing `if`, must end with `return`)",
+            name
+        );
+    }
+
+    Ok(Function {
+        name,
+        params: sig.params.clone(),
+        return_ty: sig.return_ty,
+        body,
     })
 }
 
@@ -131,13 +186,14 @@ fn lower_block(
     stmts: &[ast::Stmt],
     scope: &mut HashSet<String>,
     loop_depth: usize,
+    signatures: &SignatureTable,
 ) -> Result<Vec<Stmt>> {
     let mut out = Vec::with_capacity(stmts.len());
     for stmt in stmts {
         match stmt {
             ast::Stmt::Assign(a) => {
                 let name = parse_assign_target(&a.targets)?;
-                let value = lower_expr(&a.value, scope)?;
+                let value = lower_expr(&a.value, scope, signatures)?;
                 scope.insert(name.clone());
                 out.push(Stmt::Let { name, value });
             }
@@ -165,7 +221,7 @@ fn lower_block(
                         name
                     )
                 })?;
-                let value = lower_expr(value_expr, scope)?;
+                let value = lower_expr(value_expr, scope, signatures)?;
                 scope.insert(name.clone());
                 out.push(Stmt::Let { name, value });
             }
@@ -206,7 +262,7 @@ fn lower_block(
                         "unsupported_feature: `@=` (matmul) is not supported"
                     ),
                 };
-                let rhs = lower_expr(&a.value, scope)?;
+                let rhs = lower_expr(&a.value, scope, signatures)?;
                 let value = Expr::BinOp {
                     op,
                     lhs: Box::new(Expr::Var(name.clone())),
@@ -219,11 +275,11 @@ fn lower_block(
                     .value
                     .as_deref()
                     .ok_or_else(|| anyhow!("unsupported_feature: `return` must have a value"))?;
-                let value = lower_expr(value_expr, scope)?;
+                let value = lower_expr(value_expr, scope, signatures)?;
                 out.push(Stmt::Return { value });
             }
             ast::Stmt::If(if_stmt) => {
-                let cond = lower_expr(&if_stmt.test, scope)?;
+                let cond = lower_expr(&if_stmt.test, scope, signatures)?;
                 // Branch bodies see and may extend the same scope as
                 // the surrounding block. (Python doesn't have block
                 // scope; locals introduced in a branch are accessible
@@ -232,8 +288,8 @@ fn lower_block(
                 // in CPython. We use alloca slots that hold the
                 // last-stored value or undef; we accept this as a
                 // pragmatic deviation.)
-                let then_body = lower_block(&if_stmt.body, scope, loop_depth)?;
-                let else_body = lower_block(&if_stmt.orelse, scope, loop_depth)?;
+                let then_body = lower_block(&if_stmt.body, scope, loop_depth, signatures)?;
+                let else_body = lower_block(&if_stmt.orelse, scope, loop_depth, signatures)?;
                 out.push(Stmt::If { cond, then_body, else_body });
             }
             ast::Stmt::While(w) => {
@@ -242,8 +298,8 @@ fn lower_block(
                         "unsupported_feature: `else` clause on `while` is not supported"
                     );
                 }
-                let cond = lower_expr(&w.test, scope)?;
-                let body = lower_block(&w.body, scope, loop_depth + 1)?;
+                let cond = lower_expr(&w.test, scope, signatures)?;
+                let body = lower_block(&w.body, scope, loop_depth + 1, signatures)?;
                 out.push(Stmt::While { cond, body });
             }
             ast::Stmt::Break(_) => {
@@ -298,7 +354,7 @@ fn parse_type_annotation(ann: Option<&ast::Expr>) -> Option<Type> {
     }
 }
 
-fn lower_expr(e: &ast::Expr, scope: &HashSet<String>) -> Result<Expr> {
+fn lower_expr(e: &ast::Expr, scope: &HashSet<String>, signatures: &SignatureTable) -> Result<Expr> {
     match e {
         ast::Expr::Constant(c) => match &c.value {
             ast::Constant::Int(big) => {
@@ -341,8 +397,8 @@ fn lower_expr(e: &ast::Expr, scope: &HashSet<String>) -> Result<Expr> {
             };
             Ok(Expr::BinOp {
                 op,
-                lhs: Box::new(lower_expr(&b.left, scope)?),
-                rhs: Box::new(lower_expr(&b.right, scope)?),
+                lhs: Box::new(lower_expr(&b.left, scope, signatures)?),
+                rhs: Box::new(lower_expr(&b.right, scope, signatures)?),
             })
         }
         ast::Expr::UnaryOp(u) => {
@@ -350,23 +406,23 @@ fn lower_expr(e: &ast::Expr, scope: &HashSet<String>) -> Result<Expr> {
                 ast::UnaryOp::USub => UnaryOp::Neg,
                 ast::UnaryOp::UAdd => UnaryOp::Pos,
                 ast::UnaryOp::Not => {
-                    return Ok(Expr::Not(Box::new(lower_expr(&u.operand, scope)?)));
+                    return Ok(Expr::Not(Box::new(lower_expr(&u.operand, scope, signatures)?)));
                 }
                 ast::UnaryOp::Invert => UnaryOp::BitNot,
             };
             Ok(Expr::UnaryOp {
                 op,
-                operand: Box::new(lower_expr(&u.operand, scope)?),
+                operand: Box::new(lower_expr(&u.operand, scope, signatures)?),
             })
         }
         ast::Expr::Compare(c) => {
             // Python AST: left + ops[] + comparators[]. ops.len() == comparators.len().
-            let first = lower_expr(&c.left, scope)?;
+            let first = lower_expr(&c.left, scope, signatures)?;
             let rest: Result<Vec<(CmpOp, Expr)>> = c
                 .ops
                 .iter()
                 .zip(c.comparators.iter())
-                .map(|(op, e)| Ok((convert_cmp_op(op)?, lower_expr(e, scope)?)))
+                .map(|(op, e)| Ok((convert_cmp_op(op)?, lower_expr(e, scope, signatures)?)))
                 .collect();
             let rest = rest?;
             if rest.len() == 1 {
@@ -395,13 +451,47 @@ fn lower_expr(e: &ast::Expr, scope: &HashSet<String>) -> Result<Expr> {
                 bail!("unsupported_feature: empty BoolOp (should not be possible from valid Python)");
             }
             let mut iter = b.values.iter();
-            let first = lower_expr(iter.next().unwrap(), scope)?;
+            let first = lower_expr(iter.next().unwrap(), scope, signatures)?;
             let mut acc = first;
             for next in iter {
-                let next = lower_expr(next, scope)?;
+                let next = lower_expr(next, scope, signatures)?;
                 acc = Expr::BoolOp { op, lhs: Box::new(acc), rhs: Box::new(next) };
             }
             Ok(acc)
+        }
+        ast::Expr::Call(c) => {
+            // Resolve callee. Only plain name calls (`foo(a, b)`)
+            // supported — no method calls, no `obj.method()`, no
+            // higher-order calls. Keyword args / star-args rejected.
+            let callee = match c.func.as_ref() {
+                ast::Expr::Name(n) => n.id.as_str().to_string(),
+                _ => bail!(
+                    "unsupported_feature: only direct calls to top-level functions are supported (no method / attribute / higher-order calls yet)"
+                ),
+            };
+            if !c.keywords.is_empty() {
+                bail!("unsupported_feature: keyword arguments are not yet supported");
+            }
+            let sig = signatures.get(&callee).ok_or_else(|| {
+                anyhow!(
+                    "unsupported_feature: call to undefined function `{}`",
+                    callee
+                )
+            })?;
+            if c.args.len() != sig.params.len() {
+                bail!(
+                    "unsupported_feature: function `{}` takes {} positional arguments but {} were supplied",
+                    callee,
+                    sig.params.len(),
+                    c.args.len()
+                );
+            }
+            let args: Result<Vec<Expr>> = c
+                .args
+                .iter()
+                .map(|a| lower_expr(a, scope, signatures))
+                .collect();
+            Ok(Expr::Call { callee, args: args? })
         }
         other => bail!(
             "unsupported_feature: expression form `{}` is not supported",
@@ -508,7 +598,7 @@ mod tests {
             "def main(a: int) -> int:\n    if a < 0:\n        return -a\n    else:\n        return a\n",
         ))
         .unwrap();
-        match &p.main.body[0] {
+        match &p.main().body[0] {
             Stmt::If { cond, then_body, else_body } => {
                 assert!(matches!(cond, Expr::Cmp { op: CmpOp::Lt, .. }));
                 assert!(matches!(then_body[0], Stmt::Return { .. }));
@@ -524,7 +614,7 @@ mod tests {
             "def main(a: int) -> int:\n    if a < 0:\n        return -1\n    elif a == 0:\n        return 0\n    else:\n        return 1\n",
         ))
         .unwrap();
-        match &p.main.body[0] {
+        match &p.main().body[0] {
             Stmt::If { else_body, .. } => {
                 // else_body should contain a single nested If.
                 assert_eq!(else_body.len(), 1);
@@ -540,7 +630,7 @@ mod tests {
             "def main(a: int) -> int:\n    if 0 < a < 100:\n        return 1\n    else:\n        return 0\n",
         ))
         .unwrap();
-        match &p.main.body[0] {
+        match &p.main().body[0] {
             Stmt::If { cond: Expr::CmpChain { first, rest }, .. } => {
                 assert!(matches!(**first, Expr::ConstI64(0)));
                 assert_eq!(rest.len(), 2);
@@ -555,7 +645,7 @@ mod tests {
             "def main(a: int) -> int:\n    if a:\n        return 1\n    else:\n        return 0\n",
         ))
         .unwrap();
-        match &p.main.body[0] {
+        match &p.main().body[0] {
             Stmt::If { cond, .. } => assert!(matches!(cond, Expr::Var(n) if n == "a")),
             _ => panic!("expected If"),
         }
@@ -567,7 +657,7 @@ mod tests {
             "def main(a: int) -> int:\n    if not a:\n        return 1\n    else:\n        return 0\n",
         ))
         .unwrap();
-        match &p.main.body[0] {
+        match &p.main().body[0] {
             Stmt::If { cond: Expr::Not(_), .. } => {}
             _ => panic!("expected Not in If condition"),
         }
@@ -579,7 +669,7 @@ mod tests {
             "def main(a: int, b: int) -> int:\n    if a > 0 and b > 0:\n        return 1\n    else:\n        return 0\n",
         ))
         .unwrap();
-        match &p.main.body[0] {
+        match &p.main().body[0] {
             Stmt::If { cond: Expr::BoolOp { op: BoolOp::And, .. }, .. } => {}
             other => panic!("expected If with BoolOp::And, got {:?}", other),
         }
@@ -593,7 +683,7 @@ mod tests {
             "def main(a: int, b: int, c: int) -> int:\n    if a or b or c:\n        return 1\n    else:\n        return 0\n",
         ))
         .unwrap();
-        match &p.main.body[0] {
+        match &p.main().body[0] {
             Stmt::If { cond: Expr::BoolOp { op: BoolOp::Or, lhs, .. }, .. } => {
                 assert!(matches!(**lhs, Expr::BoolOp { op: BoolOp::Or, .. }));
             }
@@ -639,7 +729,7 @@ mod tests {
         ))
         .unwrap();
         // body[0] = Let i, body[1] = While, body[2] = Return.
-        assert!(matches!(p.main.body[1], Stmt::While { .. }));
+        assert!(matches!(p.main().body[1], Stmt::While { .. }));
     }
 
     #[test]
@@ -648,7 +738,7 @@ mod tests {
             "def main(n: int) -> int:\n    i = 0\n    while i < n:\n        if i == 5:\n            break\n        if i == 3:\n            i = i + 1\n            continue\n        i = i + 1\n    return i\n",
         ))
         .unwrap();
-        match &p.main.body[1] {
+        match &p.main().body[1] {
             Stmt::While { body, .. } => {
                 // First inner If has Break in its then_body.
                 match &body[0] {
@@ -680,7 +770,7 @@ mod tests {
     fn lowers_aug_assign() {
         // `a += 1` desugars to `a = a + 1`.
         let p = lower(&parse("def main(a: int) -> int:\n    a += 1\n    return a\n")).unwrap();
-        match &p.main.body[0] {
+        match &p.main().body[0] {
             Stmt::Let { name, value: Expr::BinOp { op: BinOp::Add, lhs, rhs } } => {
                 assert_eq!(name, "a");
                 assert!(matches!(**lhs, Expr::Var(ref n) if n == "a"));

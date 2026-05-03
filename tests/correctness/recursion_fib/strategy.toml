@@ -1,0 +1,4 @@
+# Naive recursive fib is O(phi^n). n <= 25 keeps each call < 50ms.
+[[arg]]
+type = "i64"
+range = [0, 25]
