@@ -30,6 +30,11 @@ pub fn emit_ll(prog: &Program, source_basename: &str) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     let parse_args_block = format_argv_parsing(main_fn);
+    let print_block = match main_fn.return_ty {
+        Type::I64 => "  %fmt = getelementptr inbounds [5 x i8], [5 x i8]* @.fmt_i64, i64 0, i64 0\n  call i32 (i8*, ...) @printf(i8* %fmt, i64 %r)".to_string(),
+        Type::F64 => "  call void @pyx86_print_f64(double %r)".to_string(),
+        Type::Bool => unreachable!("check rejects bool main return"),
+    };
 
     format!(
         "; ModuleID = 'pyx86_{name}'
@@ -37,27 +42,103 @@ target triple = \"x86_64-unknown-linux-gnu\"
 
 declare i32 @printf(i8*, ...)
 declare i64 @atoll(i8*)
+declare double @atof(i8*)
 declare double @llvm.pow.f64(double, double)
+declare i64 @strlen(i8*)
+declare i32 @sprintf(i8*, i8*, ...)
 
 @.fmt_i64 = private unnamed_addr constant [5 x i8] c\"%ld\\0A\\00\"
+@.fmt_f64_g = private unnamed_addr constant [6 x i8] c\"%.17g\\00\"
+@.fmt_str_nl = private unnamed_addr constant [4 x i8] c\"%s\\0A\\00\"
 
 {runtime}{defs}define i32 @main(i32 %argc, i8** %argv) {{
 entry:
-{parse}  %r = call i64 @py_main({call_args})
-  %fmt = getelementptr inbounds [5 x i8], [5 x i8]* @.fmt_i64, i64 0, i64 0
-  call i32 (i8*, ...) @printf(i8* %fmt, i64 %r)
+{parse}  %r = call {ret_ty} @py_main({call_args})
+{print_block}
   ret i32 0
 }}
 ",
         name = basename,
+        ret_ty = llvm_ty(main_fn.return_ty),
         runtime = RUNTIME_HELPERS,
         defs = function_defs,
         parse = parse_args_block,
         call_args = py_main_call_args,
+        print_block = print_block,
     )
 }
 
 const RUNTIME_HELPERS: &str = "\
+; pyx86_print_f64 — best-effort Python-style repr of a double, plus newline.
+;   - Prints %.17g into a 64-byte buffer.
+;   - Scans for '.' / 'e' / 'E' / 'n' (nan) / 'i' (inf) / 'N' / 'I'.
+;   - If none present (i.e. integer-valued shortest form), append '.0'.
+;   - Print buffer with trailing newline via printf.
+; Matches CPython's repr exactly for the common cases (integer-valued
+; floats, sums/products that produce 17-digit shortest forms).
+; Diverges for values whose shortest round-trip uses fewer than 17
+; digits (e.g. 0.1 prints as 0.10000000000000001 vs Python's 0.1).
+; Test programs target the matching cases.
+define internal void @pyx86_print_f64(double %x) {
+entry:
+  %buf = alloca [64 x i8]
+  %buf_p = getelementptr inbounds [64 x i8], [64 x i8]* %buf, i64 0, i64 0
+  %fmt_p = getelementptr inbounds [6 x i8], [6 x i8]* @.fmt_f64_g, i64 0, i64 0
+  %_w = call i32 (i8*, i8*, ...) @sprintf(i8* %buf_p, i8* %fmt_p, double %x)
+  ; Scan for any of '.', 'e', 'E', 'n', 'i', 'N', 'I' in buf.
+  %has_special = call i1 @pyx86_has_decimal_or_special(i8* %buf_p)
+  br i1 %has_special, label %print, label %append_dot_zero
+append_dot_zero:
+  %len = call i64 @strlen(i8* %buf_p)
+  %end0 = getelementptr i8, i8* %buf_p, i64 %len
+  store i8 46, i8* %end0          ; '.'
+  %end1 = getelementptr i8, i8* %end0, i64 1
+  store i8 48, i8* %end1          ; '0'
+  %end2 = getelementptr i8, i8* %end1, i64 1
+  store i8 0, i8* %end2           ; '\\0'
+  br label %print
+print:
+  %out_fmt = getelementptr inbounds [4 x i8], [4 x i8]* @.fmt_str_nl, i64 0, i64 0
+  %_p = call i32 (i8*, ...) @printf(i8* %out_fmt, i8* %buf_p)
+  ret void
+}
+
+define internal i1 @pyx86_has_decimal_or_special(i8* %s) {
+entry:
+  %i.addr = alloca i64
+  store i64 0, i64* %i.addr
+  br label %loop_header
+loop_header:
+  %i = load i64, i64* %i.addr
+  %p = getelementptr i8, i8* %s, i64 %i
+  %c = load i8, i8* %p
+  %is_zero = icmp eq i8 %c, 0
+  br i1 %is_zero, label %not_found, label %check
+check:
+  %is_dot = icmp eq i8 %c, 46
+  %is_e   = icmp eq i8 %c, 101
+  %is_E   = icmp eq i8 %c, 69
+  %is_n   = icmp eq i8 %c, 110
+  %is_i   = icmp eq i8 %c, 105
+  %is_N   = icmp eq i8 %c, 78
+  %is_I   = icmp eq i8 %c, 73
+  %t1 = or i1 %is_dot, %is_e
+  %t2 = or i1 %t1, %is_E
+  %t3 = or i1 %t2, %is_n
+  %t4 = or i1 %t3, %is_i
+  %t5 = or i1 %t4, %is_N
+  %found = or i1 %t5, %is_I
+  br i1 %found, label %yes, label %step
+step:
+  %i_new = add i64 %i, 1
+  store i64 %i_new, i64* %i.addr
+  br label %loop_header
+yes:
+  ret i1 true
+not_found:
+  ret i1 false
+}
+
 ; pyx86_pow_i64(base, exp) — int ** by binary exponentiation. For
 ; exp < 0 returns 0 (Python returns float; we have no float printer
 ; on main return, but local float values do exist — float**float
@@ -133,13 +214,26 @@ fn format_argv_parsing(func: &Function) -> String {
             idx = argv_index
         );
         let _ = writeln!(s, "  %str{i} = load i8*, i8** %slot{i}", i = i);
-        // Only I64 main params supported by check; safe to atoll.
-        let _ = writeln!(
-            s,
-            "  %p_{name} = call i64 @atoll(i8* %str{i})",
-            name = p.name,
-            i = i
-        );
+        // Dispatch on parameter type. Check rejects anything other than I64/F64.
+        match p.ty {
+            Type::I64 => {
+                let _ = writeln!(
+                    s,
+                    "  %p_{name} = call i64 @atoll(i8* %str{i})",
+                    name = p.name,
+                    i = i
+                );
+            }
+            Type::F64 => {
+                let _ = writeln!(
+                    s,
+                    "  %p_{name} = call double @atof(i8* %str{i})",
+                    name = p.name,
+                    i = i
+                );
+            }
+            Type::Bool => unreachable!("check rejects bool main params"),
+        }
     }
     s
 }
