@@ -247,6 +247,12 @@ pub enum Expr {
     /// Both operands must have the same List type; the result has that
     /// same type. Element data is copied from both sources.
     ListConcat { lhs: Box<TypedExpr>, rhs: Box<TypedExpr> },
+    /// Block expression: execute `stmts` for their effects, then
+    /// evaluate `result`. Used by list comprehensions to inline a
+    /// while-loop accumulator pattern at expression position.
+    /// Locals introduced by the inner stmts are collected by codegen
+    /// and allocated up-front in the function entry block.
+    DoBlock { stmts: Vec<Stmt>, result: Box<TypedExpr> },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
