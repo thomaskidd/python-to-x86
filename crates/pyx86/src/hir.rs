@@ -27,7 +27,20 @@ pub struct Function {
 
 #[derive(Debug)]
 pub struct Program {
-    pub main: Function,
+    /// All user-defined functions in declaration order. Exactly one
+    /// is named "main" — that's the entry point invoked by the C
+    /// `main(argc, argv)` wrapper. Others may be called from any
+    /// function (including recursively / mutually).
+    pub functions: Vec<Function>,
+}
+
+impl Program {
+    pub fn main(&self) -> &Function {
+        self.functions
+            .iter()
+            .find(|f| f.name == "main")
+            .expect("Program invariant: must contain a `main` function")
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -99,6 +112,13 @@ pub enum Expr {
         op: BoolOp,
         lhs: Box<Expr>,
         rhs: Box<Expr>,
+    },
+    /// Call to a user-defined function by name. `check.rs` ensures the
+    /// callee exists and the argument count matches its signature.
+    /// All callees return i64 in the current language subset.
+    Call {
+        callee: String,
+        args: Vec<Expr>,
     },
 }
 
