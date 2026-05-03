@@ -1,0 +1,7 @@
+# Tight range to often hit 0 (exercising both branches of and/or).
+[[arg]]
+type = "i64"
+range = [-3, 3]
+[[arg]]
+type = "i64"
+range = [-3, 3]

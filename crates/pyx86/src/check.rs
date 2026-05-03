@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use anyhow::{anyhow, bail, Result};
 use rustpython_parser::ast;
 
-use crate::hir::{BinOp, CmpOp, Expr, Function, Param, Program, Stmt, Type, UnaryOp};
+use crate::hir::{BinOp, BoolOp, CmpOp, Expr, Function, Param, Program, Stmt, Type, UnaryOp};
 use crate::parser::Module;
 
 const MAX_PARAMS: usize = 16;
@@ -339,9 +339,26 @@ fn lower_expr(e: &ast::Expr, scope: &HashSet<String>) -> Result<Expr> {
                 })
             }
         }
-        ast::Expr::BoolOp(_) => bail!(
-            "unsupported_feature: `and` / `or` are not yet supported in v0.5 (use nested `if` for now; they land in v0.6)"
-        ),
+        ast::Expr::BoolOp(b) => {
+            // Python's BoolOp is N-ary: `a and b and c` parses with
+            // values=[a, b, c]. Lower as left-associative pairs so the
+            // codegen only ever has to deal with binary BoolOp.
+            let op = match b.op {
+                ast::BoolOp::And => BoolOp::And,
+                ast::BoolOp::Or => BoolOp::Or,
+            };
+            if b.values.is_empty() {
+                bail!("unsupported_feature: empty BoolOp (should not be possible from valid Python)");
+            }
+            let mut iter = b.values.iter();
+            let first = lower_expr(iter.next().unwrap(), scope)?;
+            let mut acc = first;
+            for next in iter {
+                let next = lower_expr(next, scope)?;
+                acc = Expr::BoolOp { op, lhs: Box::new(acc), rhs: Box::new(next) };
+            }
+            Ok(acc)
+        }
         other => bail!(
             "unsupported_feature: expression form `{}` is not supported",
             expr_kind_name(other)
@@ -513,12 +530,31 @@ mod tests {
     }
 
     #[test]
-    fn rejects_and_or() {
-        let m = parse(
+    fn lowers_and_or() {
+        let p = lower(&parse(
             "def main(a: int, b: int) -> int:\n    if a > 0 and b > 0:\n        return 1\n    else:\n        return 0\n",
-        );
-        let err = lower(&m).unwrap_err();
-        assert!(format!("{}", err).contains("`and` / `or`"));
+        ))
+        .unwrap();
+        match &p.main.body[0] {
+            Stmt::If { cond: Expr::BoolOp { op: BoolOp::And, .. }, .. } => {}
+            other => panic!("expected If with BoolOp::And, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn lowers_chained_or() {
+        // `a or b or c` parses with values=[a,b,c]; we lower it as
+        // left-associative pairs.
+        let p = lower(&parse(
+            "def main(a: int, b: int, c: int) -> int:\n    if a or b or c:\n        return 1\n    else:\n        return 0\n",
+        ))
+        .unwrap();
+        match &p.main.body[0] {
+            Stmt::If { cond: Expr::BoolOp { op: BoolOp::Or, lhs, .. }, .. } => {
+                assert!(matches!(**lhs, Expr::BoolOp { op: BoolOp::Or, .. }));
+            }
+            other => panic!("expected If with nested Or, got {:?}", other),
+        }
     }
 
     #[test]
