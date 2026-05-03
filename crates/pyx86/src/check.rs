@@ -585,6 +585,14 @@ fn lower_expr(e: &ast::Expr, scope: &Scope, signatures: &SignatureTable) -> Resu
                     "unsupported_feature: only direct calls to top-level functions are supported"
                 ),
             };
+            // Special-case the small set of supported Python builtins
+            // before the user-defined-function lookup. Builtins shadow
+            // user functions if both exist (matches CPython where the
+            // local function takes priority — but we don't allow
+            // shadowing builtins as a user function name).
+            if let Some(builtin) = lower_builtin_call(&callee, &c.args, &c.keywords, scope, signatures)? {
+                return Ok(builtin);
+            }
             let sig = signatures.get(&callee).ok_or_else(|| {
                 anyhow!("unsupported_feature: call to undefined function `{}`", callee)
             })?;
@@ -811,6 +819,150 @@ fn coerce(e: TypedExpr, target: Type) -> Result<TypedExpr> {
         );
     }
     Ok(TypedExpr::new(target, Expr::Coerce { inner: Box::new(e) }))
+}
+
+/// Recognize and lower a small set of Python builtins. Returns
+/// `Ok(Some(_))` if it's a builtin, `Ok(None)` if not, `Err(_)` on
+/// invalid use. Builtins handled here:
+/// - int(x)    — convert to I64. For F64 inputs uses fptosi (truncate
+///                toward zero, matches CPython for finite values).
+/// - float(x)  — convert to F64.
+/// - bool(x)   — convert to Bool (truthy check).
+/// - abs(x)    — absolute value, preserves type (int / float).
+/// - min(a, b) — smaller of two same-type values.
+/// - max(a, b) — larger of two same-type values.
+fn lower_builtin_call(
+    name: &str,
+    args: &[ast::Expr],
+    kwargs: &[ast::Keyword],
+    scope: &Scope,
+    signatures: &SignatureTable,
+) -> Result<Option<TypedExpr>> {
+    if !kwargs.is_empty() {
+        return Ok(None);
+    }
+    match name {
+        "int" => {
+            if args.len() != 1 {
+                bail!("unsupported_feature: int() takes exactly 1 argument");
+            }
+            let inner = lower_expr(&args[0], scope, signatures)?;
+            if inner.ty == Type::F64 {
+                // Explicit float→int via fptosi.
+                Ok(Some(TypedExpr::new(
+                    Type::I64,
+                    Expr::Coerce { inner: Box::new(inner) },
+                )))
+            } else {
+                Ok(Some(coerce(inner, Type::I64)?))
+            }
+        }
+        "float" => {
+            if args.len() != 1 {
+                bail!("unsupported_feature: float() takes exactly 1 argument");
+            }
+            let inner = lower_expr(&args[0], scope, signatures)?;
+            Ok(Some(coerce(inner, Type::F64)?))
+        }
+        "bool" => {
+            if args.len() != 1 {
+                bail!("unsupported_feature: bool() takes exactly 1 argument");
+            }
+            let inner = lower_expr(&args[0], scope, signatures)?;
+            Ok(Some(coerce(inner, Type::Bool)?))
+        }
+        "abs" => {
+            if args.len() != 1 {
+                bail!("unsupported_feature: abs() takes exactly 1 argument");
+            }
+            let inner = lower_expr(&args[0], scope, signatures)?;
+            let inner = if inner.ty == Type::Bool { coerce(inner, Type::I64)? } else { inner };
+            let ty = inner.ty;
+            if ty != Type::F64 && !ty.is_int() {
+                bail!("unsupported_feature: abs() argument must be int or float");
+            }
+            // Build `(x < 0 and -x) or x` using BoolOp's short-circuit
+            // value semantics:
+            //   x >= 0: (False and ...) = 0, (0 or x) = x
+            //   x <  0: (True  and -x ) = -x, (-x or x) = -x  (since -x is truthy)
+            //   x == 0: gives 0 ∎
+            let neg = TypedExpr::new(
+                ty,
+                Expr::UnaryOp {
+                    op: UnaryOp::Neg,
+                    operand: Box::new(inner.clone()),
+                },
+            );
+            let zero = if ty == Type::F64 {
+                TypedExpr::new(Type::F64, Expr::ConstF64(0.0))
+            } else {
+                TypedExpr::new(ty, Expr::ConstI64(0))
+            };
+            let is_neg = TypedExpr::new(
+                Type::Bool,
+                Expr::Cmp {
+                    op: CmpOp::Lt,
+                    lhs: Box::new(inner.clone()),
+                    rhs: Box::new(zero),
+                },
+            );
+            let and_branch = TypedExpr::new(
+                ty,
+                Expr::BoolOp {
+                    op: BoolOp::And,
+                    lhs: Box::new(coerce(is_neg, ty)?),
+                    rhs: Box::new(neg),
+                },
+            );
+            Ok(Some(TypedExpr::new(
+                ty,
+                Expr::BoolOp {
+                    op: BoolOp::Or,
+                    lhs: Box::new(and_branch),
+                    rhs: Box::new(inner),
+                },
+            )))
+        }
+        "min" | "max" => {
+            if args.len() != 2 {
+                bail!(
+                    "unsupported_feature: {}() with {} arguments — only 2-arg form supported",
+                    name,
+                    args.len()
+                );
+            }
+            let a = lower_expr(&args[0], scope, signatures)?;
+            let b = lower_expr(&args[1], scope, signatures)?;
+            let (a, b) = unify_numeric(a, b)?;
+            let ty = a.ty;
+            let cmp_op = if name == "min" { CmpOp::Le } else { CmpOp::Ge };
+            let cmp = TypedExpr::new(
+                Type::Bool,
+                Expr::Cmp {
+                    op: cmp_op,
+                    lhs: Box::new(a.clone()),
+                    rhs: Box::new(b.clone()),
+                },
+            );
+            let and_branch = TypedExpr::new(
+                ty,
+                Expr::BoolOp {
+                    op: BoolOp::And,
+                    lhs: Box::new(coerce(cmp, ty)?),
+                    rhs: Box::new(a),
+                },
+            );
+            Ok(Some(TypedExpr::new(
+                ty,
+                Expr::BoolOp {
+                    op: BoolOp::Or,
+                    lhs: Box::new(and_branch),
+                    rhs: Box::new(b),
+                },
+            )))
+        }
+        _ => Ok(None),
+    }
 }
 
 fn resolve_call_args(
