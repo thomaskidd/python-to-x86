@@ -1,0 +1,8 @@
+# Bound the result to fit in i64. 2^62 is comfortable; we cap base
+# at 30 and exp at 12 → max ~5e17.
+[[arg]]
+type = "i64"
+range = [-30, 30]
+[[arg]]
+type = "i64"
+range = [0, 12]
