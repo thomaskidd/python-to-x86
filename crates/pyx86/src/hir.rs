@@ -16,8 +16,33 @@ use std::cell::RefCell;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TupleId(u32);
 
+/// Identifier for an interned list element type. `list[int]` and
+/// `list[int]` share the same `ListId`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ListId(u32);
+
 thread_local! {
     static TUPLE_ARENA: RefCell<Vec<Vec<Type>>> = const { RefCell::new(Vec::new()) };
+    static LIST_ARENA: RefCell<Vec<Type>> = const { RefCell::new(Vec::new()) };
+}
+
+impl ListId {
+    pub fn intern(elem: Type) -> ListId {
+        LIST_ARENA.with(|a| {
+            let mut a = a.borrow_mut();
+            for (i, e) in a.iter().enumerate() {
+                if *e == elem {
+                    return ListId(i as u32);
+                }
+            }
+            let id = a.len() as u32;
+            a.push(elem);
+            ListId(id)
+        })
+    }
+    pub fn elem(self) -> Type {
+        LIST_ARENA.with(|a| a.borrow()[self.0 as usize])
+    }
 }
 
 impl TupleId {
@@ -69,6 +94,12 @@ pub enum Type {
     /// at compile time. Element types live in a thread-local arena
     /// keyed by `TupleId` so `Type` remains `Copy`.
     Tuple(TupleId),
+    /// Homogeneous heap-allocated list `list[T]`. Stored as a value-
+    /// type `{ i64 len, T* data }` carrying the length and a pointer
+    /// to a malloc'd buffer. Element type is interned via `ListId`.
+    /// v0.19: literal construction, runtime indexing, len(), iteration.
+    /// Append / mutation is deferred.
+    List(ListId),
 }
 
 impl Type {
@@ -90,6 +121,7 @@ impl Type {
                 });
                 format!("tuple[{}]", inner)
             }
+            Type::List(id) => format!("list[{}]", id.elem().name()),
         }
     }
     /// Width of the integer type in bits, or None for non-int types.
@@ -200,6 +232,17 @@ pub enum Expr {
     /// Index into a tuple at a compile-time constant position.
     /// Result type is the element type at that index.
     TupleIndex { tuple: Box<TypedExpr>, index: usize },
+    /// Construct a list from N values. The surrounding TypedExpr.ty
+    /// must be a List; all elements are coerced to the list's element type.
+    ListLit { elements: Vec<TypedExpr> },
+    /// Runtime list indexing. The list and index are evaluated; the
+    /// load happens at runtime. Bounds are NOT currently checked
+    /// (matching CPython's IndexError behaviour is deferred).
+    ListIndex { list: Box<TypedExpr>, index: Box<TypedExpr> },
+    /// `len(list)` — extract the length field. Made an Expr (not a
+    /// builtin call) because it's a single-instruction GEP/extractvalue
+    /// the codegen handles directly.
+    ListLen { list: Box<TypedExpr> },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

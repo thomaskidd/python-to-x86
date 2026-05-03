@@ -4,7 +4,8 @@ use anyhow::{anyhow, bail, Result};
 use rustpython_parser::ast;
 
 use crate::hir::{
-    BinOp, BoolOp, CmpOp, Expr, Function, Param, Program, Stmt, TupleId, Type, TypedExpr, UnaryOp,
+    BinOp, BoolOp, CmpOp, Expr, Function, ListId, Param, Program, Stmt, TupleId, Type, TypedExpr,
+    UnaryOp,
 };
 use crate::parser::Module;
 
@@ -348,62 +349,137 @@ fn lower_block(
                         "unsupported_feature: for-loop target must be a simple name (no tuple unpacking yet)"
                     ),
                 };
-                let (start, stop, step) =
-                    parse_and_lower_range(&f.iter, scope, signatures)?;
-                let step_value = match &step.expr {
-                    Expr::ConstI64(v) => *v,
-                    _ => bail!(
-                        "unsupported_feature: range() step must be a constant integer literal in v0.14"
-                    ),
-                };
-                if step_value == 0 {
-                    bail!("unsupported_feature: range() step must be non-zero");
-                }
-                if step_value < 0 {
-                    bail!(
-                        "unsupported_feature: negative range() step is not yet supported (use a `while` loop)"
+
+                // Two for-loop forms supported:
+                //   for i in range(...): ...
+                //   for x in <list-expr>: ...
+                // Distinguish by attempting to lower the iter expression
+                // first if it isn't an obvious `range(...)` call.
+                let is_range_call = matches!(
+                    f.iter.as_ref(),
+                    ast::Expr::Call(c) if matches!(c.func.as_ref(), ast::Expr::Name(n) if n.id.as_str() == "range")
+                );
+                if is_range_call {
+                    let (start, stop, step) =
+                        parse_and_lower_range(&f.iter, scope, signatures)?;
+                    let step_value = match &step.expr {
+                        Expr::ConstI64(v) => *v,
+                        _ => bail!(
+                            "unsupported_feature: range() step must be a constant integer literal"
+                        ),
+                    };
+                    if step_value == 0 {
+                        bail!("unsupported_feature: range() step must be non-zero");
+                    }
+                    if step_value < 0 {
+                        bail!(
+                            "unsupported_feature: negative range() step is not yet supported (use a `while` loop)"
+                        );
+                    }
+                    scope.insert(loop_var.clone(), Type::I64);
+                    let body_inner =
+                        lower_block(&f.body, scope, loop_depth + 1, signatures, return_ty)?;
+                    out.push(Stmt::Let { name: loop_var.clone(), value: start });
+                    let cond = TypedExpr::new(
+                        Type::Bool,
+                        Expr::Cmp {
+                            op: CmpOp::Lt,
+                            lhs: Box::new(TypedExpr::new(
+                                Type::I64,
+                                Expr::Var(loop_var.clone()),
+                            )),
+                            rhs: Box::new(stop),
+                        },
                     );
+                    let mut while_body = body_inner;
+                    let incr = TypedExpr::new(
+                        Type::I64,
+                        Expr::BinOp {
+                            op: BinOp::Add,
+                            lhs: Box::new(TypedExpr::new(
+                                Type::I64,
+                                Expr::Var(loop_var.clone()),
+                            )),
+                            rhs: Box::new(step),
+                        },
+                    );
+                    while_body.push(Stmt::Let { name: loop_var.clone(), value: incr });
+                    out.push(Stmt::While { cond, body: while_body });
+                } else {
+                    // for-over-list: lower the iter, expect List type, desugar to
+                    //   __lst = <iter>
+                    //   __i = 0
+                    //   while __i < len(__lst):
+                    //       loop_var = __lst[__i]
+                    //       <body>
+                    //       __i = __i + 1
+                    let iter = lower_expr(&f.iter, scope, signatures)?;
+                    let elem_ty = match iter.ty {
+                        Type::List(id) => id.elem(),
+                        other => bail!(
+                            "unsupported_feature: for-loop iterables must be range(...) or list[T] (got {})",
+                            other.name()
+                        ),
+                    };
+                    // Synthesise unique helper names so they don't collide
+                    // with user vars across nested loops.
+                    let lst_name = format!("__forlst_{}", loop_depth);
+                    let idx_name = format!("__foridx_{}", loop_depth);
+                    scope.insert(lst_name.clone(), iter.ty);
+                    scope.insert(idx_name.clone(), Type::I64);
+                    scope.insert(loop_var.clone(), elem_ty);
+
+                    let body_inner =
+                        lower_block(&f.body, scope, loop_depth + 1, signatures, return_ty)?;
+
+                    out.push(Stmt::Let { name: lst_name.clone(), value: iter });
+                    out.push(Stmt::Let {
+                        name: idx_name.clone(),
+                        value: TypedExpr::new(Type::I64, Expr::ConstI64(0)),
+                    });
+                    let lst_ref = TypedExpr::new(
+                        Type::List(ListId::intern(elem_ty)),
+                        Expr::Var(lst_name.clone()),
+                    );
+                    let cond = TypedExpr::new(
+                        Type::Bool,
+                        Expr::Cmp {
+                            op: CmpOp::Lt,
+                            lhs: Box::new(TypedExpr::new(Type::I64, Expr::Var(idx_name.clone()))),
+                            rhs: Box::new(TypedExpr::new(
+                                Type::I64,
+                                Expr::ListLen { list: Box::new(lst_ref.clone()) },
+                            )),
+                        },
+                    );
+                    let mut while_body = Vec::new();
+                    while_body.push(Stmt::Let {
+                        name: loop_var.clone(),
+                        value: TypedExpr::new(
+                            elem_ty,
+                            Expr::ListIndex {
+                                list: Box::new(lst_ref),
+                                index: Box::new(TypedExpr::new(
+                                    Type::I64,
+                                    Expr::Var(idx_name.clone()),
+                                )),
+                            },
+                        ),
+                    });
+                    while_body.extend(body_inner);
+                    while_body.push(Stmt::Let {
+                        name: idx_name.clone(),
+                        value: TypedExpr::new(
+                            Type::I64,
+                            Expr::BinOp {
+                                op: BinOp::Add,
+                                lhs: Box::new(TypedExpr::new(Type::I64, Expr::Var(idx_name))),
+                                rhs: Box::new(TypedExpr::new(Type::I64, Expr::ConstI64(1))),
+                            },
+                        ),
+                    });
+                    out.push(Stmt::While { cond, body: while_body });
                 }
-
-                // Bind loop_var BEFORE lowering the body so the body can
-                // reference it.
-                scope.insert(loop_var.clone(), Type::I64);
-                let body_inner =
-                    lower_block(&f.body, scope, loop_depth + 1, signatures, return_ty)?;
-
-                // Desugar to:
-                //   loop_var = start
-                //   while loop_var < stop:
-                //     <body>
-                //     loop_var = loop_var + step
-                out.push(Stmt::Let { name: loop_var.clone(), value: start });
-
-                let cond = TypedExpr::new(
-                    Type::Bool,
-                    Expr::Cmp {
-                        op: CmpOp::Lt,
-                        lhs: Box::new(TypedExpr::new(
-                            Type::I64,
-                            Expr::Var(loop_var.clone()),
-                        )),
-                        rhs: Box::new(stop),
-                    },
-                );
-
-                let mut while_body = body_inner;
-                let incr = TypedExpr::new(
-                    Type::I64,
-                    Expr::BinOp {
-                        op: BinOp::Add,
-                        lhs: Box::new(TypedExpr::new(
-                            Type::I64,
-                            Expr::Var(loop_var.clone()),
-                        )),
-                        rhs: Box::new(step),
-                    },
-                );
-                while_body.push(Stmt::Let { name: loop_var.clone(), value: incr });
-                out.push(Stmt::While { cond, body: while_body });
             }
             ast::Stmt::While(w) => {
                 if !w.orelse.is_empty() {
@@ -471,22 +547,31 @@ fn parse_type_annotation(ann: Option<&ast::Expr>) -> Option<Type> {
             "i64" => Some(Type::I64),
             _ => None,
         },
-        // `tuple[int, float, int]` — Subscript with the tuple of element
-        // types as the slice. CPython parses this as Subscript(Name("tuple"), Tuple([...])).
+        // `tuple[T1, T2, ...]` or `list[T]` — Subscript on the type name.
         ast::Expr::Subscript(s) => {
-            match s.value.as_ref() {
-                ast::Expr::Name(n) if n.id.as_str() == "tuple" => {}
+            let head = match s.value.as_ref() {
+                ast::Expr::Name(n) => n.id.as_str(),
                 _ => return None,
-            }
-            let elem_exprs: Vec<&ast::Expr> = match s.slice.as_ref() {
-                ast::Expr::Tuple(t) => t.elts.iter().collect(),
-                single => vec![single],
             };
-            let mut elems = Vec::with_capacity(elem_exprs.len());
-            for e in elem_exprs {
-                elems.push(parse_type_annotation(Some(e))?);
+            match head {
+                "tuple" => {
+                    let elem_exprs: Vec<&ast::Expr> = match s.slice.as_ref() {
+                        ast::Expr::Tuple(t) => t.elts.iter().collect(),
+                        single => vec![single],
+                    };
+                    let mut elems = Vec::with_capacity(elem_exprs.len());
+                    for e in elem_exprs {
+                        elems.push(parse_type_annotation(Some(e))?);
+                    }
+                    Some(Type::Tuple(TupleId::intern(elems)))
+                }
+                "list" => {
+                    // `list[T]` — single element type.
+                    let elem = parse_type_annotation(Some(s.slice.as_ref()))?;
+                    Some(Type::List(ListId::intern(elem)))
+                }
+                _ => None,
             }
-            Some(Type::Tuple(TupleId::intern(elems)))
         }
         _ => None,
     }
@@ -629,12 +714,63 @@ fn lower_expr(e: &ast::Expr, scope: &Scope, signatures: &SignatureTable) -> Resu
                 Expr::TupleLit { elements },
             ))
         }
+        ast::Expr::List(l) => {
+            // List literal: `[a, b, c]`. All elements must be coercible
+            // to a common type. Empty `[]` is rejected (no type info).
+            if l.elts.is_empty() {
+                bail!(
+                    "unsupported_feature: empty list literal `[]` cannot be type-inferred (annotate the variable explicitly)"
+                );
+            }
+            let lowered: Result<Vec<TypedExpr>> = l
+                .elts
+                .iter()
+                .map(|e| lower_expr(e, scope, signatures))
+                .collect();
+            let mut lowered = lowered?;
+            // Pick element type as the unification of all element types
+            // by repeated unify_numeric (since v0.19 only supports
+            // numeric element types).
+            let mut elem_ty = lowered[0].ty;
+            for next in &lowered[1..] {
+                let (a, _) = unify_numeric(
+                    TypedExpr::new(elem_ty, Expr::ConstI64(0)), // placeholder for ty
+                    next.clone(),
+                )?;
+                elem_ty = a.ty;
+            }
+            // Coerce each element to the unified type.
+            for e in lowered.iter_mut() {
+                *e = coerce(e.clone(), elem_ty)?;
+            }
+            let id = ListId::intern(elem_ty);
+            Ok(TypedExpr::new(
+                Type::List(id),
+                Expr::ListLit { elements: lowered },
+            ))
+        }
         ast::Expr::Subscript(s) => {
             let value = lower_expr(&s.value, scope, signatures)?;
+            // List subscripting goes through ListIndex (runtime index).
+            if let Type::List(_) = value.ty {
+                let index = lower_expr(&s.slice, scope, signatures)?;
+                let index = coerce(index, Type::I64)?;
+                let elem_ty = match value.ty {
+                    Type::List(id) => id.elem(),
+                    _ => unreachable!(),
+                };
+                return Ok(TypedExpr::new(
+                    elem_ty,
+                    Expr::ListIndex {
+                        list: Box::new(value),
+                        index: Box::new(index),
+                    },
+                ));
+            }
             let id = match value.ty {
                 Type::Tuple(id) => id,
                 other => bail!(
-                    "unsupported_feature: subscripting non-tuple type {} is not supported",
+                    "unsupported_feature: subscripting non-tuple/list type {} is not supported",
                     other.name()
                 ),
             };
@@ -1007,6 +1143,27 @@ fn lower_builtin_call(
                     rhs: Box::new(inner),
                 },
             )))
+        }
+        "len" => {
+            if args.len() != 1 {
+                bail!("unsupported_feature: len() takes exactly 1 argument");
+            }
+            let inner = lower_expr(&args[0], scope, signatures)?;
+            match inner.ty {
+                Type::List(_) => Ok(Some(TypedExpr::new(
+                    Type::I64,
+                    Expr::ListLen { list: Box::new(inner) },
+                ))),
+                Type::Tuple(id) => {
+                    // Tuple length is known at compile time → constant.
+                    let n = id.with_elems(|elems| elems.len()) as i64;
+                    Ok(Some(TypedExpr::new(Type::I64, Expr::ConstI64(n))))
+                }
+                other => bail!(
+                    "unsupported_feature: len() not supported on {} (only list and tuple)",
+                    other.name()
+                ),
+            }
         }
         "min" | "max" => {
             if args.len() != 2 {

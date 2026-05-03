@@ -33,7 +33,7 @@ pub fn emit_ll(prog: &Program, source_basename: &str) -> String {
     let print_block = match main_fn.return_ty {
         Type::I64 => "  %fmt = getelementptr inbounds [5 x i8], [5 x i8]* @.fmt_i64, i64 0, i64 0\n  call i32 (i8*, ...) @printf(i8* %fmt, i64 %r)".to_string(),
         Type::F64 => "  call void @pyx86_print_f64(double %r)".to_string(),
-        Type::I8 | Type::I16 | Type::I32 | Type::Bool | Type::Tuple(_) => {
+        Type::I8 | Type::I16 | Type::I32 | Type::Bool | Type::Tuple(_) | Type::List(_) => {
             unreachable!("check rejects non-(I64|F64) main return types")
         }
     };
@@ -48,6 +48,7 @@ declare double @atof(i8*)
 declare double @llvm.pow.f64(double, double)
 declare i64 @strlen(i8*)
 declare i32 @sprintf(i8*, i8*, ...)
+declare i8* @malloc(i64)
 
 @.fmt_i64 = private unnamed_addr constant [5 x i8] c\"%ld\\0A\\00\"
 @.fmt_f64_g = private unnamed_addr constant [6 x i8] c\"%.17g\\00\"
@@ -207,6 +208,23 @@ fn llvm_ty(ty: Type) -> String {
             });
             format!("{{ {} }}", inner)
         }
+        Type::List(id) => {
+            // { i64 len, T* data }
+            let elem = llvm_ty(id.elem());
+            format!("{{ i64, {}* }}", elem)
+        }
+    }
+}
+
+/// Element size in bytes for malloc sizing.
+fn type_byte_size(ty: Type) -> u64 {
+    match ty {
+        Type::I8 | Type::Bool => 1,
+        Type::I16 => 2,
+        Type::I32 => 4,
+        Type::I64 | Type::F64 => 8,
+        Type::Tuple(id) => id.with_elems(|elems| elems.iter().map(|t| type_byte_size(*t)).sum()),
+        Type::List(_) => 16, // { i64, ptr } — 16 bytes on x86-64
     }
 }
 
@@ -247,7 +265,7 @@ fn format_argv_parsing(func: &Function) -> String {
                     i = i
                 );
             }
-            Type::I8 | Type::I16 | Type::I32 | Type::Bool | Type::Tuple(_) => {
+            Type::I8 | Type::I16 | Type::I32 | Type::Bool | Type::Tuple(_) | Type::List(_) => {
                 unreachable!("check rejects non-(I64|F64) main params")
             }
         }
@@ -465,6 +483,9 @@ impl Codegen {
             Expr::Call { callee, args } => self.lower_call(callee, args, te.ty),
             Expr::TupleLit { elements } => self.lower_tuple_lit(elements, te.ty),
             Expr::TupleIndex { tuple, index } => self.lower_tuple_index(tuple, *index, te.ty),
+            Expr::ListLit { elements } => self.lower_list_lit(elements, te.ty),
+            Expr::ListIndex { list, index } => self.lower_list_index(list, index, te.ty),
+            Expr::ListLen { list } => self.lower_list_len(list),
         }
     }
 
@@ -813,6 +834,97 @@ impl Codegen {
         self.emit(&format!(
             "{} = extractvalue {} {}, {}",
             dst, tuple_llvm_ty, tuple_op, index
+        ));
+        dst
+    }
+
+    fn lower_list_lit(&mut self, elements: &[TypedExpr], list_ty: Type) -> String {
+        let id = match list_ty {
+            Type::List(id) => id,
+            _ => panic!("internal: list_lit with non-list type"),
+        };
+        let elem_ty = id.elem();
+        let elem_llvm = llvm_ty(elem_ty);
+        let elem_size = type_byte_size(elem_ty);
+        let n = elements.len() as i64;
+
+        // Lower each element first (so they don't share SSA names with our scaffolding).
+        let elem_ops: Vec<String> = elements.iter().map(|e| self.lower(e)).collect();
+
+        // Allocate.
+        let raw = self.fresh();
+        let total_bytes = (n as u64) * elem_size;
+        self.emit(&format!("{} = call i8* @malloc(i64 {})", raw, total_bytes));
+        let data = self.fresh();
+        self.emit(&format!("{} = bitcast i8* {} to {}*", data, raw, elem_llvm));
+
+        // Store each element.
+        for (i, op) in elem_ops.iter().enumerate() {
+            let p = self.fresh();
+            self.emit(&format!(
+                "{} = getelementptr {ety}, {ety}* {}, i64 {}",
+                p,
+                data,
+                i,
+                ety = elem_llvm
+            ));
+            self.emit(&format!("store {ety} {}, {ety}* {}", op, p, ety = elem_llvm));
+        }
+
+        // Build the {len, data} struct.
+        let list_llvm = llvm_ty(list_ty);
+        let s0 = self.fresh();
+        self.emit(&format!(
+            "{} = insertvalue {ty} undef, i64 {}, 0",
+            s0,
+            n,
+            ty = list_llvm
+        ));
+        let s1 = self.fresh();
+        self.emit(&format!(
+            "{} = insertvalue {ty} {}, {}* {}, 1",
+            s1, s0, elem_llvm, data,
+            ty = list_llvm
+        ));
+        s1
+    }
+
+    fn lower_list_index(&mut self, list: &TypedExpr, index: &TypedExpr, _result_ty: Type) -> String {
+        let list_op = self.lower(list);
+        let idx_op = self.lower(index);
+        let list_llvm = llvm_ty(list.ty);
+        let elem_ty = match list.ty {
+            Type::List(id) => id.elem(),
+            _ => panic!("internal: list_index on non-list"),
+        };
+        let elem_llvm = llvm_ty(elem_ty);
+        // Pull data pointer.
+        let data = self.fresh();
+        self.emit(&format!(
+            "{} = extractvalue {ty} {}, 1",
+            data, list_op,
+            ty = list_llvm
+        ));
+        // GEP + load.
+        let p = self.fresh();
+        self.emit(&format!(
+            "{} = getelementptr {ety}, {ety}* {}, i64 {}",
+            p, data, idx_op,
+            ety = elem_llvm
+        ));
+        let dst = self.fresh();
+        self.emit(&format!("{} = load {ety}, {ety}* {}", dst, p, ety = elem_llvm));
+        dst
+    }
+
+    fn lower_list_len(&mut self, list: &TypedExpr) -> String {
+        let list_op = self.lower(list);
+        let list_llvm = llvm_ty(list.ty);
+        let dst = self.fresh();
+        self.emit(&format!(
+            "{} = extractvalue {ty} {}, 0",
+            dst, list_op,
+            ty = list_llvm
         ));
         dst
     }
