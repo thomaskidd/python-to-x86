@@ -109,12 +109,19 @@ pub enum BinOp {
     Mul,
     FloorDiv,
     Mod,
+    BitAnd,
+    BitOr,
+    BitXor,
+    Shl,
+    Shr,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnaryOp {
     Neg,
     Pos,
+    /// Bitwise not (`~x`). LLVM `xor i64 %x, -1`.
+    BitNot,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

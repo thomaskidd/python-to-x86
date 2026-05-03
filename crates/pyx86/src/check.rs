@@ -288,12 +288,11 @@ fn lower_expr(e: &ast::Expr, scope: &HashSet<String>) -> Result<Expr> {
                 ),
                 ast::Operator::Pow => bail!("unsupported_feature: `**` (exponentiation) is not yet supported"),
                 ast::Operator::MatMult => bail!("unsupported_feature: `@` (matmul) is not supported"),
-                ast::Operator::LShift | ast::Operator::RShift => {
-                    bail!("unsupported_feature: bit-shift operators are not yet supported")
-                }
-                ast::Operator::BitOr | ast::Operator::BitXor | ast::Operator::BitAnd => {
-                    bail!("unsupported_feature: bitwise operators are not yet supported")
-                }
+                ast::Operator::LShift => BinOp::Shl,
+                ast::Operator::RShift => BinOp::Shr,
+                ast::Operator::BitAnd => BinOp::BitAnd,
+                ast::Operator::BitOr => BinOp::BitOr,
+                ast::Operator::BitXor => BinOp::BitXor,
             };
             Ok(Expr::BinOp {
                 op,
@@ -308,7 +307,7 @@ fn lower_expr(e: &ast::Expr, scope: &HashSet<String>) -> Result<Expr> {
                 ast::UnaryOp::Not => {
                     return Ok(Expr::Not(Box::new(lower_expr(&u.operand, scope)?)));
                 }
-                ast::UnaryOp::Invert => bail!("unsupported_feature: bitwise `~` is not yet supported"),
+                ast::UnaryOp::Invert => UnaryOp::BitNot,
             };
             Ok(Expr::UnaryOp {
                 op,
