@@ -1,0 +1,4 @@
+# Tight range biases toward hitting 0 frequently.
+[[arg]]
+type = "i64"
+range = [-3, 3]

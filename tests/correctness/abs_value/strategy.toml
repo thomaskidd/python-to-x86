@@ -1,0 +1,6 @@
+# Avoid i64::MIN where -a overflows (Python wraps to a positive bigint
+# but our i64 wraps back to MIN). We can pin the i64::MIN behaviour
+# in a dedicated edge-case test when we add explicit-edge generation.
+[[arg]]
+type = "i64"
+range = [-9_000_000_000_000_000_000, 9_000_000_000_000_000_000]

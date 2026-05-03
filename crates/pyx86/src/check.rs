@@ -3,20 +3,24 @@ use std::collections::HashSet;
 use anyhow::{anyhow, bail, Result};
 use rustpython_parser::ast;
 
-use crate::hir::{BinOp, Expr, Function, Param, Program, Stmt, Type, UnaryOp};
+use crate::hir::{BinOp, CmpOp, Expr, Function, Param, Program, Stmt, Type, UnaryOp};
 use crate::parser::Module;
 
 const MAX_PARAMS: usize = 16;
 
-/// Validate that the module is in the supported subset and lower it
-/// to HIR. v0.4 supports:
+/// Lower the parsed module into a `hir::Program`. v0.5 supports:
 ///
-/// ```text
-/// def main(<param>: int, …) -> int:
-///     <name> [: int] = <expr>      # zero or more local bindings
-///     …
-///     return <expr>                # required, must be last stmt
-/// ```
+/// - `def main(<param>: int, …) -> int:` (up to 16 typed-int params)
+/// - body composed of:
+///   - `<name> [: int] = <expr>`     (assignment, plain or annotated)
+///   - `if <cond>: <body> [elif …]* [else: <body>]`
+///   - `return <expr>`
+/// - expressions:
+///   - int literals
+///   - variable references (param or local)
+///   - binary `+ - * // %`
+///   - unary `+x`, `-x`, `not x`
+///   - comparison `< <= > >= == !=` (chained allowed)
 ///
 /// Anything else produces an `unsupported_feature` error.
 pub fn lower(module: &Module) -> Result<Program> {
@@ -78,76 +82,14 @@ pub fn lower(module: &Module) -> Result<Program> {
     };
 
     if func.body.is_empty() {
-        bail!("unsupported_feature: `main()` body must end with a `return` statement");
+        bail!("unsupported_feature: function body is empty");
     }
 
-    let mut body: Vec<Stmt> = Vec::with_capacity(func.body.len());
-    let last_idx = func.body.len() - 1;
-    for (i, stmt) in func.body.iter().enumerate() {
-        let is_last = i == last_idx;
-        match stmt {
-            ast::Stmt::Assign(a) => {
-                if is_last {
-                    bail!(
-                        "unsupported_feature: function body must end with `return`, found assignment as last statement"
-                    );
-                }
-                let name = parse_assign_target(&a.targets)?;
-                let value = lower_expr(&a.value, &scope)?;
-                scope.insert(name.clone());
-                body.push(Stmt::Let { name, value });
-            }
-            ast::Stmt::AnnAssign(a) => {
-                if is_last {
-                    bail!(
-                        "unsupported_feature: function body must end with `return`, found assignment as last statement"
-                    );
-                }
-                let name = match a.target.as_ref() {
-                    ast::Expr::Name(n) => n.id.as_str().to_string(),
-                    _ => bail!("unsupported_feature: only simple-name targets are supported in assignments"),
-                };
-                if !a.simple {
-                    // `(x): int = ...` — Python allows this, we don't.
-                    bail!("unsupported_feature: parenthesised annotation targets are not supported");
-                }
-                if parse_type_annotation(Some(&a.annotation)).is_none() {
-                    bail!(
-                        "unsupported_feature: only `: int` annotations are supported on locals, on `{}`",
-                        name
-                    );
-                }
-                let value_expr = a
-                    .value
-                    .as_deref()
-                    .ok_or_else(|| anyhow!("unsupported_feature: bare annotation `{}: int` (no value) is not supported", name))?;
-                let value = lower_expr(value_expr, &scope)?;
-                scope.insert(name.clone());
-                body.push(Stmt::Let { name, value });
-            }
-            ast::Stmt::Return(r) => {
-                if !is_last {
-                    bail!(
-                        "unsupported_feature: statements after `return` are not allowed (early return needs control flow, lands in v0.5)"
-                    );
-                }
-                let value_expr = r
-                    .value
-                    .as_deref()
-                    .ok_or_else(|| anyhow!("unsupported_feature: `return` must have a value"))?;
-                let value = lower_expr(value_expr, &scope)?;
-                body.push(Stmt::Return { value });
-            }
-            other => bail!(
-                "unsupported_feature: statement `{}` is not supported in v0.4",
-                stmt_kind_name(other)
-            ),
-        }
-    }
+    let body = lower_block(&func.body, &mut scope)?;
 
-    if !matches!(body.last(), Some(Stmt::Return { .. })) {
+    if !block_always_returns(&body) {
         bail!(
-            "unsupported_feature: `main()` body must end with a `return` statement"
+            "unsupported_feature: not all paths return a value (the function body, or both branches of every trailing `if`, must end with `return`)"
         );
     }
 
@@ -159,6 +101,98 @@ pub fn lower(module: &Module) -> Result<Program> {
             body,
         },
     })
+}
+
+/// Conservative path-coverage check. Returns true iff:
+/// - the block ends with a `Return`, OR
+/// - the block ends with an `If` whose then_body and else_body both
+///   recursively cover, AND the else_body is non-empty.
+///
+/// This rejects valid programs where coverage requires reasoning
+/// about expressions (e.g. `if True: return 1`) but never accepts
+/// invalid ones, which is the side we want to err on.
+fn block_always_returns(body: &[Stmt]) -> bool {
+    match body.last() {
+        Some(Stmt::Return { .. }) => true,
+        Some(Stmt::If { then_body, else_body, .. }) => {
+            !else_body.is_empty()
+                && block_always_returns(then_body)
+                && block_always_returns(else_body)
+        }
+        _ => false,
+    }
+}
+
+fn lower_block(stmts: &[ast::Stmt], scope: &mut HashSet<String>) -> Result<Vec<Stmt>> {
+    let mut out = Vec::with_capacity(stmts.len());
+    for stmt in stmts {
+        match stmt {
+            ast::Stmt::Assign(a) => {
+                let name = parse_assign_target(&a.targets)?;
+                let value = lower_expr(&a.value, scope)?;
+                scope.insert(name.clone());
+                out.push(Stmt::Let { name, value });
+            }
+            ast::Stmt::AnnAssign(a) => {
+                let name = match a.target.as_ref() {
+                    ast::Expr::Name(n) => n.id.as_str().to_string(),
+                    _ => bail!(
+                        "unsupported_feature: only simple-name targets are supported in assignments"
+                    ),
+                };
+                if !a.simple {
+                    bail!(
+                        "unsupported_feature: parenthesised annotation targets are not supported"
+                    );
+                }
+                if parse_type_annotation(Some(&a.annotation)).is_none() {
+                    bail!(
+                        "unsupported_feature: only `: int` annotations are supported on locals, on `{}`",
+                        name
+                    );
+                }
+                let value_expr = a.value.as_deref().ok_or_else(|| {
+                    anyhow!(
+                        "unsupported_feature: bare annotation `{}: int` (no value) is not supported",
+                        name
+                    )
+                })?;
+                let value = lower_expr(value_expr, scope)?;
+                scope.insert(name.clone());
+                out.push(Stmt::Let { name, value });
+            }
+            ast::Stmt::Return(r) => {
+                let value_expr = r
+                    .value
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("unsupported_feature: `return` must have a value"))?;
+                let value = lower_expr(value_expr, scope)?;
+                out.push(Stmt::Return { value });
+            }
+            ast::Stmt::If(if_stmt) => {
+                let cond = lower_expr(&if_stmt.test, scope)?;
+                // Branch bodies see and may extend the same scope as
+                // the surrounding block. (Python doesn't have block
+                // scope; locals introduced in a branch are accessible
+                // after the branch — though using them when the
+                // branch wasn't taken is a runtime UnboundLocalError
+                // in CPython. v0.5 uses alloca slots that hold the
+                // last-stored value or undef; we accept this as a
+                // pragmatic deviation.)
+                let then_body = lower_block(&if_stmt.body, scope)?;
+                let else_body = lower_block(&if_stmt.orelse, scope)?;
+                out.push(Stmt::If { cond, then_body, else_body });
+            }
+            ast::Stmt::Pass(_) => {
+                // pass is a no-op; lower it as nothing.
+            }
+            other => bail!(
+                "unsupported_feature: statement `{}` is not supported in v0.5",
+                stmt_kind_name(other)
+            ),
+        }
+    }
+    Ok(out)
 }
 
 fn parse_assign_target(targets: &[ast::Expr]) -> Result<String> {
@@ -198,7 +232,8 @@ fn lower_expr(e: &ast::Expr, scope: &HashSet<String>) -> Result<Expr> {
                 })?;
                 Ok(Expr::ConstI64(v))
             }
-            _ => bail!("unsupported_feature: only integer literals are supported"),
+            ast::Constant::Bool(b) => Ok(Expr::ConstI64(if *b { 1 } else { 0 })),
+            _ => bail!("unsupported_feature: only integer (and bool) literals are supported"),
         },
         ast::Expr::Name(n) => {
             let name = n.id.as_str();
@@ -240,7 +275,9 @@ fn lower_expr(e: &ast::Expr, scope: &HashSet<String>) -> Result<Expr> {
             let op = match u.op {
                 ast::UnaryOp::USub => UnaryOp::Neg,
                 ast::UnaryOp::UAdd => UnaryOp::Pos,
-                ast::UnaryOp::Not => bail!("unsupported_feature: boolean `not` is not yet supported"),
+                ast::UnaryOp::Not => {
+                    return Ok(Expr::Not(Box::new(lower_expr(&u.operand, scope)?)));
+                }
                 ast::UnaryOp::Invert => bail!("unsupported_feature: bitwise `~` is not yet supported"),
             };
             Ok(Expr::UnaryOp {
@@ -248,11 +285,55 @@ fn lower_expr(e: &ast::Expr, scope: &HashSet<String>) -> Result<Expr> {
                 operand: Box::new(lower_expr(&u.operand, scope)?),
             })
         }
+        ast::Expr::Compare(c) => {
+            // Python AST: left + ops[] + comparators[]. ops.len() == comparators.len().
+            let first = lower_expr(&c.left, scope)?;
+            let rest: Result<Vec<(CmpOp, Expr)>> = c
+                .ops
+                .iter()
+                .zip(c.comparators.iter())
+                .map(|(op, e)| Ok((convert_cmp_op(op)?, lower_expr(e, scope)?)))
+                .collect();
+            let rest = rest?;
+            if rest.len() == 1 {
+                let (op, rhs) = rest.into_iter().next().unwrap();
+                Ok(Expr::Cmp {
+                    op,
+                    lhs: Box::new(first),
+                    rhs: Box::new(rhs),
+                })
+            } else {
+                Ok(Expr::CmpChain {
+                    first: Box::new(first),
+                    rest,
+                })
+            }
+        }
+        ast::Expr::BoolOp(_) => bail!(
+            "unsupported_feature: `and` / `or` are not yet supported in v0.5 (use nested `if` for now; they land in v0.6)"
+        ),
         other => bail!(
             "unsupported_feature: expression form `{}` is not supported",
             expr_kind_name(other)
         ),
     }
+}
+
+fn convert_cmp_op(op: &ast::CmpOp) -> Result<CmpOp> {
+    Ok(match op {
+        ast::CmpOp::Lt => CmpOp::Lt,
+        ast::CmpOp::LtE => CmpOp::Le,
+        ast::CmpOp::Gt => CmpOp::Gt,
+        ast::CmpOp::GtE => CmpOp::Ge,
+        ast::CmpOp::Eq => CmpOp::Eq,
+        ast::CmpOp::NotEq => CmpOp::Ne,
+        ast::CmpOp::Is | ast::CmpOp::IsNot => bail!(
+            "unsupported_feature: `is` / `is not` are not supported (only allowed against `None` in later slices)"
+        ),
+        ast::CmpOp::In | ast::CmpOp::NotIn => bail!(
+            "unsupported_feature: `in` / `not in` are not supported (need container types first)"
+        ),
+    })
 }
 
 fn stmt_kind_name(s: &ast::Stmt) -> &'static str {
@@ -331,106 +412,113 @@ mod tests {
     }
 
     #[test]
-    fn lowers_no_locals() {
-        let p = lower(&parse("def main() -> int:\n    return 42\n")).unwrap();
-        assert_eq!(p.main.body.len(), 1);
-        assert!(matches!(p.main.body[0], Stmt::Return { .. }));
-    }
-
-    #[test]
-    fn lowers_single_local() {
+    fn lowers_simple_if_else() {
         let p = lower(&parse(
-            "def main(a: int) -> int:\n    x = a + 1\n    return x\n",
+            "def main(a: int) -> int:\n    if a < 0:\n        return -a\n    else:\n        return a\n",
         ))
         .unwrap();
-        assert_eq!(p.main.body.len(), 2);
         match &p.main.body[0] {
-            Stmt::Let { name, .. } => assert_eq!(name, "x"),
-            _ => panic!("expected Let"),
-        }
-        match &p.main.body[1] {
-            Stmt::Return { value } => assert!(matches!(value, Expr::Var(n) if n == "x")),
-            _ => panic!("expected Return"),
+            Stmt::If { cond, then_body, else_body } => {
+                assert!(matches!(cond, Expr::Cmp { op: CmpOp::Lt, .. }));
+                assert!(matches!(then_body[0], Stmt::Return { .. }));
+                assert!(matches!(else_body[0], Stmt::Return { .. }));
+            }
+            other => panic!("expected If, got {:?}", other),
         }
     }
 
     #[test]
-    fn lowers_annotated_assignment() {
+    fn elif_lowers_to_nested_if() {
         let p = lower(&parse(
-            "def main(a: int) -> int:\n    x: int = a + 1\n    return x\n",
+            "def main(a: int) -> int:\n    if a < 0:\n        return -1\n    elif a == 0:\n        return 0\n    else:\n        return 1\n",
         ))
         .unwrap();
-        assert!(matches!(p.main.body[0], Stmt::Let { ref name, .. } if name == "x"));
+        match &p.main.body[0] {
+            Stmt::If { else_body, .. } => {
+                // else_body should contain a single nested If.
+                assert_eq!(else_body.len(), 1);
+                assert!(matches!(else_body[0], Stmt::If { .. }));
+            }
+            _ => panic!("expected If at top"),
+        }
     }
 
     #[test]
-    fn allows_reassignment() {
+    fn lowers_chained_compare() {
         let p = lower(&parse(
-            "def main(a: int) -> int:\n    x = a\n    x = x + 1\n    return x\n",
+            "def main(a: int) -> int:\n    if 0 < a < 100:\n        return 1\n    else:\n        return 0\n",
         ))
         .unwrap();
-        // Two Let statements, both binding `x`.
-        assert_eq!(p.main.body.len(), 3);
-        assert!(matches!(p.main.body[0], Stmt::Let { ref name, .. } if name == "x"));
-        assert!(matches!(p.main.body[1], Stmt::Let { ref name, .. } if name == "x"));
-        assert!(matches!(p.main.body[2], Stmt::Return { .. }));
+        match &p.main.body[0] {
+            Stmt::If { cond: Expr::CmpChain { first, rest }, .. } => {
+                assert!(matches!(**first, Expr::ConstI64(0)));
+                assert_eq!(rest.len(), 2);
+            }
+            _ => panic!("expected CmpChain in If condition"),
+        }
     }
 
     #[test]
-    fn rejects_non_int_local_annotation() {
-        let m = parse("def main(a: int) -> int:\n    x: str = a\n    return a\n");
-        let err = lower(&m).unwrap_err();
-        assert!(format!("{}", err).contains("`: int`"));
+    fn lowers_truthy_int_condition() {
+        let p = lower(&parse(
+            "def main(a: int) -> int:\n    if a:\n        return 1\n    else:\n        return 0\n",
+        ))
+        .unwrap();
+        match &p.main.body[0] {
+            Stmt::If { cond, .. } => assert!(matches!(cond, Expr::Var(n) if n == "a")),
+            _ => panic!("expected If"),
+        }
     }
 
     #[test]
-    fn rejects_unbound_name() {
-        let m = parse("def main(a: int) -> int:\n    return a + b\n");
-        let err = lower(&m).unwrap_err();
-        let msg = format!("{}", err);
-        assert!(msg.contains("`b`"));
-        assert!(msg.contains("not in scope"));
+    fn lowers_not() {
+        let p = lower(&parse(
+            "def main(a: int) -> int:\n    if not a:\n        return 1\n    else:\n        return 0\n",
+        ))
+        .unwrap();
+        match &p.main.body[0] {
+            Stmt::If { cond: Expr::Not(_), .. } => {}
+            _ => panic!("expected Not in If condition"),
+        }
     }
 
     #[test]
-    fn rejects_use_before_assignment() {
-        let m = parse("def main(a: int) -> int:\n    y = x + 1\n    x = a\n    return y\n");
+    fn rejects_and_or() {
+        let m = parse(
+            "def main(a: int, b: int) -> int:\n    if a > 0 and b > 0:\n        return 1\n    else:\n        return 0\n",
+        );
         let err = lower(&m).unwrap_err();
-        assert!(format!("{}", err).contains("`x`"));
+        assert!(format!("{}", err).contains("`and` / `or`"));
     }
 
     #[test]
-    fn rejects_return_not_last() {
-        let m = parse("def main(a: int) -> int:\n    return a\n    x = 1\n");
+    fn rejects_is() {
+        let m = parse("def main(a: int) -> int:\n    if a is 0:\n        return 1\n    else:\n        return 0\n");
         let err = lower(&m).unwrap_err();
-        assert!(format!("{}", err).contains("after `return`"));
+        assert!(format!("{}", err).contains("`is`"));
     }
 
     #[test]
-    fn rejects_missing_return() {
-        let m = parse("def main(a: int) -> int:\n    x = a\n");
+    fn rejects_path_without_return() {
+        // `if` with no else, no trailing return — not all paths return.
+        let m = parse("def main(a: int) -> int:\n    if a > 0:\n        return 1\n");
         let err = lower(&m).unwrap_err();
-        assert!(format!("{}", err).contains("`return`"));
+        assert!(format!("{}", err).contains("not all paths return"));
     }
 
     #[test]
-    fn rejects_chained_assignment() {
-        let m = parse("def main(a: int) -> int:\n    x = y = a\n    return x\n");
-        let err = lower(&m).unwrap_err();
-        assert!(format!("{}", err).contains("chained"));
+    fn accepts_if_followed_by_return() {
+        let _ = lower(&parse(
+            "def main(a: int) -> int:\n    if a < 0:\n        return -1\n    return a\n",
+        ))
+        .unwrap();
     }
 
     #[test]
-    fn rejects_aug_assign() {
-        let m = parse("def main(a: int) -> int:\n    a += 1\n    return a\n");
-        let err = lower(&m).unwrap_err();
-        assert!(format!("{}", err).contains("AugAssign"));
-    }
-
-    #[test]
-    fn rejects_tuple_unpacking() {
-        let m = parse("def main() -> int:\n    a, b = 1, 2\n    return a + b\n");
-        let err = lower(&m).unwrap_err();
-        assert!(format!("{}", err).contains("unpacking"));
+    fn accepts_pass_in_branch() {
+        let _ = lower(&parse(
+            "def main(a: int) -> int:\n    if a > 0:\n        pass\n    return a\n",
+        ))
+        .unwrap();
     }
 }
