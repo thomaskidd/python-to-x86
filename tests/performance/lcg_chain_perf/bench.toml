@@ -1,0 +1,11 @@
+tier = 3
+warmup = 5
+iterations = 30
+max_ratio = 1.5
+
+# 100 million iterations of an LCG step (mul + add). At ~1 ns per
+# iteration on modern x86, this is ~100 ms — well above the ~1 ms
+# process-startup floor, so the ratio reflects compute, not startup.
+[[input]]
+type = "i64"
+range = [100_000_000, 100_000_000]

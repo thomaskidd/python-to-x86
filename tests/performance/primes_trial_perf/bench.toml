@@ -1,0 +1,11 @@
+tier = 3
+warmup = 3
+iterations = 15
+max_ratio = 1.5
+
+# Counting primes < 100k via trial division. Total work scales like
+# sum over prime p of (sqrt(p)) ~ O(n * sqrt(n) / ln n). For n=100k
+# this is well into the multi-millisecond range.
+[[input]]
+type = "i64"
+range = [100_000, 100_000]

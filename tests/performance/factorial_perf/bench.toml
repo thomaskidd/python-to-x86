@@ -1,8 +1,0 @@
-tier = 3
-warmup = 5
-iterations = 30
-max_ratio = 2.0
-
-[[input]]
-type = "i64"
-range = [12, 12]
