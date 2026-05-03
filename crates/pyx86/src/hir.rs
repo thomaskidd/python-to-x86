@@ -243,6 +243,10 @@ pub enum Expr {
     /// builtin call) because it's a single-instruction GEP/extractvalue
     /// the codegen handles directly.
     ListLen { list: Box<TypedExpr> },
+    /// Concatenate two lists into a new heap-allocated list.
+    /// Both operands must have the same List type; the result has that
+    /// same type. Element data is copied from both sources.
+    ListConcat { lhs: Box<TypedExpr>, rhs: Box<TypedExpr> },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

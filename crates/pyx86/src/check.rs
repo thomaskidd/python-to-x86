@@ -716,11 +716,19 @@ fn lower_expr(e: &ast::Expr, scope: &Scope, signatures: &SignatureTable) -> Resu
         }
         ast::Expr::List(l) => {
             // List literal: `[a, b, c]`. All elements must be coercible
-            // to a common type. Empty `[]` is rejected (no type info).
+            // to a common type. Empty `[]` produces a List of element
+            // type "Unknown" — we use I64 as a placeholder and rely on
+            // the assignment/return context to coerce. (For
+            // empty-list-with-annotation we'd ideally infer from the
+            // annotation; the AnnAssign path already does that since
+            // it lowers RHS first then coerces. Empty `[]` becomes
+            // `List(I64)` by default; for `list[float]` it's coerced.)
             if l.elts.is_empty() {
-                bail!(
-                    "unsupported_feature: empty list literal `[]` cannot be type-inferred (annotate the variable explicitly)"
-                );
+                let id = ListId::intern(Type::I64);
+                return Ok(TypedExpr::new(
+                    Type::List(id),
+                    Expr::ListLit { elements: Vec::new() },
+                ));
             }
             let lowered: Result<Vec<TypedExpr>> = l
                 .elts
@@ -897,6 +905,28 @@ fn apply_binop(op: BinOp, lhs: TypedExpr, rhs: TypedExpr) -> Result<TypedExpr> {
             ))
         }
         BinOp::Add | BinOp::Sub | BinOp::Mul => {
+            // List concatenation: list[T] + list[T] = list[T].
+            if let (Type::List(a), Type::List(b)) = (lhs.ty, rhs.ty) {
+                if op != BinOp::Add {
+                    bail!(
+                        "unsupported_feature: only `+` is defined on lists (no `-`/`*` yet)"
+                    );
+                }
+                if a != b {
+                    bail!(
+                        "unsupported_feature: cannot concatenate {} and {} (element types must match)",
+                        lhs.ty.name(),
+                        rhs.ty.name()
+                    );
+                }
+                return Ok(TypedExpr::new(
+                    lhs.ty,
+                    Expr::ListConcat {
+                        lhs: Box::new(lhs),
+                        rhs: Box::new(rhs),
+                    },
+                ));
+            }
             let (l, r) = unify_numeric(lhs, rhs)?;
             let ty = l.ty;
             Ok(TypedExpr::new(
@@ -1015,6 +1045,15 @@ fn unify_cmp_operands(lhs: TypedExpr, rhs: TypedExpr) -> Result<(TypedExpr, Type
 fn coerce(e: TypedExpr, target: Type) -> Result<TypedExpr> {
     if e.ty == target {
         return Ok(e);
+    }
+    // Special case: empty list literal can be re-tagged as any list type
+    // (it has no elements to retype). Lets `lst: list[float] = []` work.
+    if let (Type::List(_), Type::List(_)) = (e.ty, target) {
+        if let Expr::ListLit { elements } = &e.expr {
+            if elements.is_empty() {
+                return Ok(TypedExpr::new(target, Expr::ListLit { elements: Vec::new() }));
+            }
+        }
     }
     let allowed = match (e.ty, target) {
         // Float → int: lossy, rejected.
