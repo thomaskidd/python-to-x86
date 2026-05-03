@@ -9,7 +9,49 @@
 //! Codegen dispatches on `ty` to choose between integer and float
 //! LLVM ops, choose alloca element type, etc.
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+use std::cell::RefCell;
+
+/// Compile-time identifier for an interned tuple type. Two tuples
+/// with the same element types share the same `TupleId`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TupleId(u32);
+
+thread_local! {
+    static TUPLE_ARENA: RefCell<Vec<Vec<Type>>> = const { RefCell::new(Vec::new()) };
+}
+
+impl TupleId {
+    /// Intern a tuple-element list and get back its id. Idempotent
+    /// for repeated calls with the same elements.
+    pub fn intern(elems: Vec<Type>) -> TupleId {
+        TUPLE_ARENA.with(|a| {
+            let mut a = a.borrow_mut();
+            for (i, existing) in a.iter().enumerate() {
+                if existing == &elems {
+                    return TupleId(i as u32);
+                }
+            }
+            let id = a.len() as u32;
+            a.push(elems);
+            TupleId(id)
+        })
+    }
+    /// Borrow the element types of this tuple. Panics if the id is invalid.
+    /// `f` is called with a slice of the elements; the borrow is released
+    /// once `f` returns.
+    pub fn with_elems<R>(self, f: impl FnOnce(&[Type]) -> R) -> R {
+        TUPLE_ARENA.with(|a| {
+            let a = a.borrow();
+            f(&a[self.0 as usize])
+        })
+    }
+    /// Convenience: clone the elements out of the arena.
+    pub fn elems(self) -> Vec<Type> {
+        self.with_elems(|e| e.to_vec())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Type {
     I8,
     I16,
@@ -22,17 +64,32 @@ pub enum Type {
     /// Internal type produced by comparisons, `not`, boolean literals.
     /// Lowered as LLVM `i1`.
     Bool,
+    /// Fixed-arity heterogeneous tuple. Stored as an LLVM struct,
+    /// passed by value (no heap). Indexable only by constant integer
+    /// at compile time. Element types live in a thread-local arena
+    /// keyed by `TupleId` so `Type` remains `Copy`.
+    Tuple(TupleId),
 }
 
 impl Type {
-    pub fn name(self) -> &'static str {
+    pub fn name(self) -> String {
         match self {
-            Type::I8 => "i8",
-            Type::I16 => "i16",
-            Type::I32 => "i32",
-            Type::I64 => "int",
-            Type::F64 => "float",
-            Type::Bool => "bool",
+            Type::I8 => "i8".to_string(),
+            Type::I16 => "i16".to_string(),
+            Type::I32 => "i32".to_string(),
+            Type::I64 => "int".to_string(),
+            Type::F64 => "float".to_string(),
+            Type::Bool => "bool".to_string(),
+            Type::Tuple(id) => {
+                let inner = id.with_elems(|elems| {
+                    elems
+                        .iter()
+                        .map(|t| t.name())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                });
+                format!("tuple[{}]", inner)
+            }
         }
     }
     /// Width of the integer type in bits, or None for non-int types.
@@ -47,6 +104,9 @@ impl Type {
     }
     pub fn is_int(self) -> bool {
         self.int_width().is_some()
+    }
+    pub fn is_tuple(self) -> bool {
+        matches!(self, Type::Tuple(_))
     }
 }
 
@@ -134,6 +194,12 @@ pub enum Expr {
     /// the surrounding TypedExpr.ty is the target. Codegen emits the
     /// appropriate LLVM coercion (zext, sext, sitofp, fptosi, icmp-ne-0).
     Coerce { inner: Box<TypedExpr> },
+    /// Construct a tuple from N values. Element types must match the
+    /// surrounding TypedExpr.ty (which must be a Tuple).
+    TupleLit { elements: Vec<TypedExpr> },
+    /// Index into a tuple at a compile-time constant position.
+    /// Result type is the element type at that index.
+    TupleIndex { tuple: Box<TypedExpr>, index: usize },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
