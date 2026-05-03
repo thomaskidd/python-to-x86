@@ -4,16 +4,16 @@
 
 Take the validated program (eventually: typed HIR / SSA mid-IR) and emit LLVM IR as text. Drive the final assemble + link step by shelling out to `clang`.
 
-## Current scope (v0.3)
+## Current scope (v0.4)
 
-`main(<a>: int, ...)` (up to 16 typed-int params) returns an integer expression composed of:
+`main(<a>: int, ...)` (up to 16 typed-int params) has a body of zero or more local bindings followed by a `return`. Expressions compose:
 - `int` literals (i64-range)
-- Parameter references
+- Variable references (parameters or previously assigned locals)
 - Binary `+ - * // %`
 - Unary `+x`, `-x`
 - Parentheses
 
-No locals, no control flow yet — those are v0.4+.
+No control flow yet — that's v0.5.
 
 ## v0.1 IR template (literal return)
 
@@ -127,6 +127,41 @@ entry:
 Naming convention: `%p_<name>` for parameters, `%v<n>` for internal SSA values, `%slot<i>` / `%str<i>` for the argv-parsing scaffold. The `p_` prefix avoids collisions when a user names a parameter like `v0`.
 
 `atoll` returns 0 on parse failure rather than reporting an error. v0.3 trusts the caller (the bench) to pass well-formed integers; argv-validation lands when we add error handling.
+
+## v0.4 IR — locals as pure SSA
+
+The function body is now a sequence of statements. Codegen maintains a `HashMap<String, String>` mapping HIR variable names to LLVM operands. The map is **seeded with parameters** (`"a" → "%p_a"`) so `Var(name)` lookups uniformly resolve both params and locals.
+
+For each `Stmt::Let { name, value }`:
+- Lower `value`, get an operand (literal or SSA name).
+- Insert (or **overwrite**) `name → operand` in the map.
+
+For `Stmt::Return { value }`:
+- Lower `value`, emit `ret i64 <operand>`.
+
+There are **no `alloca` / `store` / `load` instructions** in v0.4. Locals are pure SSA. Reassignment is a map overwrite, which produces a fresh SSA name on the next emitted instruction; the previous SSA name becomes dead and LLVM's DCE removes it.
+
+```python
+def main(a: int) -> int:
+    x = a + 1
+    y = x * 2
+    return y
+```
+
+emits
+
+```llvm
+define i64 @py_main(i64 %p_a) {
+entry:
+  %v0 = add i64 %p_a, 1     ; x
+  %v1 = mul i64 %v0, 2      ; y
+  ret i64 %v1
+}
+```
+
+Aliasing assignments like `x = a` emit no instruction at all: the map gets `"x" → "%p_a"` and subsequent `Var("x")` lookups return `"%p_a"` directly.
+
+When v0.5 adds branching, this scheme stops working — locals modified in a then-branch can't be SSA-renamed without `phi` nodes. The plan is to switch locals to `alloca`+`load`/`store` in v0.5 and let LLVM's `mem2reg` collapse them back to SSA at `-O1+`. Hand-rolled phis are not on the menu.
 
 ## Pipeline driven by codegen
 

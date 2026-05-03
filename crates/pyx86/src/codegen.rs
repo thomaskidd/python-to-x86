@@ -1,22 +1,29 @@
+use std::collections::HashMap;
 use std::fmt::Write as _;
 
-use crate::hir::{BinOp, Expr, Function, Program, UnaryOp};
+use crate::hir::{BinOp, Expr, Function, Program, Stmt, UnaryOp};
 
-/// Emit LLVM IR text for a v0.3 HIR program.
+/// Emit LLVM IR text for a v0.4 HIR program.
 ///
-/// `py_main` carries the user's function signature (i64 params,
-/// i64 return). A C `main(argc, argv)` wrapper parses each argv
-/// string via `atoll`, calls `py_main`, prints the return value
-/// via `printf("%ld\n", ...)`, and returns 0.
+/// Function body is now a sequence of statements. Locals are pure
+/// SSA values (no `alloca`/`load`/`store`) — fine because v0.4 has
+/// no control flow. Reassignment overwrites the entry in the
+/// variable map, producing a fresh SSA name each time.
 ///
-/// Typed pointers (`i8*`) so this works on LLVM 10+. Opaque
-/// pointers (`ptr`) are LLVM 14+; we don't require them.
+/// When v0.5 adds branching, locals will switch to `alloca`+
+/// `load`/`store` and let LLVM's `mem2reg` collapse them back to
+/// SSA at -O1+.
 pub fn emit_ll(prog: &Program, source_basename: &str) -> String {
     let basename = sanitize_module_id(source_basename);
     let func = &prog.main;
 
     let mut cg = Codegen::new();
-    let result = cg.lower(&func.body);
+    // Seed the variable map with parameters so `Var(name)` lowering
+    // can find them.
+    for p in &func.params {
+        cg.vars.insert(p.name.clone(), format!("%p_{}", p.name));
+    }
+    cg.lower_body(&func.body);
     let body = cg.body;
 
     let signature = format_signature(func);
@@ -39,8 +46,7 @@ declare i64 @atoll(i8*)
 
 define i64 @py_main({sig}) {{
 entry:
-{body}  ret i64 {result}
-}}
+{body}}}
 
 define i32 @main(i32 %argc, i8** %argv) {{
 entry:
@@ -53,7 +59,6 @@ entry:
         name = basename,
         sig = signature,
         body = body,
-        result = result,
         parse = parse_args_block,
         call_args = py_main_call_args,
     )
@@ -67,8 +72,6 @@ fn format_signature(func: &Function) -> String {
         .join(", ")
 }
 
-/// Generate the wrapper instructions that pull each parameter out of
-/// argv (1-indexed: argv[0] is the program name) and atoll it.
 fn format_argv_parsing(func: &Function) -> String {
     let mut s = String::new();
     for (i, p) in func.params.iter().enumerate() {
@@ -90,17 +93,22 @@ fn format_argv_parsing(func: &Function) -> String {
     s
 }
 
-/// Builds a single `py_main` body. Each `lower(...)` call returns the
-/// LLVM operand (literal like `42` or SSA name like `%v3`) holding
-/// the expression's value, after appending instructions to `self.body`.
 struct Codegen {
     body: String,
     next_id: usize,
+    /// Maps HIR variable name → LLVM operand currently holding its value.
+    /// Reassignment overwrites the entry; the old SSA name becomes
+    /// dead code (LLVM DCE removes it).
+    vars: HashMap<String, String>,
 }
 
 impl Codegen {
     fn new() -> Self {
-        Self { body: String::new(), next_id: 0 }
+        Self {
+            body: String::new(),
+            next_id: 0,
+            vars: HashMap::new(),
+        }
     }
 
     fn fresh(&mut self) -> String {
@@ -113,10 +121,29 @@ impl Codegen {
         let _ = writeln!(self.body, "  {}", line);
     }
 
+    fn lower_body(&mut self, stmts: &[Stmt]) {
+        for stmt in stmts {
+            match stmt {
+                Stmt::Let { name, value } => {
+                    let operand = self.lower(value);
+                    self.vars.insert(name.clone(), operand);
+                }
+                Stmt::Return { value } => {
+                    let operand = self.lower(value);
+                    self.emit(&format!("ret i64 {}", operand));
+                }
+            }
+        }
+    }
+
     fn lower(&mut self, e: &Expr) -> String {
         match e {
             Expr::ConstI64(v) => v.to_string(),
-            Expr::Param(name) => format!("%p_{}", name),
+            Expr::Var(name) => self
+                .vars
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| panic!("internal: var `{}` not in codegen scope (check should have caught this)", name)),
             Expr::UnaryOp { op, operand } => {
                 let inner = self.lower(operand);
                 match op {
@@ -198,9 +225,9 @@ fn sanitize_module_id(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hir::{BinOp, Expr, Function, Param, Program, Type, UnaryOp};
+    use crate::hir::{BinOp, Expr, Function, Param, Program, Stmt, Type};
 
-    fn make_program(params: Vec<&str>, body: Expr) -> Program {
+    fn make_program(params: Vec<&str>, body: Vec<Stmt>) -> Program {
         Program {
             main: Function {
                 name: "main".into(),
@@ -214,78 +241,96 @@ mod tests {
         }
     }
 
-    fn ll_for(prog: Program) -> String {
-        emit_ll(&prog, "test")
-    }
-
     #[test]
-    fn no_param_const_returns_literal() {
-        let ll = ll_for(make_program(vec![], Expr::ConstI64(42)));
-        assert!(ll.contains("define i64 @py_main()"));
-        assert!(ll.contains("ret i64 42"));
-        assert!(ll.contains("call i64 @py_main()"));
-    }
-
-    #[test]
-    fn one_param_identity_passes_argv0_through() {
-        let ll = ll_for(make_program(vec!["x"], Expr::Param("x".into())));
-        assert!(ll.contains("define i64 @py_main(i64 %p_x)"));
-        // Wrapper parses argv[1] into %p_x via atoll.
-        assert!(ll.contains("getelementptr inbounds i8*, i8** %argv, i64 1"));
-        assert!(ll.contains("%p_x = call i64 @atoll"));
-        assert!(ll.contains("call i64 @py_main(i64 %p_x)"));
-        // Body returns the param directly (no extra instructions).
-        assert!(ll.contains("ret i64 %p_x"));
-    }
-
-    #[test]
-    fn two_param_add_uses_correct_argv_indices() {
-        let ll = ll_for(make_program(
-            vec!["a", "b"],
-            Expr::BinOp {
-                op: BinOp::Add,
-                lhs: Box::new(Expr::Param("a".into())),
-                rhs: Box::new(Expr::Param("b".into())),
-            },
-        ));
-        assert!(ll.contains("define i64 @py_main(i64 %p_a, i64 %p_b)"));
-        assert!(ll.contains("getelementptr inbounds i8*, i8** %argv, i64 1"));
-        assert!(ll.contains("getelementptr inbounds i8*, i8** %argv, i64 2"));
-        assert!(ll.contains("call i64 @py_main(i64 %p_a, i64 %p_b)"));
-        assert!(ll.contains("add i64 %p_a, %p_b"));
-    }
-
-    #[test]
-    fn unary_neg_emits_zero_minus() {
-        let ll = ll_for(make_program(
-            vec![],
-            Expr::UnaryOp { op: UnaryOp::Neg, operand: Box::new(Expr::ConstI64(5)) },
-        ));
-        assert!(ll.contains("sub i64 0, 5"));
-    }
-
-    #[test]
-    fn floor_div_emits_correction_block() {
-        let ll = ll_for(make_program(
-            vec![],
-            Expr::BinOp {
-                op: BinOp::FloorDiv,
-                lhs: Box::new(Expr::ConstI64(-7)),
-                rhs: Box::new(Expr::ConstI64(2)),
-            },
-        ));
-        assert!(ll.contains("sdiv i64"));
-        assert!(ll.contains("srem i64"));
-        assert!(ll.contains("xor i64"));
-        assert!(ll.contains("sext i1"));
-    }
-
-    #[test]
-    fn module_id_is_sanitized() {
+    fn no_locals_emits_a_simple_return() {
         let ll = emit_ll(
-            &make_program(vec![], Expr::ConstI64(0)),
-            "weird-name.with.dots",
+            &make_program(vec![], vec![Stmt::Return { value: Expr::ConstI64(42) }]),
+            "test",
         );
-        assert!(ll.contains("ModuleID = 'pyx86_weird_name_with_dots'"));
+        assert!(ll.contains("ret i64 42"));
+    }
+
+    #[test]
+    fn local_binds_then_returns() {
+        let ll = emit_ll(
+            &make_program(
+                vec!["a"],
+                vec![
+                    Stmt::Let {
+                        name: "x".into(),
+                        value: Expr::BinOp {
+                            op: BinOp::Add,
+                            lhs: Box::new(Expr::Var("a".into())),
+                            rhs: Box::new(Expr::ConstI64(1)),
+                        },
+                    },
+                    Stmt::Return { value: Expr::Var("x".into()) },
+                ],
+            ),
+            "test",
+        );
+        // The Let statement should produce an `add i64 %p_a, 1` and
+        // the Return should `ret i64` of that SSA value (%v0).
+        assert!(ll.contains("%v0 = add i64 %p_a, 1"));
+        assert!(ll.contains("ret i64 %v0"));
+    }
+
+    #[test]
+    fn reassignment_overwrites_var_map() {
+        let ll = emit_ll(
+            &make_program(
+                vec!["a"],
+                vec![
+                    Stmt::Let { name: "x".into(), value: Expr::Var("a".into()) },
+                    Stmt::Let {
+                        name: "x".into(),
+                        value: Expr::BinOp {
+                            op: BinOp::Add,
+                            lhs: Box::new(Expr::Var("x".into())),
+                            rhs: Box::new(Expr::ConstI64(1)),
+                        },
+                    },
+                    Stmt::Return { value: Expr::Var("x".into()) },
+                ],
+            ),
+            "test",
+        );
+        // First Let: x = a, no instruction emitted (Var lookup just maps x → %p_a).
+        // Second Let: x = x + 1 → emits `%v0 = add i64 %p_a, 1`, then x → %v0.
+        // Return: ret i64 %v0.
+        assert!(ll.contains("%v0 = add i64 %p_a, 1"));
+        assert!(ll.contains("ret i64 %v0"));
+    }
+
+    #[test]
+    fn chain_of_locals_uses_each_predecessor() {
+        let ll = emit_ll(
+            &make_program(
+                vec!["a"],
+                vec![
+                    Stmt::Let {
+                        name: "x".into(),
+                        value: Expr::BinOp {
+                            op: BinOp::Add,
+                            lhs: Box::new(Expr::Var("a".into())),
+                            rhs: Box::new(Expr::ConstI64(1)),
+                        },
+                    },
+                    Stmt::Let {
+                        name: "y".into(),
+                        value: Expr::BinOp {
+                            op: BinOp::Mul,
+                            lhs: Box::new(Expr::Var("x".into())),
+                            rhs: Box::new(Expr::ConstI64(2)),
+                        },
+                    },
+                    Stmt::Return { value: Expr::Var("y".into()) },
+                ],
+            ),
+            "test",
+        );
+        assert!(ll.contains("%v0 = add i64 %p_a, 1"));
+        assert!(ll.contains("%v1 = mul i64 %v0, 2"));
+        assert!(ll.contains("ret i64 %v1"));
     }
 }

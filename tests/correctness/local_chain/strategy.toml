@@ -1,0 +1,5 @@
+# Tight bounds: g = f * b, where b ~ a+1 and f ~ d/2 ~ c. Worst case
+# product roughly a * a * 2 = 2 * 1e12, still inside i64 (~9.2e18).
+[[arg]]
+type = "i64"
+range = [-1_000_000, 1_000_000]

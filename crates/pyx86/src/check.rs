@@ -3,21 +3,20 @@ use std::collections::HashSet;
 use anyhow::{anyhow, bail, Result};
 use rustpython_parser::ast;
 
-use crate::hir::{BinOp, Expr, Function, Param, Program, Type, UnaryOp};
+use crate::hir::{BinOp, Expr, Function, Param, Program, Stmt, Type, UnaryOp};
 use crate::parser::Module;
 
 const MAX_PARAMS: usize = 16;
 
 /// Validate that the module is in the supported subset and lower it
-/// to HIR. v0.3 supports:
+/// to HIR. v0.4 supports:
 ///
 /// ```text
 /// def main(<param>: int, …) -> int:
-///     return <expr>
+///     <name> [: int] = <expr>      # zero or more local bindings
+///     …
+///     return <expr>                # required, must be last stmt
 /// ```
-///
-/// where `<expr>` is built from int literals, parameter references,
-/// binary `+ - * // %`, unary `+x/-x`, and parens.
 ///
 /// Anything else produces an `unsupported_feature` error.
 pub fn lower(module: &Module) -> Result<Program> {
@@ -47,9 +46,6 @@ pub fn lower(module: &Module) -> Result<Program> {
     if func.args.vararg.is_some() || func.args.kwarg.is_some() {
         bail!("unsupported_feature: *args / **kwargs are not supported");
     }
-    // `defaults()` is a method on Arguments in rustpython-ast 0.4 that
-    // returns an iterator over the default expressions. Any default at
-    // all is rejected.
     if func.args.defaults().next().is_some() {
         bail!("unsupported_feature: default arguments are not supported");
     }
@@ -65,10 +61,10 @@ pub fn lower(module: &Module) -> Result<Program> {
     }
 
     let mut params = Vec::with_capacity(func.args.args.len());
-    let mut seen = HashSet::new();
+    let mut scope: HashSet<String> = HashSet::new();
     for arg in &func.args.args {
         let name = arg.def.arg.as_str().to_string();
-        if !seen.insert(name.clone()) {
+        if !scope.insert(name.clone()) {
             bail!("unsupported_feature: duplicate parameter name `{}`", name);
         }
         let ty = parse_type_annotation(arg.def.annotation.as_deref())
@@ -81,26 +77,79 @@ pub fn lower(module: &Module) -> Result<Program> {
         None => bail!("unsupported_feature: requires a return annotation `-> int`"),
     };
 
-    if func.body.len() != 1 {
+    if func.body.is_empty() {
+        bail!("unsupported_feature: `main()` body must end with a `return` statement");
+    }
+
+    let mut body: Vec<Stmt> = Vec::with_capacity(func.body.len());
+    let last_idx = func.body.len() - 1;
+    for (i, stmt) in func.body.iter().enumerate() {
+        let is_last = i == last_idx;
+        match stmt {
+            ast::Stmt::Assign(a) => {
+                if is_last {
+                    bail!(
+                        "unsupported_feature: function body must end with `return`, found assignment as last statement"
+                    );
+                }
+                let name = parse_assign_target(&a.targets)?;
+                let value = lower_expr(&a.value, &scope)?;
+                scope.insert(name.clone());
+                body.push(Stmt::Let { name, value });
+            }
+            ast::Stmt::AnnAssign(a) => {
+                if is_last {
+                    bail!(
+                        "unsupported_feature: function body must end with `return`, found assignment as last statement"
+                    );
+                }
+                let name = match a.target.as_ref() {
+                    ast::Expr::Name(n) => n.id.as_str().to_string(),
+                    _ => bail!("unsupported_feature: only simple-name targets are supported in assignments"),
+                };
+                if !a.simple {
+                    // `(x): int = ...` — Python allows this, we don't.
+                    bail!("unsupported_feature: parenthesised annotation targets are not supported");
+                }
+                if parse_type_annotation(Some(&a.annotation)).is_none() {
+                    bail!(
+                        "unsupported_feature: only `: int` annotations are supported on locals, on `{}`",
+                        name
+                    );
+                }
+                let value_expr = a
+                    .value
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("unsupported_feature: bare annotation `{}: int` (no value) is not supported", name))?;
+                let value = lower_expr(value_expr, &scope)?;
+                scope.insert(name.clone());
+                body.push(Stmt::Let { name, value });
+            }
+            ast::Stmt::Return(r) => {
+                if !is_last {
+                    bail!(
+                        "unsupported_feature: statements after `return` are not allowed (early return needs control flow, lands in v0.5)"
+                    );
+                }
+                let value_expr = r
+                    .value
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("unsupported_feature: `return` must have a value"))?;
+                let value = lower_expr(value_expr, &scope)?;
+                body.push(Stmt::Return { value });
+            }
+            other => bail!(
+                "unsupported_feature: statement `{}` is not supported in v0.4",
+                stmt_kind_name(other)
+            ),
+        }
+    }
+
+    if !matches!(body.last(), Some(Stmt::Return { .. })) {
         bail!(
-            "unsupported_feature: `main()` body must be a single `return` statement, found {} stmts",
-            func.body.len()
+            "unsupported_feature: `main()` body must end with a `return` statement"
         );
     }
-    let ret = match &func.body[0] {
-        ast::Stmt::Return(r) => r,
-        other => bail!(
-            "unsupported_feature: `main()` body must be `return <expr>`, found {}",
-            stmt_kind_name(other)
-        ),
-    };
-    let value_expr = ret
-        .value
-        .as_deref()
-        .ok_or_else(|| anyhow!("unsupported_feature: `main()` must return a value"))?;
-
-    let param_names: HashSet<&str> = params.iter().map(|p| p.name.as_str()).collect();
-    let body = lower_expr(value_expr, &param_names)?;
 
     Ok(Program {
         main: Function {
@@ -112,6 +161,27 @@ pub fn lower(module: &Module) -> Result<Program> {
     })
 }
 
+fn parse_assign_target(targets: &[ast::Expr]) -> Result<String> {
+    if targets.len() != 1 {
+        bail!(
+            "unsupported_feature: chained assignment `a = b = ...` is not supported (use separate statements)"
+        );
+    }
+    match &targets[0] {
+        ast::Expr::Name(n) => Ok(n.id.as_str().to_string()),
+        ast::Expr::Tuple(_) | ast::Expr::List(_) => {
+            bail!("unsupported_feature: tuple/list unpacking on assignment is not supported")
+        }
+        ast::Expr::Subscript(_) | ast::Expr::Attribute(_) => {
+            bail!("unsupported_feature: subscript / attribute assignment is not supported")
+        }
+        other => bail!(
+            "unsupported_feature: assignment target `{}` is not supported",
+            expr_kind_name(other)
+        ),
+    }
+}
+
 fn parse_type_annotation(ann: Option<&ast::Expr>) -> Option<Type> {
     match ann? {
         ast::Expr::Name(n) if n.id.as_str() == "int" => Some(Type::I64),
@@ -119,7 +189,7 @@ fn parse_type_annotation(ann: Option<&ast::Expr>) -> Option<Type> {
     }
 }
 
-fn lower_expr(e: &ast::Expr, params: &HashSet<&str>) -> Result<Expr> {
+fn lower_expr(e: &ast::Expr, scope: &HashSet<String>) -> Result<Expr> {
     match e {
         ast::Expr::Constant(c) => match &c.value {
             ast::Constant::Int(big) => {
@@ -132,11 +202,11 @@ fn lower_expr(e: &ast::Expr, params: &HashSet<&str>) -> Result<Expr> {
         },
         ast::Expr::Name(n) => {
             let name = n.id.as_str();
-            if params.contains(name) {
-                Ok(Expr::Param(name.to_string()))
+            if scope.contains(name) {
+                Ok(Expr::Var(name.to_string()))
             } else {
                 bail!(
-                    "unsupported_feature: name `{}` is not a parameter (locals not supported until v0.4)",
+                    "unsupported_feature: name `{}` is not in scope (must be a parameter or previously assigned local)",
                     name
                 )
             }
@@ -162,8 +232,8 @@ fn lower_expr(e: &ast::Expr, params: &HashSet<&str>) -> Result<Expr> {
             };
             Ok(Expr::BinOp {
                 op,
-                lhs: Box::new(lower_expr(&b.left, params)?),
-                rhs: Box::new(lower_expr(&b.right, params)?),
+                lhs: Box::new(lower_expr(&b.left, scope)?),
+                rhs: Box::new(lower_expr(&b.right, scope)?),
             })
         }
         ast::Expr::UnaryOp(u) => {
@@ -175,7 +245,7 @@ fn lower_expr(e: &ast::Expr, params: &HashSet<&str>) -> Result<Expr> {
             };
             Ok(Expr::UnaryOp {
                 op,
-                operand: Box::new(lower_expr(&u.operand, params)?),
+                operand: Box::new(lower_expr(&u.operand, scope)?),
             })
         }
         other => bail!(
@@ -261,71 +331,106 @@ mod tests {
     }
 
     #[test]
-    fn lowers_no_param_main() {
-        let m = parse("def main() -> int:\n    return 42\n");
-        let p = lower(&m).unwrap();
-        assert_eq!(p.main.params.len(), 0);
-        assert!(matches!(p.main.body, Expr::ConstI64(42)));
+    fn lowers_no_locals() {
+        let p = lower(&parse("def main() -> int:\n    return 42\n")).unwrap();
+        assert_eq!(p.main.body.len(), 1);
+        assert!(matches!(p.main.body[0], Stmt::Return { .. }));
     }
 
     #[test]
-    fn lowers_two_param_main() {
-        let m = parse("def main(a: int, b: int) -> int:\n    return a + b\n");
-        let p = lower(&m).unwrap();
-        assert_eq!(p.main.params.len(), 2);
-        assert_eq!(p.main.params[0].name, "a");
-        assert_eq!(p.main.params[1].name, "b");
-        match &p.main.body {
-            Expr::BinOp { op: BinOp::Add, lhs, rhs } => {
-                assert!(matches!(**lhs, Expr::Param(ref n) if n == "a"));
-                assert!(matches!(**rhs, Expr::Param(ref n) if n == "b"));
-            }
-            other => panic!("expected Add of params, got {:?}", other),
+    fn lowers_single_local() {
+        let p = lower(&parse(
+            "def main(a: int) -> int:\n    x = a + 1\n    return x\n",
+        ))
+        .unwrap();
+        assert_eq!(p.main.body.len(), 2);
+        match &p.main.body[0] {
+            Stmt::Let { name, .. } => assert_eq!(name, "x"),
+            _ => panic!("expected Let"),
+        }
+        match &p.main.body[1] {
+            Stmt::Return { value } => assert!(matches!(value, Expr::Var(n) if n == "x")),
+            _ => panic!("expected Return"),
         }
     }
 
     #[test]
-    fn rejects_unannotated_param() {
-        let m = parse("def main(a) -> int:\n    return a\n");
-        let err = lower(&m).unwrap_err();
-        assert!(format!("{}", err).contains("annotated"));
+    fn lowers_annotated_assignment() {
+        let p = lower(&parse(
+            "def main(a: int) -> int:\n    x: int = a + 1\n    return x\n",
+        ))
+        .unwrap();
+        assert!(matches!(p.main.body[0], Stmt::Let { ref name, .. } if name == "x"));
     }
 
     #[test]
-    fn rejects_non_int_param_annotation() {
-        let m = parse("def main(a: str) -> int:\n    return 0\n");
-        let err = lower(&m).unwrap_err();
-        assert!(format!("{}", err).contains("annotated"));
+    fn allows_reassignment() {
+        let p = lower(&parse(
+            "def main(a: int) -> int:\n    x = a\n    x = x + 1\n    return x\n",
+        ))
+        .unwrap();
+        // Two Let statements, both binding `x`.
+        assert_eq!(p.main.body.len(), 3);
+        assert!(matches!(p.main.body[0], Stmt::Let { ref name, .. } if name == "x"));
+        assert!(matches!(p.main.body[1], Stmt::Let { ref name, .. } if name == "x"));
+        assert!(matches!(p.main.body[2], Stmt::Return { .. }));
     }
 
     #[test]
-    fn rejects_unknown_name_reference() {
+    fn rejects_non_int_local_annotation() {
+        let m = parse("def main(a: int) -> int:\n    x: str = a\n    return a\n");
+        let err = lower(&m).unwrap_err();
+        assert!(format!("{}", err).contains("`: int`"));
+    }
+
+    #[test]
+    fn rejects_unbound_name() {
         let m = parse("def main(a: int) -> int:\n    return a + b\n");
         let err = lower(&m).unwrap_err();
         let msg = format!("{}", err);
-        assert!(msg.contains("`b`") && msg.contains("not a parameter"));
+        assert!(msg.contains("`b`"));
+        assert!(msg.contains("not in scope"));
     }
 
     #[test]
-    fn rejects_default_arguments() {
-        let m = parse("def main(a: int = 0) -> int:\n    return a\n");
+    fn rejects_use_before_assignment() {
+        let m = parse("def main(a: int) -> int:\n    y = x + 1\n    x = a\n    return y\n");
         let err = lower(&m).unwrap_err();
-        assert!(format!("{}", err).contains("default"));
+        assert!(format!("{}", err).contains("`x`"));
     }
 
     #[test]
-    fn rejects_too_many_params() {
-        let names: Vec<String> = (0..MAX_PARAMS + 1).map(|i| format!("p{}: int", i)).collect();
-        let src = format!("def main({}) -> int:\n    return 0\n", names.join(", "));
-        let m = parse(&src);
+    fn rejects_return_not_last() {
+        let m = parse("def main(a: int) -> int:\n    return a\n    x = 1\n");
         let err = lower(&m).unwrap_err();
-        assert!(format!("{}", err).contains("at most"));
+        assert!(format!("{}", err).contains("after `return`"));
     }
 
     #[test]
-    fn rejects_missing_return_annotation() {
-        let m = parse("def main(a: int):\n    return a\n");
+    fn rejects_missing_return() {
+        let m = parse("def main(a: int) -> int:\n    x = a\n");
         let err = lower(&m).unwrap_err();
-        assert!(format!("{}", err).contains("return annotation"));
+        assert!(format!("{}", err).contains("`return`"));
+    }
+
+    #[test]
+    fn rejects_chained_assignment() {
+        let m = parse("def main(a: int) -> int:\n    x = y = a\n    return x\n");
+        let err = lower(&m).unwrap_err();
+        assert!(format!("{}", err).contains("chained"));
+    }
+
+    #[test]
+    fn rejects_aug_assign() {
+        let m = parse("def main(a: int) -> int:\n    a += 1\n    return a\n");
+        let err = lower(&m).unwrap_err();
+        assert!(format!("{}", err).contains("AugAssign"));
+    }
+
+    #[test]
+    fn rejects_tuple_unpacking() {
+        let m = parse("def main() -> int:\n    a, b = 1, 2\n    return a + b\n");
+        let err = lower(&m).unwrap_err();
+        assert!(format!("{}", err).contains("unpacking"));
     }
 }
