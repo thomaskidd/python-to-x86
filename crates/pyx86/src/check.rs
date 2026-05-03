@@ -169,6 +169,51 @@ fn lower_block(
                 scope.insert(name.clone());
                 out.push(Stmt::Let { name, value });
             }
+            ast::Stmt::AugAssign(a) => {
+                // `x op= e` desugars to `x = x op e`. Requires x to
+                // already be in scope (CPython gives UnboundLocalError
+                // otherwise — we reject at compile time).
+                let name = match a.target.as_ref() {
+                    ast::Expr::Name(n) => n.id.as_str().to_string(),
+                    _ => bail!(
+                        "unsupported_feature: augmented-assignment target must be a simple name"
+                    ),
+                };
+                if !scope.contains(&name) {
+                    bail!(
+                        "unsupported_feature: augmented assignment to unbound name `{}` (must already be a parameter or assigned local)",
+                        name
+                    );
+                }
+                let op = match a.op {
+                    ast::Operator::Add => BinOp::Add,
+                    ast::Operator::Sub => BinOp::Sub,
+                    ast::Operator::Mult => BinOp::Mul,
+                    ast::Operator::FloorDiv => BinOp::FloorDiv,
+                    ast::Operator::Mod => BinOp::Mod,
+                    ast::Operator::LShift => BinOp::Shl,
+                    ast::Operator::RShift => BinOp::Shr,
+                    ast::Operator::BitAnd => BinOp::BitAnd,
+                    ast::Operator::BitOr => BinOp::BitOr,
+                    ast::Operator::BitXor => BinOp::BitXor,
+                    ast::Operator::Div => bail!(
+                        "unsupported_feature: `/=` (true division) is not yet supported"
+                    ),
+                    ast::Operator::Pow => bail!(
+                        "unsupported_feature: `**=` is not yet supported"
+                    ),
+                    ast::Operator::MatMult => bail!(
+                        "unsupported_feature: `@=` (matmul) is not supported"
+                    ),
+                };
+                let rhs = lower_expr(&a.value, scope)?;
+                let value = Expr::BinOp {
+                    op,
+                    lhs: Box::new(Expr::Var(name.clone())),
+                    rhs: Box::new(rhs),
+                };
+                out.push(Stmt::Let { name, value });
+            }
             ast::Stmt::Return(r) => {
                 let value_expr = r
                     .value
@@ -629,6 +674,27 @@ mod tests {
         let m = parse("def main() -> int:\n    continue\n    return 0\n");
         let err = lower(&m).unwrap_err();
         assert!(format!("{}", err).contains("`continue` outside"));
+    }
+
+    #[test]
+    fn lowers_aug_assign() {
+        // `a += 1` desugars to `a = a + 1`.
+        let p = lower(&parse("def main(a: int) -> int:\n    a += 1\n    return a\n")).unwrap();
+        match &p.main.body[0] {
+            Stmt::Let { name, value: Expr::BinOp { op: BinOp::Add, lhs, rhs } } => {
+                assert_eq!(name, "a");
+                assert!(matches!(**lhs, Expr::Var(ref n) if n == "a"));
+                assert!(matches!(**rhs, Expr::ConstI64(1)));
+            }
+            other => panic!("expected Let with BinOp::Add desugar, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn rejects_aug_assign_to_unbound_name() {
+        let m = parse("def main() -> int:\n    x += 1\n    return x\n");
+        let err = lower(&m).unwrap_err();
+        assert!(format!("{}", err).contains("unbound name `x`"));
     }
 
     #[test]
