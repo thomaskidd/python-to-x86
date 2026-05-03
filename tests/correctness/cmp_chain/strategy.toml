@@ -1,0 +1,4 @@
+# Range straddles both bounds.
+[[arg]]
+type = "i64"
+range = [-50, 200]

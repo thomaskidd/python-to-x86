@@ -4,16 +4,17 @@
 
 Take the validated program (eventually: typed HIR / SSA mid-IR) and emit LLVM IR as text. Drive the final assemble + link step by shelling out to `clang`.
 
-## Current scope (v0.4)
+## Current scope (v0.5)
 
-`main(<a>: int, ...)` (up to 16 typed-int params) has a body of zero or more local bindings followed by a `return`. Expressions compose:
+`main(<a>: int, ...)` (up to 16 typed-int params) has a body of statements (assignments, `if`/`elif`/`else`, `pass`, `return`) that provably returns on every path. Expressions compose:
 - `int` literals (i64-range)
 - Variable references (parameters or previously assigned locals)
 - Binary `+ - * // %`
-- Unary `+x`, `-x`
+- Unary `+x`, `-x`, `not x`
+- Comparisons `< <= > >= == !=` (single and chained)
 - Parentheses
 
-No control flow yet — that's v0.5.
+No `while`, no `and`/`or` yet — those are v0.6.
 
 ## v0.1 IR template (literal return)
 
@@ -162,6 +163,76 @@ entry:
 Aliasing assignments like `x = a` emit no instruction at all: the map gets `"x" → "%p_a"` and subsequent `Var("x")` lookups return `"%p_a"` directly.
 
 When v0.5 adds branching, this scheme stops working — locals modified in a then-branch can't be SSA-renamed without `phi` nodes. The plan is to switch locals to `alloca`+`load`/`store` in v0.5 and let LLVM's `mem2reg` collapse them back to SSA at `-O1+`. Hand-rolled phis are not on the menu.
+
+## v0.5 IR — alloca-based locals + branching
+
+### Why alloca
+
+Once `if`/`else` is in the picture, a local assigned inside one branch and used after the merge can't be a single SSA name. Hand-rolling `phi` nodes is annoying and error-prone. We follow the LLVM "Kaleidoscope" pattern: **every local (and every parameter, for uniformity) gets an `alloca i64` slot at function entry**. Reads emit `load`, writes emit `store`, and LLVM's `mem2reg` pass (active at `-O1+`, and we always run `-O2`) collapses the slot back into SSA + phi.
+
+### Function prologue
+
+For every parameter and every local name (collected by walking the HIR body):
+
+```llvm
+entry:
+  %a.addr = alloca i64
+  store i64 %p_a, i64* %a.addr
+  %x.addr = alloca i64
+  …
+```
+
+A param and a local with the same name share the slot (we don't model Python's UnboundLocalError here — accept this as a pragmatic deviation).
+
+### Statement codegen
+
+| Stmt | Emitted |
+|---|---|
+| `Let { name, value }` | lower `value` → operand; `store i64 <op>, i64* %<name>.addr` |
+| `Return { value }` | lower `value` → operand; `ret i64 <op>`; mark current block terminated |
+| `If { cond, then, else }` | lower `cond` → i1; `br i1 <c>, label %then.N, label %else.N`; emit then-block + else-block + merge-block |
+
+`If` blocks use a single per-statement id `N` so labels read `then.0`, `else.0`, `merge.0`, `then.1`, … . When a branch's body terminates (returns), we skip the trailing `br label %merge.N`. If both branches terminate, the merge block is emitted but is dead — LLVM tolerates this and DCE removes it. If the function falls off the end without a terminator (shouldn't happen — `check.rs` enforces every-path-returns), we emit `unreachable`.
+
+### Conditions and value contexts
+
+Conditions are i1; values are i64. Helpers:
+
+- **`lower(e)` (value context)**: produces an i64 operand. For `Cmp`/`CmpChain`/`Not`, internally lowers to i1 then `zext i1 → i64`.
+- **`lower_cond(e)` (condition context)**: produces an i1 operand. For `Cmp`/`CmpChain`/`Not`, lowers directly to i1 (skipping the zext). For everything else, lowers to i64 then emits `icmp ne i64 %v, 0`.
+
+The extra zext/cmp pair on the value-context side is trivially eliminated by LLVM.
+
+### Comparison codegen
+
+| `CmpOp` | LLVM `icmp` predicate |
+|---|---|
+| `Lt` | `slt` |
+| `Le` | `sle` |
+| `Gt` | `sgt` |
+| `Ge` | `sge` |
+| `Eq` | `eq` |
+| `Ne` | `ne` |
+
+`Cmp { op, lhs, rhs }`:
+```llvm
+%v = icmp <pred> i64 %lhs, %rhs
+```
+
+`CmpChain { first, rest }` (Python's `a < b < c < d`): emit each pairwise comparison and `and` the i1 results.
+```llvm
+%c1 = icmp <op0> i64 %first, %r0
+%c2 = icmp <op1> i64 %r0, %r1
+%c12 = and i1 %c1, %c2
+…
+```
+Operands are pure in v0.5 (no calls, no side effects), so duplicate evaluation across `prev`/`next` boundaries is harmless. LLVM CSEs identical loads.
+
+`Not(inner)`:
+- Inner is i1 (`Cmp`, etc.) → `xor i1 %inner, true`.
+- Inner is i64 → lower as condition (i.e. `icmp ne 0`) then `xor i1, true`.
+
+Both end up as i1; the value-context wrapper zexts to i64 if needed.
 
 ## Pipeline driven by codegen
 

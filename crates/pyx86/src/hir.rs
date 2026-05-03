@@ -1,4 +1,4 @@
-//! High-level IR. Grows slice by slice; v0.4 adds locals + multi-stmt bodies.
+//! High-level IR. Grows slice by slice; v0.5 adds control flow + comparisons.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Type {
@@ -8,23 +8,20 @@ pub enum Type {
 #[derive(Debug, Clone)]
 pub struct Param {
     pub name: String,
-    /// Always Type::I64 in v0.4. Carried so codegen can dispatch on
-    /// it once other types land.
+    /// Always Type::I64 in v0.5.
     #[allow(dead_code)]
     pub ty: Type,
 }
 
 #[derive(Debug, Clone)]
 pub struct Function {
-    /// Always "main" in v0.4. Carried so error messages and later
-    /// slices that add user-defined functions don't need to refactor.
+    /// Always "main" in v0.5.
     #[allow(dead_code)]
     pub name: String,
     pub params: Vec<Param>,
-    /// Always Type::I64 in v0.4.
+    /// Always Type::I64 in v0.5.
     #[allow(dead_code)]
     pub return_ty: Type,
-    /// Sequence of statements ending with exactly one `Return`.
     pub body: Vec<Stmt>,
 }
 
@@ -35,16 +32,25 @@ pub struct Program {
 
 #[derive(Debug, Clone)]
 pub enum Stmt {
-    /// `name = <expr>` (annotation, if present, was already validated to be `int`)
-    Let { name: String, value: Expr },
-    /// `return <expr>` — must be the last statement in the body.
-    Return { value: Expr },
+    Let {
+        name: String,
+        value: Expr,
+    },
+    Return {
+        value: Expr,
+    },
+    If {
+        cond: Expr,
+        then_body: Vec<Stmt>,
+        /// Empty Vec when there is no `else` clause.
+        else_body: Vec<Stmt>,
+    },
 }
 
 #[derive(Debug, Clone)]
 pub enum Expr {
     ConstI64(i64),
-    /// Reference to any name in scope — parameter or local.
+    /// Reference to a parameter or previously assigned local.
     Var(String),
     BinOp {
         op: BinOp,
@@ -55,6 +61,25 @@ pub enum Expr {
         op: UnaryOp,
         operand: Box<Expr>,
     },
+    /// A single comparison: `a <op> b` → produces i64 0 or 1 (zext of the i1).
+    Cmp {
+        op: CmpOp,
+        lhs: Box<Expr>,
+        rhs: Box<Expr>,
+    },
+    /// Python-style chained comparison `a < b < c < d`. The vector
+    /// holds the operators and the right-hand operand of each pair;
+    /// `first` is the leftmost operand. All sub-expressions are
+    /// pure (no calls, no side effects in v0.5), so codegen lowers
+    /// each operand once per appearance and AND's the i1 results.
+    CmpChain {
+        first: Box<Expr>,
+        rest: Vec<(CmpOp, Expr)>,
+    },
+    /// Logical `not`. Codegen treats inner as truthy-if-nonzero (for
+    /// i64 operands) or as a direct i1 for nested Cmp/Not. Always
+    /// produces i64 0 or 1.
+    Not(Box<Expr>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,4 +95,14 @@ pub enum BinOp {
 pub enum UnaryOp {
     Neg,
     Pos,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CmpOp {
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    Eq,
+    Ne,
 }

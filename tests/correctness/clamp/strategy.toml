@@ -1,0 +1,4 @@
+# Range straddles 0 and 100 so all three branches get exercised.
+[[arg]]
+type = "i64"
+range = [-200, 300]

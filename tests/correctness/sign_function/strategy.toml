@@ -1,0 +1,4 @@
+# Skewed range so we sometimes get exactly 0 to exercise the elif/else path.
+[[arg]]
+type = "i64"
+range = [-5, 5]

@@ -17,21 +17,20 @@ In later slices this module evolves into a full type-inference pass and is renam
 
 ```text
 def main(<param>: int, …) -> int:
-    <name> [: int] = <expr>          # zero or more
-    …
-    return <expr>                    # required, must be last stmt
+    <stmt>*                          # any mix of:
+                                     #   <name> [: int] = <expr>
+                                     #   if <cond>: <body> [elif …]* [else: <body>]
+                                     #   pass
+                                     #   return <expr>
 ```
 
-with up to 16 typed `int` parameters, and `<expr>` built from:
-- integer literals (must fit i64)
-- variable references (parameters or previously assigned locals)
-- binary operators `+ - * // %`
-- unary operators `+x`, `-x`
-- parentheses (transparent in the AST)
+with up to 16 typed `int` parameters and a body that **provably ends with a return on every path** (conservative: the last statement is either `Return` or an `If` whose two branches both recursively end with `Return`).
 
-Reassignment is allowed (`x = 1; x = x + 1`); the in-scope set is monotonically grown as we walk the body.
+Expressions: integer literals, bool literals (lowered to `0`/`1`), variable references, `+ - * // %`, unary `+ -`, `not`, comparisons `< <= > >= == !=` (chained allowed: `a < b < c` works as in CPython).
 
-Anything else — different function name, untyped/non-int parameters, default args, decorators, missing/wrong return annotation, multiple top-level definitions, augmented assignment (`x += 1`), tuple unpacking, chained assignment (`a = b = 1`), early `return`, statements after `return`, control flow (`if`/`while`/`for`), exceptions, division by `/`, exponentiation, bitwise, calls, comprehensions, etc. — produces `unsupported_feature: <reason>`. Use of an unbound name produces an "not in scope" error.
+Conditions in `if` accept any int expression (truthy via implicit `!= 0`) or a comparison/`not` directly.
+
+Anything else — different function name, untyped/non-int parameters, default args, decorators, multiple top-level definitions, augmented assignment (`x += 1`), tuple unpacking, chained assignment (`a = b = 1`), `while`/`for` loops, `and`/`or`, `is`/`in`, exceptions, division by `/`, exponentiation, bitwise, calls, comprehensions, etc. — produces `unsupported_feature: <reason>`. Use of an unbound name produces a "not in scope" error.
 
 ## Why not infer types here
 

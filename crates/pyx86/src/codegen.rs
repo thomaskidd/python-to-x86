@@ -1,29 +1,23 @@
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fmt::Write as _;
 
-use crate::hir::{BinOp, Expr, Function, Program, Stmt, UnaryOp};
+use crate::hir::{BinOp, CmpOp, Expr, Function, Program, Stmt, UnaryOp};
 
-/// Emit LLVM IR text for a v0.4 HIR program.
+/// Emit LLVM IR text for a v0.5 HIR program (`if`/`elif`/`else`,
+/// comparisons, early `return`, `not`, truthy int conditions).
 ///
-/// Function body is now a sequence of statements. Locals are pure
-/// SSA values (no `alloca`/`load`/`store`) — fine because v0.4 has
-/// no control flow. Reassignment overwrites the entry in the
-/// variable map, producing a fresh SSA name each time.
+/// Locals (and parameters, for uniformity) are allocated as i64
+/// stack slots in the function entry block. Reads emit `load`,
+/// writes emit `store`. LLVM's `mem2reg` (active at -O1+) collapses
+/// these back to SSA + phi.
 ///
-/// When v0.5 adds branching, locals will switch to `alloca`+
-/// `load`/`store` and let LLVM's `mem2reg` collapse them back to
-/// SSA at -O1+.
+/// Typed pointers (`i8*`, `i64*`) so this works on LLVM 10+.
 pub fn emit_ll(prog: &Program, source_basename: &str) -> String {
     let basename = sanitize_module_id(source_basename);
     let func = &prog.main;
 
     let mut cg = Codegen::new();
-    // Seed the variable map with parameters so `Var(name)` lowering
-    // can find them.
-    for p in &func.params {
-        cg.vars.insert(p.name.clone(), format!("%p_{}", p.name));
-    }
-    cg.lower_body(&func.body);
+    cg.lower_function(func);
     let body = cg.body;
 
     let signature = format_signature(func);
@@ -45,7 +39,6 @@ declare i64 @atoll(i8*)
 @.fmt_i64 = private unnamed_addr constant [5 x i8] c\"%ld\\0A\\00\"
 
 define i64 @py_main({sig}) {{
-entry:
 {body}}}
 
 define i32 @main(i32 %argc, i8** %argv) {{
@@ -96,10 +89,11 @@ fn format_argv_parsing(func: &Function) -> String {
 struct Codegen {
     body: String,
     next_id: usize,
-    /// Maps HIR variable name → LLVM operand currently holding its value.
-    /// Reassignment overwrites the entry; the old SSA name becomes
-    /// dead code (LLVM DCE removes it).
-    vars: HashMap<String, String>,
+    next_block_id: usize,
+    /// Whether the current basic block has been terminated (by `ret`
+    /// or `br`). When true, no further instructions are emitted into
+    /// the current block until a new label is opened.
+    block_terminated: bool,
 }
 
 impl Codegen {
@@ -107,7 +101,8 @@ impl Codegen {
         Self {
             body: String::new(),
             next_id: 0,
-            vars: HashMap::new(),
+            next_block_id: 0,
+            block_terminated: false,
         }
     }
 
@@ -118,32 +113,118 @@ impl Codegen {
     }
 
     fn emit(&mut self, line: &str) {
+        if self.block_terminated {
+            return;
+        }
         let _ = writeln!(self.body, "  {}", line);
     }
 
-    fn lower_body(&mut self, stmts: &[Stmt]) {
+    fn open_block(&mut self, label: &str) {
+        let _ = writeln!(self.body, "{}:", label);
+        self.block_terminated = false;
+    }
+
+    fn lower_function(&mut self, func: &Function) {
+        self.open_block("entry");
+
+        // Allocate slots for params + locals. A param and local can
+        // share a name (Python scope rules); we dedupe by name so we
+        // only emit one alloca per slot.
+        let local_names = collect_locals(&func.body);
+        let mut emitted: HashSet<String> = HashSet::new();
+        for p in &func.params {
+            self.emit(&format!("%{}.addr = alloca i64", p.name));
+            self.emit(&format!("store i64 %p_{name}, i64* %{name}.addr", name = p.name));
+            emitted.insert(p.name.clone());
+        }
+        for name in &local_names {
+            if emitted.insert(name.clone()) {
+                self.emit(&format!("%{}.addr = alloca i64", name));
+            }
+        }
+
+        self.lower_block(&func.body);
+
+        // If the user's body falls through without a terminator
+        // (shouldn't happen — the check pass enforces every path
+        // returns — but be defensive), emit `unreachable`.
+        if !self.block_terminated {
+            self.emit("unreachable");
+            self.block_terminated = true;
+        }
+    }
+
+    fn lower_block(&mut self, stmts: &[Stmt]) {
         for stmt in stmts {
+            if self.block_terminated {
+                // Unreachable code follows a `return` or `br`. Skip.
+                break;
+            }
             match stmt {
                 Stmt::Let { name, value } => {
-                    let operand = self.lower(value);
-                    self.vars.insert(name.clone(), operand);
+                    let op = self.lower(value);
+                    self.emit(&format!("store i64 {}, i64* %{}.addr", op, name));
                 }
                 Stmt::Return { value } => {
-                    let operand = self.lower(value);
-                    self.emit(&format!("ret i64 {}", operand));
+                    let op = self.lower(value);
+                    self.emit(&format!("ret i64 {}", op));
+                    self.block_terminated = true;
+                }
+                Stmt::If { cond, then_body, else_body } => {
+                    let cond_i1 = self.lower_cond(cond);
+                    // Single id per `if` statement so labels read as
+                    // then.0/else.0/merge.0, then.1/else.1/merge.1, …
+                    let id = self.next_block_id;
+                    self.next_block_id += 1;
+                    let then_lbl = format!("then.{}", id);
+                    let else_lbl = format!("else.{}", id);
+                    let merge_lbl = format!("merge.{}", id);
+
+                    self.emit(&format!(
+                        "br i1 {}, label %{}, label %{}",
+                        cond_i1, then_lbl, else_lbl
+                    ));
+                    self.block_terminated = true;
+
+                    // then-block
+                    self.open_block(&then_lbl);
+                    self.lower_block(then_body);
+                    if !self.block_terminated {
+                        self.emit(&format!("br label %{}", merge_lbl));
+                        self.block_terminated = true;
+                    }
+
+                    // else-block (empty Vec when no else clause)
+                    self.open_block(&else_lbl);
+                    self.lower_block(else_body);
+                    if !self.block_terminated {
+                        self.emit(&format!("br label %{}", merge_lbl));
+                        self.block_terminated = true;
+                    }
+
+                    // merge-block: where post-if statements continue.
+                    // If both branches terminated (e.g. both returned),
+                    // the merge block is dead — but LLVM tolerates it,
+                    // and any subsequent stmt in the surrounding block
+                    // emits cleanly into it. If no further statements
+                    // follow, lower_function emits `unreachable` here.
+                    self.open_block(&merge_lbl);
                 }
             }
         }
     }
 
+    /// Lower an expression in a value (i64) context. Comparison /
+    /// not results are zext'd to i64 so they can be stored in i64
+    /// slots and returned uniformly.
     fn lower(&mut self, e: &Expr) -> String {
         match e {
             Expr::ConstI64(v) => v.to_string(),
-            Expr::Var(name) => self
-                .vars
-                .get(name)
-                .cloned()
-                .unwrap_or_else(|| panic!("internal: var `{}` not in codegen scope (check should have caught this)", name)),
+            Expr::Var(name) => {
+                let dst = self.fresh();
+                self.emit(&format!("{} = load i64, i64* %{}.addr", dst, name));
+                dst
+            }
             Expr::UnaryOp { op, operand } => {
                 let inner = self.lower(operand);
                 match op {
@@ -166,6 +247,75 @@ impl Codegen {
                     BinOp::Mod => self.floor_mod(&l, &r),
                 }
             }
+            Expr::Cmp { .. } | Expr::CmpChain { .. } | Expr::Not(_) => {
+                let i1 = self.lower_i1(e);
+                let dst = self.fresh();
+                self.emit(&format!("{} = zext i1 {} to i64", dst, i1));
+                dst
+            }
+        }
+    }
+
+    /// Lower an expression in a condition (i1) context. Comparisons /
+    /// not return i1 directly; everything else gets a `!= 0` coercion.
+    fn lower_cond(&mut self, e: &Expr) -> String {
+        match e {
+            Expr::Cmp { .. } | Expr::CmpChain { .. } | Expr::Not(_) => self.lower_i1(e),
+            _ => {
+                let v = self.lower(e);
+                let dst = self.fresh();
+                self.emit(&format!("{} = icmp ne i64 {}, 0", dst, v));
+                dst
+            }
+        }
+    }
+
+    /// Direct i1 lowering for Cmp / CmpChain / Not. Caller must know
+    /// the expression yields i1.
+    fn lower_i1(&mut self, e: &Expr) -> String {
+        match e {
+            Expr::Cmp { op, lhs, rhs } => {
+                let l = self.lower(lhs);
+                let r = self.lower(rhs);
+                let dst = self.fresh();
+                self.emit(&format!("{} = icmp {} i64 {}, {}", dst, llvm_icmp_op(*op), l, r));
+                dst
+            }
+            Expr::CmpChain { first, rest } => {
+                // Lower each operand once per comparison. Side-effect
+                // free in v0.5 so duplicate evaluation is harmless;
+                // LLVM CSEs identical loads.
+                let mut prev = self.lower(first);
+                let mut acc: Option<String> = None;
+                for (op, e) in rest {
+                    let next = self.lower(e);
+                    let cmp = self.fresh();
+                    self.emit(&format!(
+                        "{} = icmp {} i64 {}, {}",
+                        cmp,
+                        llvm_icmp_op(*op),
+                        prev,
+                        next
+                    ));
+                    acc = match acc {
+                        None => Some(cmp),
+                        Some(a) => {
+                            let combined = self.fresh();
+                            self.emit(&format!("{} = and i1 {}, {}", combined, a, cmp));
+                            Some(combined)
+                        }
+                    };
+                    prev = next;
+                }
+                acc.expect("CmpChain.rest must be non-empty")
+            }
+            Expr::Not(inner) => {
+                let i1 = self.lower_cond(inner);
+                let dst = self.fresh();
+                self.emit(&format!("{} = xor i1 {}, true", dst, i1));
+                dst
+            }
+            _ => unreachable!("lower_i1 called on a non-bool-producing expression"),
         }
     }
 
@@ -216,6 +366,40 @@ impl Codegen {
     }
 }
 
+fn llvm_icmp_op(op: CmpOp) -> &'static str {
+    match op {
+        CmpOp::Lt => "slt",
+        CmpOp::Le => "sle",
+        CmpOp::Gt => "sgt",
+        CmpOp::Ge => "sge",
+        CmpOp::Eq => "eq",
+        CmpOp::Ne => "ne",
+    }
+}
+
+fn collect_locals(body: &[Stmt]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    fn walk(stmts: &[Stmt], out: &mut Vec<String>, seen: &mut HashSet<String>) {
+        for s in stmts {
+            match s {
+                Stmt::Let { name, .. } => {
+                    if seen.insert(name.clone()) {
+                        out.push(name.clone());
+                    }
+                }
+                Stmt::Return { .. } => {}
+                Stmt::If { then_body, else_body, .. } => {
+                    walk(then_body, out, seen);
+                    walk(else_body, out, seen);
+                }
+            }
+        }
+    }
+    walk(body, &mut out, &mut seen);
+    out
+}
+
 fn sanitize_module_id(s: &str) -> String {
     s.chars()
         .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
@@ -225,7 +409,7 @@ fn sanitize_module_id(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hir::{BinOp, Expr, Function, Param, Program, Stmt, Type};
+    use crate::hir::{BinOp, CmpOp, Expr, Function, Param, Program, Stmt, Type};
 
     fn make_program(params: Vec<&str>, body: Vec<Stmt>) -> Program {
         Program {
@@ -242,95 +426,135 @@ mod tests {
     }
 
     #[test]
-    fn no_locals_emits_a_simple_return() {
-        let ll = emit_ll(
-            &make_program(vec![], vec![Stmt::Return { value: Expr::ConstI64(42) }]),
-            "test",
-        );
-        assert!(ll.contains("ret i64 42"));
-    }
-
-    #[test]
-    fn local_binds_then_returns() {
+    fn allocates_param_and_local_slots() {
         let ll = emit_ll(
             &make_program(
                 vec!["a"],
                 vec![
-                    Stmt::Let {
-                        name: "x".into(),
-                        value: Expr::BinOp {
-                            op: BinOp::Add,
-                            lhs: Box::new(Expr::Var("a".into())),
-                            rhs: Box::new(Expr::ConstI64(1)),
-                        },
-                    },
+                    Stmt::Let { name: "x".into(), value: Expr::ConstI64(0) },
                     Stmt::Return { value: Expr::Var("x".into()) },
                 ],
             ),
             "test",
         );
-        // The Let statement should produce an `add i64 %p_a, 1` and
-        // the Return should `ret i64` of that SSA value (%v0).
-        assert!(ll.contains("%v0 = add i64 %p_a, 1"));
-        assert!(ll.contains("ret i64 %v0"));
+        assert!(ll.contains("%a.addr = alloca i64"));
+        assert!(ll.contains("store i64 %p_a, i64* %a.addr"));
+        assert!(ll.contains("%x.addr = alloca i64"));
+        assert!(ll.contains("store i64 0, i64* %x.addr"));
+        assert!(ll.contains("load i64, i64* %x.addr"));
     }
 
     #[test]
-    fn reassignment_overwrites_var_map() {
+    fn if_else_emits_branch_and_two_blocks() {
         let ll = emit_ll(
             &make_program(
                 vec!["a"],
-                vec![
-                    Stmt::Let { name: "x".into(), value: Expr::Var("a".into()) },
-                    Stmt::Let {
-                        name: "x".into(),
-                        value: Expr::BinOp {
-                            op: BinOp::Add,
-                            lhs: Box::new(Expr::Var("x".into())),
-                            rhs: Box::new(Expr::ConstI64(1)),
-                        },
+                vec![Stmt::If {
+                    cond: Expr::Cmp {
+                        op: CmpOp::Lt,
+                        lhs: Box::new(Expr::Var("a".into())),
+                        rhs: Box::new(Expr::ConstI64(0)),
                     },
-                    Stmt::Return { value: Expr::Var("x".into()) },
-                ],
+                    then_body: vec![Stmt::Return {
+                        value: Expr::UnaryOp {
+                            op: crate::hir::UnaryOp::Neg,
+                            operand: Box::new(Expr::Var("a".into())),
+                        },
+                    }],
+                    else_body: vec![Stmt::Return { value: Expr::Var("a".into()) }],
+                }],
             ),
             "test",
         );
-        // First Let: x = a, no instruction emitted (Var lookup just maps x → %p_a).
-        // Second Let: x = x + 1 → emits `%v0 = add i64 %p_a, 1`, then x → %v0.
-        // Return: ret i64 %v0.
-        assert!(ll.contains("%v0 = add i64 %p_a, 1"));
-        assert!(ll.contains("ret i64 %v0"));
+        assert!(ll.contains("icmp slt i64"));
+        assert!(ll.contains("br i1"));
+        assert!(ll.contains("then.0:"));
+        assert!(ll.contains("else.0:"));
+        assert!(ll.contains("merge.0:"));
     }
 
     #[test]
-    fn chain_of_locals_uses_each_predecessor() {
+    fn truthy_int_condition_inserts_icmp_ne_zero() {
         let ll = emit_ll(
             &make_program(
                 vec!["a"],
-                vec![
-                    Stmt::Let {
-                        name: "x".into(),
-                        value: Expr::BinOp {
-                            op: BinOp::Add,
-                            lhs: Box::new(Expr::Var("a".into())),
-                            rhs: Box::new(Expr::ConstI64(1)),
-                        },
-                    },
-                    Stmt::Let {
-                        name: "y".into(),
-                        value: Expr::BinOp {
-                            op: BinOp::Mul,
-                            lhs: Box::new(Expr::Var("x".into())),
-                            rhs: Box::new(Expr::ConstI64(2)),
-                        },
-                    },
-                    Stmt::Return { value: Expr::Var("y".into()) },
-                ],
+                vec![Stmt::If {
+                    cond: Expr::Var("a".into()),
+                    then_body: vec![Stmt::Return { value: Expr::ConstI64(1) }],
+                    else_body: vec![Stmt::Return { value: Expr::ConstI64(0) }],
+                }],
             ),
             "test",
         );
-        assert!(ll.contains("%v0 = add i64 %p_a, 1"));
-        assert!(ll.contains("%v1 = mul i64 %v0, 2"));
-        assert!(ll.contains("ret i64 %v1"));
+        assert!(ll.contains("icmp ne i64"));
+    }
+
+    #[test]
+    fn cmp_chain_ands_pairwise_results() {
+        let ll = emit_ll(
+            &make_program(
+                vec!["a"],
+                vec![Stmt::If {
+                    cond: Expr::CmpChain {
+                        first: Box::new(Expr::ConstI64(0)),
+                        rest: vec![
+                            (CmpOp::Lt, Expr::Var("a".into())),
+                            (CmpOp::Lt, Expr::ConstI64(100)),
+                        ],
+                    },
+                    then_body: vec![Stmt::Return { value: Expr::ConstI64(1) }],
+                    else_body: vec![Stmt::Return { value: Expr::ConstI64(0) }],
+                }],
+            ),
+            "test",
+        );
+        // Two icmp slt + one and i1.
+        let icmps = ll.matches("icmp slt").count();
+        assert!(icmps >= 2, "expected ≥2 icmp slt, got: \n{}", ll);
+        assert!(ll.contains("and i1"));
+    }
+
+    #[test]
+    fn not_int_emits_eq_zero() {
+        let ll = emit_ll(
+            &make_program(
+                vec!["a"],
+                vec![Stmt::If {
+                    cond: Expr::Not(Box::new(Expr::Var("a".into()))),
+                    then_body: vec![Stmt::Return { value: Expr::ConstI64(1) }],
+                    else_body: vec![Stmt::Return { value: Expr::ConstI64(0) }],
+                }],
+            ),
+            "test",
+        );
+        // `not a` (i64) lowers to icmp eq i64 a, 0 ... wait actually
+        // we lower as `cond = icmp ne 0; not(cond) = xor cond, true`.
+        // Either form works; the bench is the source of truth.
+        assert!(ll.contains("icmp ne i64") || ll.contains("icmp eq i64"));
+        assert!(ll.contains("xor i1") || ll.contains("icmp eq i64"));
+    }
+
+    #[test]
+    fn early_return_in_then_skips_merge_emission() {
+        // If both branches return, the merge block is emitted but
+        // contains only the implicit `unreachable` from the function
+        // wrapper.
+        let ll = emit_ll(
+            &make_program(
+                vec!["a"],
+                vec![Stmt::If {
+                    cond: Expr::Cmp {
+                        op: CmpOp::Lt,
+                        lhs: Box::new(Expr::Var("a".into())),
+                        rhs: Box::new(Expr::ConstI64(0)),
+                    },
+                    then_body: vec![Stmt::Return { value: Expr::ConstI64(-1) }],
+                    else_body: vec![Stmt::Return { value: Expr::ConstI64(1) }],
+                }],
+            ),
+            "test",
+        );
+        assert!(ll.contains("merge.0:"));
+        assert!(ll.contains("unreachable"));
     }
 }
