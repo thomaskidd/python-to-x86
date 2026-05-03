@@ -1,0 +1,9 @@
+# Stay positive so the diff is meaningful (Python's ~ matches LLVM xor -1
+# for any int, but combined arithmetic with `* 1000` could overflow if
+# we used full i64 range).
+[[arg]]
+type = "i64"
+range = [0, 1_000_000]
+[[arg]]
+type = "i64"
+range = [0, 1_000_000]

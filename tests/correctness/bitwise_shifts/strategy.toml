@@ -1,0 +1,9 @@
+# `a` bounded so `a << n` stays in i64 range for n up to 31.
+# Python wouldn't overflow but pyx86 wraps, and the differential
+# would fail for shifts that overflow.
+[[arg]]
+type = "i64"
+range = [-2_000_000_000, 2_000_000_000]
+[[arg]]
+type = "i64"
+range = [0, 31]

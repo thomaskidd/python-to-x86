@@ -292,6 +292,12 @@ impl Codegen {
                         self.emit(&format!("{} = sub i64 0, {}", dst, inner));
                         dst
                     }
+                    UnaryOp::BitNot => {
+                        // Python `~x` == `-x - 1` == `xor x, -1`.
+                        let dst = self.fresh();
+                        self.emit(&format!("{} = xor i64 {}, -1", dst, inner));
+                        dst
+                    }
                 }
             }
             Expr::BinOp { op, lhs, rhs } => {
@@ -303,6 +309,15 @@ impl Codegen {
                     BinOp::Mul => self.simple_binop("mul", &l, &r),
                     BinOp::FloorDiv => self.floor_div(&l, &r),
                     BinOp::Mod => self.floor_mod(&l, &r),
+                    BinOp::BitAnd => self.simple_binop("and", &l, &r),
+                    BinOp::BitOr => self.simple_binop("or", &l, &r),
+                    BinOp::BitXor => self.simple_binop("xor", &l, &r),
+                    // Python's `>>` is arithmetic (sign-extending) for ints; LLVM `ashr`.
+                    // Python's `<<` is `shl`. Note that Python raises ValueError on
+                    // negative or oversized shift counts; LLVM is undefined-behaviour
+                    // for shift count >= bit width. Test programs stay within [0, 63].
+                    BinOp::Shl => self.simple_binop("shl", &l, &r),
+                    BinOp::Shr => self.simple_binop("ashr", &l, &r),
                 }
             }
             Expr::Cmp { .. } | Expr::CmpChain { .. } | Expr::Not(_) => {
