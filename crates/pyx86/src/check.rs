@@ -14,6 +14,11 @@ const MAX_PARAMS: usize = 16;
 #[derive(Debug)]
 struct FunctionSig {
     params: Vec<Param>,
+    /// Defaults aligned with `params`. `None` for required params,
+    /// `Some(<literal expr>)` for params with default values. Python
+    /// requires all defaulted params to come after all required ones;
+    /// we enforce that.
+    defaults: Vec<Option<Expr>>,
     return_ty: Type,
 }
 
@@ -74,12 +79,6 @@ fn collect_signature(func: &ast::StmtFunctionDef) -> Result<FunctionSig> {
             func.name
         );
     }
-    if func.args.defaults().next().is_some() {
-        bail!(
-            "unsupported_feature: default arguments are not supported (in `{}`)",
-            func.name
-        );
-    }
     if !func.decorator_list.is_empty() {
         bail!(
             "unsupported_feature: decorators are not supported (in `{}`)",
@@ -124,7 +123,63 @@ fn collect_signature(func: &ast::StmtFunctionDef) -> Result<FunctionSig> {
         ),
     };
 
-    Ok(FunctionSig { params, return_ty })
+    // Defaults: rustpython-ast's Arguments.defaults are listed in the
+    // same order as the parameters they belong to, applied to the
+    // *trailing* parameters. So for `def f(a, b, c=3, d=4)`, defaults
+    // = [3, 4] and they apply to params[2] and params[3].
+    let raw_defaults: Vec<&ast::Expr> = func.args.defaults().collect();
+    let n = params.len();
+    let n_defaulted = raw_defaults.len();
+    if n_defaulted > n {
+        // Should be impossible for valid Python.
+        bail!(
+            "internal: more defaults than parameters in `{}`",
+            func.name
+        );
+    }
+    let n_required = n - n_defaulted;
+    let mut defaults: Vec<Option<Expr>> = vec![None; n];
+    for (i, raw) in raw_defaults.iter().enumerate() {
+        let param_idx = n_required + i;
+        defaults[param_idx] = Some(lower_default(raw).map_err(|e| {
+            anyhow!(
+                "unsupported_feature: default for parameter `{}` (in `{}`): {}",
+                params[param_idx].name,
+                func.name,
+                e
+            )
+        })?);
+    }
+
+    Ok(FunctionSig { params, defaults, return_ty })
+}
+
+/// Defaults are evaluated at function-definition time in Python. We
+/// only allow constants (int / bool literals, optionally negated) so
+/// there's no need for a "definition-time scope" — the expression is
+/// fully reduced at compile time and inlined at the call site.
+fn lower_default(e: &ast::Expr) -> Result<Expr> {
+    match e {
+        ast::Expr::Constant(c) => match &c.value {
+            ast::Constant::Int(big) => {
+                let v: i64 = big.try_into().map_err(|_| {
+                    anyhow!("integer literal does not fit in i64")
+                })?;
+                Ok(Expr::ConstI64(v))
+            }
+            ast::Constant::Bool(b) => Ok(Expr::ConstI64(if *b { 1 } else { 0 })),
+            _ => bail!("only integer literals are allowed as defaults"),
+        },
+        ast::Expr::UnaryOp(u) if matches!(u.op, ast::UnaryOp::USub | ast::UnaryOp::UAdd) => {
+            let inner = lower_default(&u.operand)?;
+            match (u.op, inner) {
+                (ast::UnaryOp::USub, Expr::ConstI64(v)) => Ok(Expr::ConstI64(-v)),
+                (ast::UnaryOp::UAdd, Expr::ConstI64(v)) => Ok(Expr::ConstI64(v)),
+                _ => bail!("only integer literals are allowed as defaults"),
+            }
+        }
+        _ => bail!("only integer literals are allowed as defaults"),
+    }
 }
 
 fn lower_function(func: &ast::StmtFunctionDef, signatures: &SignatureTable) -> Result<Function> {
@@ -460,42 +515,95 @@ fn lower_expr(e: &ast::Expr, scope: &HashSet<String>, signatures: &SignatureTabl
         ast::Expr::Call(c) => {
             // Resolve callee. Only plain name calls (`foo(a, b)`)
             // supported — no method calls, no `obj.method()`, no
-            // higher-order calls. Keyword args / star-args rejected.
+            // higher-order calls.
             let callee = match c.func.as_ref() {
                 ast::Expr::Name(n) => n.id.as_str().to_string(),
                 _ => bail!(
                     "unsupported_feature: only direct calls to top-level functions are supported (no method / attribute / higher-order calls yet)"
                 ),
             };
-            if !c.keywords.is_empty() {
-                bail!("unsupported_feature: keyword arguments are not yet supported");
-            }
             let sig = signatures.get(&callee).ok_or_else(|| {
                 anyhow!(
                     "unsupported_feature: call to undefined function `{}`",
                     callee
                 )
             })?;
-            if c.args.len() != sig.params.len() {
-                bail!(
-                    "unsupported_feature: function `{}` takes {} positional arguments but {} were supplied",
-                    callee,
-                    sig.params.len(),
-                    c.args.len()
-                );
-            }
-            let args: Result<Vec<Expr>> = c
-                .args
-                .iter()
-                .map(|a| lower_expr(a, scope, signatures))
-                .collect();
-            Ok(Expr::Call { callee, args: args? })
+            let args = resolve_call_args(&callee, sig, &c.args, &c.keywords, scope, signatures)?;
+            Ok(Expr::Call { callee, args })
         }
         other => bail!(
             "unsupported_feature: expression form `{}` is not supported",
             expr_kind_name(other)
         ),
     }
+}
+
+/// Match positional + keyword call args to the callee's parameters,
+/// filling in defaults for any unmatched. Errors on duplicates,
+/// unknown keywords, missing required args, or `**kwargs` unpacking.
+fn resolve_call_args(
+    callee: &str,
+    sig: &FunctionSig,
+    pos_args: &[ast::Expr],
+    kw_args: &[ast::Keyword],
+    scope: &HashSet<String>,
+    signatures: &SignatureTable,
+) -> Result<Vec<Expr>> {
+    let n = sig.params.len();
+    if pos_args.len() > n {
+        bail!(
+            "unsupported_feature: function `{}` takes {} positional arguments but {} were supplied",
+            callee,
+            n,
+            pos_args.len()
+        );
+    }
+    let mut filled: Vec<Option<Expr>> = vec![None; n];
+    for (i, a) in pos_args.iter().enumerate() {
+        filled[i] = Some(lower_expr(a, scope, signatures)?);
+    }
+    for kw in kw_args {
+        let name = kw.arg.as_ref().ok_or_else(|| {
+            anyhow!(
+                "unsupported_feature: `**kwargs` unpacking at call site is not supported (in call to `{}`)",
+                callee
+            )
+        })?;
+        let idx = sig
+            .params
+            .iter()
+            .position(|p| p.name == name.as_str())
+            .ok_or_else(|| {
+                anyhow!(
+                    "unsupported_feature: function `{}` has no parameter named `{}`",
+                    callee,
+                    name
+                )
+            })?;
+        if filled[idx].is_some() {
+            bail!(
+                "unsupported_feature: multiple values for argument `{}` in call to `{}`",
+                name,
+                callee
+            );
+        }
+        filled[idx] = Some(lower_expr(&kw.value, scope, signatures)?);
+    }
+    let mut out = Vec::with_capacity(n);
+    for (i, slot) in filled.into_iter().enumerate() {
+        match slot {
+            Some(e) => out.push(e),
+            None => match &sig.defaults[i] {
+                Some(default) => out.push(default.clone()),
+                None => bail!(
+                    "unsupported_feature: missing required argument `{}` in call to `{}`",
+                    sig.params[i].name,
+                    callee
+                ),
+            },
+        }
+    }
+    Ok(out)
 }
 
 fn convert_cmp_op(op: &ast::CmpOp) -> Result<CmpOp> {
