@@ -4,17 +4,11 @@
 
 Take the validated program (eventually: typed HIR / SSA mid-IR) and emit LLVM IR as text. Drive the final assemble + link step by shelling out to `clang`.
 
-## Current scope (v0.5)
+## Current scope (v0.6)
 
-`main(<a>: int, ...)` (up to 16 typed-int params) has a body of statements (assignments, `if`/`elif`/`else`, `pass`, `return`) that provably returns on every path. Expressions compose:
-- `int` literals (i64-range)
-- Variable references (parameters or previously assigned locals)
-- Binary `+ - * // %`
-- Unary `+x`, `-x`, `not x`
-- Comparisons `< <= > >= == !=` (single and chained)
-- Parentheses
+`main(<a>: int, ...)` (up to 16 typed-int params) has a body of statements (assignments, `if`/`elif`/`else`, `while`, `break`, `continue`, `pass`, `return`) that provably returns on every path. Expressions are unchanged from v0.5.
 
-No `while`, no `and`/`or` yet — those are v0.6.
+No `and`/`or`, no `for`, no calls yet.
 
 ## v0.1 IR template (literal return)
 
@@ -191,6 +185,9 @@ A param and a local with the same name share the slot (we don't model Python's U
 | `Let { name, value }` | lower `value` → operand; `store i64 <op>, i64* %<name>.addr` |
 | `Return { value }` | lower `value` → operand; `ret i64 <op>`; mark current block terminated |
 | `If { cond, then, else }` | lower `cond` → i1; `br i1 <c>, label %then.N, label %else.N`; emit then-block + else-block + merge-block |
+| `While { cond, body }` | `br label %loop_header.N`; emit header (cond + br to body or exit), body (with loop targets pushed, back-edge to header), exit (continuation point) |
+| `Break` | `br label %<top-of-loop-stack break_target>` |
+| `Continue` | `br label %<top-of-loop-stack continue_target>` |
 
 `If` blocks use a single per-statement id `N` so labels read `then.0`, `else.0`, `merge.0`, `then.1`, … . When a branch's body terminates (returns), we skip the trailing `br label %merge.N`. If both branches terminate, the merge block is emitted but is dead — LLVM tolerates this and DCE removes it. If the function falls off the end without a terminator (shouldn't happen — `check.rs` enforces every-path-returns), we emit `unreachable`.
 
@@ -233,6 +230,29 @@ Operands are pure in v0.5 (no calls, no side effects), so duplicate evaluation a
 - Inner is i64 → lower as condition (i.e. `icmp ne 0`) then `xor i1, true`.
 
 Both end up as i1; the value-context wrapper zexts to i64 if needed.
+
+## v0.6 IR — while loops, break, continue
+
+For each `Stmt::While { cond, body }` with stmt id `N`:
+
+```llvm
+  br label %loop_header.N
+loop_header.N:
+  <cond lowered to i1 %c>
+  br i1 %c, label %loop_body.N, label %loop_exit.N
+loop_body.N:
+  <body lowered>
+  br label %loop_header.N        ; back-edge (omitted if body terminated)
+loop_exit.N:
+```
+
+Codegen maintains `Vec<(continue_target, break_target)>` as a stack. Entering a `While` pushes `(loop_header.N, loop_exit.N)`; exiting pops. `Stmt::Break` and `Stmt::Continue` always read the **top** of the stack — they jump to the innermost enclosing loop, matching Python semantics.
+
+`Break` / `Continue` mark the current block as terminated, so the back-edge `br` from the body bottom is suppressed when the body itself jumped out. Same pattern as the `Return`-in-`If` case.
+
+Loop labels share `next_block_id` with `if` labels: a `while` after an `if` may produce `loop_header.5` / `loop_body.5` / `loop_exit.5`. The id is unique per stmt, not per kind. This was a deliberate v0.5 choice and continues to read well.
+
+LLVM's loop optimizations (`loop-rotate`, `licm`, `indvars`, `loop-unroll`, …) all run at `-O2` and operate fine on this header-test-body shape — equivalent to what clang generates for C `while`.
 
 ## Pipeline driven by codegen
 

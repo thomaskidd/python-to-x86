@@ -1,0 +1,9 @@
+# Positive ints. Negative inputs would diverge from Python's `gcd(-7, 2) == 1`
+# because we'd do floor-mod and a stays negative through the loop.
+[[arg]]
+type = "i64"
+range = [1, 1_000_000]
+
+[[arg]]
+type = "i64"
+range = [1, 1_000_000]

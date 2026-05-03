@@ -1,0 +1,4 @@
+# Range fits within 1000^2 to keep result in [0, 999].
+[[arg]]
+type = "i64"
+range = [0, 999_999]

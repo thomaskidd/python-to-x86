@@ -85,7 +85,7 @@ pub fn lower(module: &Module) -> Result<Program> {
         bail!("unsupported_feature: function body is empty");
     }
 
-    let body = lower_block(&func.body, &mut scope)?;
+    let body = lower_block(&func.body, &mut scope, 0)?;
 
     if !block_always_returns(&body) {
         bail!(
@@ -108,6 +108,10 @@ pub fn lower(module: &Module) -> Result<Program> {
 /// - the block ends with an `If` whose then_body and else_body both
 ///   recursively cover, AND the else_body is non-empty.
 ///
+/// `While`, `Break`, `Continue`, `Let` are **not** covering — a while
+/// may execute zero iterations and break/continue jump rather than
+/// returning.
+///
 /// This rejects valid programs where coverage requires reasoning
 /// about expressions (e.g. `if True: return 1`) but never accepts
 /// invalid ones, which is the side we want to err on.
@@ -123,7 +127,11 @@ fn block_always_returns(body: &[Stmt]) -> bool {
     }
 }
 
-fn lower_block(stmts: &[ast::Stmt], scope: &mut HashSet<String>) -> Result<Vec<Stmt>> {
+fn lower_block(
+    stmts: &[ast::Stmt],
+    scope: &mut HashSet<String>,
+    loop_depth: usize,
+) -> Result<Vec<Stmt>> {
     let mut out = Vec::with_capacity(stmts.len());
     for stmt in stmts {
         match stmt {
@@ -176,18 +184,40 @@ fn lower_block(stmts: &[ast::Stmt], scope: &mut HashSet<String>) -> Result<Vec<S
                 // scope; locals introduced in a branch are accessible
                 // after the branch — though using them when the
                 // branch wasn't taken is a runtime UnboundLocalError
-                // in CPython. v0.5 uses alloca slots that hold the
+                // in CPython. We use alloca slots that hold the
                 // last-stored value or undef; we accept this as a
                 // pragmatic deviation.)
-                let then_body = lower_block(&if_stmt.body, scope)?;
-                let else_body = lower_block(&if_stmt.orelse, scope)?;
+                let then_body = lower_block(&if_stmt.body, scope, loop_depth)?;
+                let else_body = lower_block(&if_stmt.orelse, scope, loop_depth)?;
                 out.push(Stmt::If { cond, then_body, else_body });
+            }
+            ast::Stmt::While(w) => {
+                if !w.orelse.is_empty() {
+                    bail!(
+                        "unsupported_feature: `else` clause on `while` is not supported"
+                    );
+                }
+                let cond = lower_expr(&w.test, scope)?;
+                let body = lower_block(&w.body, scope, loop_depth + 1)?;
+                out.push(Stmt::While { cond, body });
+            }
+            ast::Stmt::Break(_) => {
+                if loop_depth == 0 {
+                    bail!("unsupported_feature: `break` outside of a loop");
+                }
+                out.push(Stmt::Break);
+            }
+            ast::Stmt::Continue(_) => {
+                if loop_depth == 0 {
+                    bail!("unsupported_feature: `continue` outside of a loop");
+                }
+                out.push(Stmt::Continue);
             }
             ast::Stmt::Pass(_) => {
                 // pass is a no-op; lower it as nothing.
             }
             other => bail!(
-                "unsupported_feature: statement `{}` is not supported in v0.5",
+                "unsupported_feature: statement `{}` is not supported in v0.6",
                 stmt_kind_name(other)
             ),
         }
@@ -520,5 +550,68 @@ mod tests {
             "def main(a: int) -> int:\n    if a > 0:\n        pass\n    return a\n",
         ))
         .unwrap();
+    }
+
+    #[test]
+    fn lowers_while_loop() {
+        let p = lower(&parse(
+            "def main(n: int) -> int:\n    i = 0\n    while i < n:\n        i = i + 1\n    return i\n",
+        ))
+        .unwrap();
+        // body[0] = Let i, body[1] = While, body[2] = Return.
+        assert!(matches!(p.main.body[1], Stmt::While { .. }));
+    }
+
+    #[test]
+    fn lowers_break_and_continue_in_loop() {
+        let p = lower(&parse(
+            "def main(n: int) -> int:\n    i = 0\n    while i < n:\n        if i == 5:\n            break\n        if i == 3:\n            i = i + 1\n            continue\n        i = i + 1\n    return i\n",
+        ))
+        .unwrap();
+        match &p.main.body[1] {
+            Stmt::While { body, .. } => {
+                // First inner If has Break in its then_body.
+                match &body[0] {
+                    Stmt::If { then_body, .. } => {
+                        assert!(matches!(then_body[0], Stmt::Break));
+                    }
+                    _ => panic!("expected If at start of while body"),
+                }
+            }
+            _ => panic!("expected While"),
+        }
+    }
+
+    #[test]
+    fn rejects_break_outside_loop() {
+        let m = parse("def main() -> int:\n    break\n    return 0\n");
+        let err = lower(&m).unwrap_err();
+        assert!(format!("{}", err).contains("`break` outside"));
+    }
+
+    #[test]
+    fn rejects_continue_outside_loop() {
+        let m = parse("def main() -> int:\n    continue\n    return 0\n");
+        let err = lower(&m).unwrap_err();
+        assert!(format!("{}", err).contains("`continue` outside"));
+    }
+
+    #[test]
+    fn rejects_else_on_while() {
+        let m = parse(
+            "def main(n: int) -> int:\n    while n > 0:\n        n = n - 1\n    else:\n        n = -1\n    return n\n",
+        );
+        let err = lower(&m).unwrap_err();
+        assert!(format!("{}", err).contains("`else` clause on `while`"));
+    }
+
+    #[test]
+    fn while_alone_does_not_satisfy_path_coverage() {
+        // `while` is not a covering construct — last statement must be a return.
+        let m = parse(
+            "def main(n: int) -> int:\n    while n > 0:\n        return n\n",
+        );
+        let err = lower(&m).unwrap_err();
+        assert!(format!("{}", err).contains("not all paths return"));
     }
 }

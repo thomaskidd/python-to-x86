@@ -1,0 +1,5 @@
+# Bound n so iterations stay reasonable and total fits in i64.
+# sum(0..1000) = 499_500, well within i64.
+[[arg]]
+type = "i64"
+range = [0, 1000]
