@@ -1,12 +1,14 @@
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use rustpython_parser::ast;
 
 use crate::hir::{
     BinOp, BoolOp, CmpOp, Expr, Function, ListId, Param, Program, Stmt, TupleId, Type, TypedExpr,
     UnaryOp,
 };
+use crate::parser;
 use crate::parser::Module;
 
 const MAX_PARAMS: usize = 16;
@@ -23,51 +25,29 @@ struct FunctionSig {
 
 type SignatureTable = HashMap<String, FunctionSig>;
 
-pub fn lower(module: &Module) -> Result<Program> {
-    // Pass 1: collect signatures.
+pub fn lower(module: &Module, source_path: &Path) -> Result<Program> {
+    let mut loaded: HashSet<PathBuf> = HashSet::new();
+    let mut all_functions: Vec<Function> = Vec::new();
     let mut signatures: SignatureTable = HashMap::new();
-    for stmt in &module.body {
-        match stmt {
-            ast::Stmt::FunctionDef(f) => {
-                let sig = collect_signature(f)?;
-                let name = f.name.as_str().to_string();
-                if signatures.contains_key(&name) {
-                    bail!("unsupported_feature: duplicate top-level function `{}`", name);
-                }
-                signatures.insert(name, sig);
-            }
-            ast::Stmt::ImportFrom(im) => {
-                // Allowed: `from pyx86.types import …` (type-name documentation)
-                //          `from __future__ import annotations` (lets test
-                //              programs use PEP 585 syntax under Python 3.8)
-                let module_name = im
-                    .module
-                    .as_ref()
-                    .map(|s| s.as_str())
-                    .unwrap_or("");
-                match module_name {
-                    "pyx86.types" | "__future__" => {
-                        // Accepted; we don't act on the imports — type names
-                        // are resolved directly and we ignore Python's lazy-
-                        // annotation semantics.
-                    }
-                    _ => bail!(
-                        "unsupported_feature: only `from pyx86.types import …` and `from __future__ import …` imports are supported at module level (found `from {} import …`)",
-                        module_name
-                    ),
-                }
-            }
-            other => bail!(
-                "unsupported_feature: only `def` and `from pyx86.types import …` are allowed at the top level, found {}",
-                stmt_kind_name(other)
-            ),
-        }
+
+    let abs = source_path
+        .canonicalize()
+        .unwrap_or_else(|_| source_path.to_path_buf());
+    loaded.insert(abs.clone());
+
+    lower_module_into(
+        module,
+        source_path,
+        &mut signatures,
+        &mut all_functions,
+        &mut loaded,
+        true, // root module: collects top-level functions for self-defined main
+    )?;
+
+    if !signatures.contains_key("main") {
+        bail!("unsupported_feature: no `main` function defined at the top level");
     }
-    let main_sig = signatures.get("main").ok_or_else(|| {
-        anyhow!("unsupported_feature: no `main` function defined at the top level")
-    })?;
-    // main return must be int or float — bool isn't a useful CLI return
-    // (and we don't have a printer for it).
+    let main_sig = signatures.get("main").unwrap();
     if !matches!(main_sig.return_ty, Type::I64 | Type::F64) {
         bail!(
             "unsupported_feature: `main` must return `int` or `float`, found {}",
@@ -84,15 +64,110 @@ pub fn lower(module: &Module) -> Result<Program> {
         }
     }
 
-    // Pass 2: lower each function body. Skip non-FunctionDef stmts
-    // (already validated in pass 1).
-    let mut functions = Vec::with_capacity(module.body.len());
+    Ok(Program { functions: all_functions })
+}
+
+/// Recursively lower a module + its sibling-file imports into the
+/// shared signature table and function list. `is_root` only affects
+/// error messages (a non-root module that lacks `main` is fine).
+fn lower_module_into(
+    module: &Module,
+    source_path: &Path,
+    signatures: &mut SignatureTable,
+    all_functions: &mut Vec<Function>,
+    loaded: &mut HashSet<PathBuf>,
+    _is_root: bool,
+) -> Result<()> {
+    let mut local_func_defs: Vec<&ast::StmtFunctionDef> = Vec::new();
     for stmt in &module.body {
-        if let ast::Stmt::FunctionDef(func) = stmt {
-            functions.push(lower_function(func, &signatures)?);
+        match stmt {
+            ast::Stmt::FunctionDef(f) => {
+                let sig = collect_signature(f)?;
+                let name = f.name.as_str().to_string();
+                if signatures.contains_key(&name) {
+                    bail!(
+                        "unsupported_feature: duplicate top-level function `{}` (collisions across files are not supported)",
+                        name
+                    );
+                }
+                signatures.insert(name, sig);
+                local_func_defs.push(f);
+            }
+            ast::Stmt::ImportFrom(im) => {
+                let module_name = im.module.as_ref().map(|s| s.as_str()).unwrap_or("");
+                match module_name {
+                    "pyx86.types" | "__future__" => {
+                        // Documentary / parser-side imports; no action.
+                    }
+                    _ => {
+                        // Resolve sibling file: <source_dir>/<module-as-path>.py.
+                        let dir = source_path.parent().unwrap_or_else(|| Path::new("."));
+                        let mut rel = PathBuf::new();
+                        for part in module_name.split('.') {
+                            rel.push(part);
+                        }
+                        let mut candidate = dir.join(&rel);
+                        candidate.set_extension("py");
+                        if !candidate.exists() {
+                            bail!(
+                                "unsupported_feature: cannot find module `{}` (looked for {})",
+                                module_name,
+                                candidate.display()
+                            );
+                        }
+                        let abs = candidate
+                            .canonicalize()
+                            .unwrap_or_else(|_| candidate.clone());
+                        if loaded.contains(&abs) {
+                            // Already loaded (or a cycle) — skip recursive load.
+                            // The names being imported are presumed to be in
+                            // signatures already.
+                            continue;
+                        }
+                        loaded.insert(abs.clone());
+                        let source = std::fs::read_to_string(&candidate).with_context(|| {
+                            format!("read imported module {}", candidate.display())
+                        })?;
+                        let imported_module = parser::parse(&source, &candidate)?;
+                        lower_module_into(
+                            &imported_module,
+                            &candidate,
+                            signatures,
+                            all_functions,
+                            loaded,
+                            false,
+                        )?;
+                        // Verify the requested names actually exist.
+                        for alias in &im.names {
+                            let name = alias.name.as_str();
+                            if !signatures.contains_key(name) {
+                                bail!(
+                                    "unsupported_feature: module `{}` does not define `{}`",
+                                    module_name,
+                                    name
+                                );
+                            }
+                            if alias.asname.is_some() {
+                                bail!(
+                                    "unsupported_feature: import aliases (`as`) are not yet supported"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            other => bail!(
+                "unsupported_feature: only `def` and `from … import …` are allowed at the top level, found {}",
+                stmt_kind_name(other)
+            ),
         }
     }
-    Ok(Program { functions })
+    // Pass 2: lower bodies of THIS module's local functions.
+    for func in local_func_defs {
+        let lowered = lower_function(func, signatures)?;
+        all_functions.push(lowered);
+    }
+    Ok(())
 }
 
 fn collect_signature(func: &ast::StmtFunctionDef) -> Result<FunctionSig> {
@@ -1716,7 +1791,7 @@ mod tests {
 
     #[test]
     fn lowers_no_param_main() {
-        let p = lower(&parse("def main() -> int:\n    return 42\n")).unwrap();
+        let p = lower(&parse("def main() -> int:\n    return 42\n"), &PathBuf::from("t.py")).unwrap();
         assert_eq!(p.main().params.len(), 0);
         assert_eq!(p.main().return_ty, Type::I64);
     }
@@ -1725,7 +1800,7 @@ mod tests {
     fn lowers_two_param_main() {
         let p = lower(&parse(
             "def main(a: int, b: int) -> int:\n    return a + b\n",
-        ))
+        ), &PathBuf::from("t.py"))
         .unwrap();
         assert_eq!(p.main().params.len(), 2);
         assert_eq!(p.main().params[0].ty, Type::I64);
@@ -1737,26 +1812,26 @@ mod tests {
         // The result of true-div is F64; we check it via comparison.
         let _ = lower(&parse(
             "def helper() -> float:\n    return 1.5 + 2.5\n\ndef main() -> int:\n    x: float = helper()\n    if x > 0.0:\n        return 1\n    else:\n        return 0\n",
-        ))
+        ), &PathBuf::from("t.py"))
         .unwrap();
     }
 
     #[test]
     fn rejects_implicit_float_to_int_on_return() {
         let m = parse("def main() -> int:\n    return 1.5\n");
-        let err = lower(&m).unwrap_err();
+        let err = lower(&m, &PathBuf::from("t.py")).unwrap_err();
         assert!(format!("{}", err).contains("float→int"));
     }
 
     #[test]
     fn accepts_float_main_return() {
-        let _ = lower(&parse("def main() -> float:\n    return 1.0\n")).unwrap();
+        let _ = lower(&parse("def main() -> float:\n    return 1.0\n"), &PathBuf::from("t.py")).unwrap();
     }
 
     #[test]
     fn rejects_bool_main_return() {
         let m = parse("def main() -> bool:\n    return True\n");
-        let err = lower(&m).unwrap_err();
+        let err = lower(&m, &PathBuf::from("t.py")).unwrap_err();
         assert!(format!("{}", err).contains("`main` must return"));
     }
 
@@ -1764,7 +1839,7 @@ mod tests {
     fn lowers_simple_if_else() {
         let p = lower(&parse(
             "def main(a: int) -> int:\n    if a < 0:\n        return -a\n    else:\n        return a\n",
-        ))
+        ), &PathBuf::from("t.py"))
         .unwrap();
         match &p.main().body[0] {
             Stmt::If { cond, .. } => assert_eq!(cond.ty, Type::Bool),
@@ -1775,7 +1850,7 @@ mod tests {
     #[test]
     fn rejects_break_outside_loop() {
         let m = parse("def main() -> int:\n    break\n    return 0\n");
-        let err = lower(&m).unwrap_err();
+        let err = lower(&m, &PathBuf::from("t.py")).unwrap_err();
         assert!(format!("{}", err).contains("`break` outside"));
     }
 }
