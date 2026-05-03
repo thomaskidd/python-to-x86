@@ -26,19 +26,38 @@ pub fn lower(module: &Module) -> Result<Program> {
     // Pass 1: collect signatures.
     let mut signatures: SignatureTable = HashMap::new();
     for stmt in &module.body {
-        let func = match stmt {
-            ast::Stmt::FunctionDef(f) => f,
+        match stmt {
+            ast::Stmt::FunctionDef(f) => {
+                let sig = collect_signature(f)?;
+                let name = f.name.as_str().to_string();
+                if signatures.contains_key(&name) {
+                    bail!("unsupported_feature: duplicate top-level function `{}`", name);
+                }
+                signatures.insert(name, sig);
+            }
+            ast::Stmt::ImportFrom(im) => {
+                // The only allowed import (currently) is `from pyx86.types
+                // import …`. The names are accepted as type annotations
+                // directly; the import is only documentary.
+                let module_name = im
+                    .module
+                    .as_ref()
+                    .map(|s| s.as_str())
+                    .unwrap_or("");
+                if module_name != "pyx86.types" {
+                    bail!(
+                        "unsupported_feature: only `from pyx86.types import …` imports are supported (found `from {} import …`)",
+                        module_name
+                    );
+                }
+                // Accept the names but don't track them — type annotations
+                // resolve i8/i16/i32 directly.
+            }
             other => bail!(
-                "unsupported_feature: only `def` is allowed at the top level, found {}",
+                "unsupported_feature: only `def` and `from pyx86.types import …` are allowed at the top level, found {}",
                 stmt_kind_name(other)
             ),
-        };
-        let sig = collect_signature(func)?;
-        let name = func.name.as_str().to_string();
-        if signatures.contains_key(&name) {
-            bail!("unsupported_feature: duplicate top-level function `{}`", name);
         }
-        signatures.insert(name, sig);
     }
     let main_sig = signatures.get("main").ok_or_else(|| {
         anyhow!("unsupported_feature: no `main` function defined at the top level")
@@ -61,14 +80,13 @@ pub fn lower(module: &Module) -> Result<Program> {
         }
     }
 
-    // Pass 2: lower each function body.
+    // Pass 2: lower each function body. Skip non-FunctionDef stmts
+    // (already validated in pass 1).
     let mut functions = Vec::with_capacity(module.body.len());
     for stmt in &module.body {
-        let func = match stmt {
-            ast::Stmt::FunctionDef(f) => f,
-            _ => unreachable!(),
-        };
-        functions.push(lower_function(func, &signatures)?);
+        if let ast::Stmt::FunctionDef(func) = stmt {
+            functions.push(lower_function(func, &signatures)?);
+        }
     }
     Ok(Program { functions })
 }
@@ -444,6 +462,14 @@ fn parse_type_annotation(ann: Option<&ast::Expr>) -> Option<Type> {
             "int" => Some(Type::I64),
             "float" => Some(Type::F64),
             "bool" => Some(Type::Bool),
+            // C-width int types — equivalent to `from pyx86.types import i8`,
+            // but we accept the names directly as built-ins. The import
+            // statement is allowed at module level for documentation but
+            // doesn't gate the names.
+            "i8" => Some(Type::I8),
+            "i16" => Some(Type::I16),
+            "i32" => Some(Type::I32),
+            "i64" => Some(Type::I64),
             _ => None,
         },
         _ => None,
@@ -586,24 +612,49 @@ fn apply_binop(op: BinOp, lhs: TypedExpr, rhs: TypedExpr) -> Result<TypedExpr> {
             ))
         }
         BinOp::FloorDiv | BinOp::Mod => {
-            // I64 operands only (Python's float // and % are not in scope yet).
-            let l = coerce(lhs, Type::I64)?;
-            let r = coerce(rhs, Type::I64)?;
+            // Reject float (Python supports float `%` but we don't yet).
+            if lhs.ty == Type::F64 || rhs.ty == Type::F64 {
+                bail!(
+                    "unsupported_feature: `//` / `%` on float operands not yet supported"
+                );
+            }
+            // Unify int widths.
+            let (l, r) = unify_int_widths(lhs, rhs)?;
+            let ty = l.ty;
             Ok(TypedExpr::new(
-                Type::I64,
+                ty,
                 Expr::BinOp { op, lhs: Box::new(l), rhs: Box::new(r) },
             ))
         }
-        BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Shr => {
-            let l = coerce(lhs, Type::I64)?;
-            let r = coerce(rhs, Type::I64)?;
+        BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor => {
+            if lhs.ty == Type::F64 || rhs.ty == Type::F64 {
+                bail!(
+                    "unsupported_feature: bitwise ops on float operands are not allowed"
+                );
+            }
+            let (l, r) = unify_int_widths(lhs, rhs)?;
+            let ty = l.ty;
             Ok(TypedExpr::new(
-                Type::I64,
+                ty,
                 Expr::BinOp { op, lhs: Box::new(l), rhs: Box::new(r) },
+            ))
+        }
+        BinOp::Shl | BinOp::Shr => {
+            if lhs.ty == Type::F64 || rhs.ty == Type::F64 {
+                bail!("unsupported_feature: shift ops on float operands are not allowed");
+            }
+            // Result type follows lhs width; rhs is coerced to lhs's width.
+            let lhs = coerce_int_keep_width(lhs)?;
+            let target = lhs.ty;
+            let r = coerce(rhs, target)?;
+            Ok(TypedExpr::new(
+                target,
+                Expr::BinOp { op, lhs: Box::new(lhs), rhs: Box::new(r) },
             ))
         }
         BinOp::Pow => {
-            // Int**Int → I64. Float**Float → F64. Mixed → F64.
+            // Int**Int → I64 (using runtime helper, always i64 result for
+            // simplicity; sub-i64 ints would be widened). Float**Float → F64. Mixed → F64.
             let result_ty = if lhs.ty == Type::F64 || rhs.ty == Type::F64 {
                 Type::F64
             } else {
@@ -627,6 +678,39 @@ fn apply_binop(op: BinOp, lhs: TypedExpr, rhs: TypedExpr) -> Result<TypedExpr> {
     }
 }
 
+/// Unify two int-shaped operands to the wider int width. Bool counts
+/// as I64 (Python-ish). Caller must have already verified neither is F64.
+fn unify_int_widths(lhs: TypedExpr, rhs: TypedExpr) -> Result<(TypedExpr, TypedExpr)> {
+    let lty = if lhs.ty == Type::Bool { Type::I64 } else { lhs.ty };
+    let rty = if rhs.ty == Type::Bool { Type::I64 } else { rhs.ty };
+    let target = match (lty.int_width(), rty.int_width()) {
+        (Some(lw), Some(rw)) => match lw.max(rw) {
+            8 => Type::I8,
+            16 => Type::I16,
+            32 => Type::I32,
+            _ => Type::I64,
+        },
+        _ => bail!(
+            "unsupported_feature: cannot unify {} and {} as ints",
+            lhs.ty.name(),
+            rhs.ty.name()
+        ),
+    };
+    Ok((coerce(lhs, target)?, coerce(rhs, target)?))
+}
+
+/// If the expression is a Bool, coerce it to I64; otherwise pass through.
+/// Used where we want the int-shaped width of the operand to drive the result.
+fn coerce_int_keep_width(e: TypedExpr) -> Result<TypedExpr> {
+    if e.ty == Type::Bool {
+        coerce(e, Type::I64)
+    } else if e.ty.is_int() {
+        Ok(e)
+    } else {
+        bail!("unsupported_feature: expected int-shaped operand, got {}", e.ty.name())
+    }
+}
+
 fn apply_unop(op: UnaryOp, operand: TypedExpr) -> Result<TypedExpr> {
     match op {
         UnaryOp::Neg | UnaryOp::Pos => {
@@ -643,22 +727,43 @@ fn apply_unop(op: UnaryOp, operand: TypedExpr) -> Result<TypedExpr> {
             ))
         }
         UnaryOp::BitNot => {
-            let operand = coerce(operand, Type::I64)?;
+            // Bitwise not on int operand of any width.
+            let operand = coerce_int_keep_width(operand)?;
+            let ty = operand.ty;
             Ok(TypedExpr::new(
-                Type::I64,
+                ty,
                 Expr::UnaryOp { op, operand: Box::new(operand) },
             ))
         }
     }
 }
 
-/// Numeric promotion for arithmetic operands: if either is F64, both
-/// become F64; if either is Bool, it becomes I64; otherwise keep I64.
+/// Numeric promotion for arithmetic operands.
+///
+/// Rules (in order):
+/// - If either is F64, both become F64.
+/// - Otherwise, both become the wider of the two int types (Bool counts
+///   as 1-bit; treated as I64 when mixed with anything int-shaped to
+///   match Python's `True + 1 == 2` semantics).
 fn unify_numeric(lhs: TypedExpr, rhs: TypedExpr) -> Result<(TypedExpr, TypedExpr)> {
-    let target = if lhs.ty == Type::F64 || rhs.ty == Type::F64 {
-        Type::F64
-    } else {
-        Type::I64
+    if lhs.ty == Type::F64 || rhs.ty == Type::F64 {
+        return Ok((coerce(lhs, Type::F64)?, coerce(rhs, Type::F64)?));
+    }
+    // Both int-shaped (I*) or Bool. Bool counts as I64 (Python-ish).
+    let lty = if lhs.ty == Type::Bool { Type::I64 } else { lhs.ty };
+    let rty = if rhs.ty == Type::Bool { Type::I64 } else { rhs.ty };
+    let target = match (lty.int_width(), rty.int_width()) {
+        (Some(lw), Some(rw)) => match lw.max(rw) {
+            8 => Type::I8,
+            16 => Type::I16,
+            32 => Type::I32,
+            _ => Type::I64,
+        },
+        _ => bail!(
+            "unsupported_feature: cannot unify {} and {} for arithmetic",
+            lhs.ty.name(),
+            rhs.ty.name()
+        ),
     };
     Ok((coerce(lhs, target)?, coerce(rhs, target)?))
 }
@@ -669,31 +774,43 @@ fn unify_cmp_operands(lhs: TypedExpr, rhs: TypedExpr) -> Result<(TypedExpr, Type
 }
 
 /// Insert a coercion if the expression's type doesn't match the target.
-/// Allowed coercions: Bool↔I64, I64→F64, Bool→F64, Bool→Bool (no-op),
-/// F64→Bool (via != 0.0). F64→I64 is rejected (lossy; needs explicit
-/// `int()` builtin which we don't have yet).
+/// Allowed coercions:
+/// - between any two int widths (sext or trunc; signed semantics)
+/// - Bool ↔ any int (zext / icmp ne 0)
+/// - any int → F64 (sitofp)
+/// - Bool → F64 (zext to int then sitofp)
+/// - F64 → Bool (fcmp one … 0.0)
+///
+/// F64 → int is rejected (would be lossy; requires explicit cast that
+/// we don't have a builtin for yet).
 fn coerce(e: TypedExpr, target: Type) -> Result<TypedExpr> {
     if e.ty == target {
         return Ok(e);
     }
-    match (e.ty, target) {
-        (Type::Bool, Type::I64)
-        | (Type::I64, Type::Bool)
-        | (Type::I64, Type::F64)
-        | (Type::Bool, Type::F64)
-        | (Type::F64, Type::Bool) => Ok(TypedExpr::new(
-            target,
-            Expr::Coerce { inner: Box::new(e) },
-        )),
-        (Type::F64, Type::I64) => bail!(
-            "unsupported_feature: implicit float→int conversion is not allowed (`int()` builtin coming later)"
-        ),
-        _ => bail!(
+    let allowed = match (e.ty, target) {
+        // Float → int: lossy, rejected.
+        (Type::F64, t) if t.is_int() => {
+            bail!(
+                "unsupported_feature: implicit float→{} conversion is not allowed (use an explicit cast — coming later)",
+                t.name()
+            )
+        }
+        // Int width changes (incl. Bool ↔ int): always allowed via sext/trunc/zext.
+        (a, b) if (a.is_int() || a == Type::Bool) && (b.is_int() || b == Type::Bool) => true,
+        // Numeric → F64: int / Bool → F64 is allowed.
+        (a, Type::F64) if a.is_int() || a == Type::Bool => true,
+        // F64 → Bool: allowed (fcmp).
+        (Type::F64, Type::Bool) => true,
+        _ => false,
+    };
+    if !allowed {
+        bail!(
             "unsupported_feature: cannot coerce {} to {}",
             e.ty.name(),
             target.name()
-        ),
+        );
     }
+    Ok(TypedExpr::new(target, Expr::Coerce { inner: Box::new(e) }))
 }
 
 fn resolve_call_args(
@@ -929,11 +1046,15 @@ mod tests {
     }
 
     #[test]
-    fn rejects_float_main_return() {
-        let m = parse("def main() -> float:\n    return 1.0\n");
+    fn accepts_float_main_return() {
+        let _ = lower(&parse("def main() -> float:\n    return 1.0\n")).unwrap();
+    }
+
+    #[test]
+    fn rejects_bool_main_return() {
+        let m = parse("def main() -> bool:\n    return True\n");
         let err = lower(&m).unwrap_err();
-        let msg = format!("{}", err);
-        assert!(msg.contains("`main` must return `int`"));
+        assert!(format!("{}", err).contains("`main` must return"));
     }
 
     #[test]

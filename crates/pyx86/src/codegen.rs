@@ -33,7 +33,11 @@ pub fn emit_ll(prog: &Program, source_basename: &str) -> String {
     let print_block = match main_fn.return_ty {
         Type::I64 => "  %fmt = getelementptr inbounds [5 x i8], [5 x i8]* @.fmt_i64, i64 0, i64 0\n  call i32 (i8*, ...) @printf(i8* %fmt, i64 %r)".to_string(),
         Type::F64 => "  call void @pyx86_print_f64(double %r)".to_string(),
-        Type::Bool => unreachable!("check rejects bool main return"),
+        // Check restricts main return to I64 or F64. The other cases
+        // are unreachable but keep the match exhaustive.
+        Type::I8 | Type::I16 | Type::I32 | Type::Bool => {
+            unreachable!("check rejects non-(I64|F64) main return types")
+        }
     };
 
     format!(
@@ -189,6 +193,9 @@ loop_exit:
 
 fn llvm_ty(ty: Type) -> &'static str {
     match ty {
+        Type::I8 => "i8",
+        Type::I16 => "i16",
+        Type::I32 => "i32",
         Type::I64 => "i64",
         Type::F64 => "double",
         Type::Bool => "i1",
@@ -232,7 +239,9 @@ fn format_argv_parsing(func: &Function) -> String {
                     i = i
                 );
             }
-            Type::Bool => unreachable!("check rejects bool main params"),
+            Type::I8 | Type::I16 | Type::I32 | Type::Bool => {
+                unreachable!("check rejects non-(I64|F64) main params")
+            }
         }
     }
     s
@@ -451,24 +460,22 @@ impl Codegen {
 
     fn lower_coerce(&mut self, inner: &TypedExpr, target: Type) -> String {
         let inner_op = self.lower(inner);
+        if inner.ty == target {
+            return inner_op;
+        }
+        // Bool ↔ Int / Bool ↔ Float
         match (inner.ty, target) {
-            (Type::Bool, Type::I64) => {
+            (Type::Bool, t) if t.is_int() => {
                 let dst = self.fresh();
-                self.emit(&format!("{} = zext i1 {} to i64", dst, inner_op));
+                self.emit(&format!("{} = zext i1 {} to {}", dst, inner_op, llvm_ty(t)));
                 dst
             }
-            (Type::I64, Type::Bool) => {
+            (a, Type::Bool) if a.is_int() => {
                 let dst = self.fresh();
-                self.emit(&format!("{} = icmp ne i64 {}, 0", dst, inner_op));
-                dst
-            }
-            (Type::I64, Type::F64) => {
-                let dst = self.fresh();
-                self.emit(&format!("{} = sitofp i64 {} to double", dst, inner_op));
+                self.emit(&format!("{} = icmp ne {} {}, 0", dst, llvm_ty(a), inner_op));
                 dst
             }
             (Type::Bool, Type::F64) => {
-                // i1 → i64 → double
                 let intermediate = self.fresh();
                 self.emit(&format!("{} = zext i1 {} to i64", intermediate, inner_op));
                 let dst = self.fresh();
@@ -480,7 +487,25 @@ impl Codegen {
                 self.emit(&format!("{} = fcmp one double {}, 0.0", dst, inner_op));
                 dst
             }
-            (a, b) if a == b => inner_op,
+            (a, Type::F64) if a.is_int() => {
+                let dst = self.fresh();
+                self.emit(&format!("{} = sitofp {} {} to double", dst, llvm_ty(a), inner_op));
+                dst
+            }
+            // Int width changes
+            (a, b) if a.is_int() && b.is_int() => {
+                let aw = a.int_width().unwrap();
+                let bw = b.int_width().unwrap();
+                let dst = self.fresh();
+                if bw > aw {
+                    // sign-extend
+                    self.emit(&format!("{} = sext {} {} to {}", dst, llvm_ty(a), inner_op, llvm_ty(b)));
+                } else {
+                    // narrow
+                    self.emit(&format!("{} = trunc {} {} to {}", dst, llvm_ty(a), inner_op, llvm_ty(b)));
+                }
+                dst
+            }
             (a, b) => panic!(
                 "internal: codegen Coerce {} → {} not implemented",
                 a.name(),
@@ -491,24 +516,24 @@ impl Codegen {
 
     fn lower_unary(&mut self, op: UnaryOp, operand: &TypedExpr, _result_ty: Type) -> String {
         let v = self.lower(operand);
-        match (op, operand.ty) {
-            (UnaryOp::Pos, _) => v,
-            (UnaryOp::Neg, Type::I64) => {
+        match op {
+            UnaryOp::Pos => v,
+            UnaryOp::Neg if operand.ty.is_int() => {
                 let dst = self.fresh();
-                self.emit(&format!("{} = sub i64 0, {}", dst, v));
+                self.emit(&format!("{} = sub {} 0, {}", dst, llvm_ty(operand.ty), v));
                 dst
             }
-            (UnaryOp::Neg, Type::F64) => {
+            UnaryOp::Neg if operand.ty == Type::F64 => {
                 let dst = self.fresh();
                 self.emit(&format!("{} = fneg double {}", dst, v));
                 dst
             }
-            (UnaryOp::BitNot, Type::I64) => {
+            UnaryOp::BitNot if operand.ty.is_int() => {
                 let dst = self.fresh();
-                self.emit(&format!("{} = xor i64 {}, -1", dst, v));
+                self.emit(&format!("{} = xor {} {}, -1", dst, llvm_ty(operand.ty), v));
                 dst
             }
-            (UnaryOp::Neg, Type::Bool) | (UnaryOp::BitNot, _) => panic!(
+            _ => panic!(
                 "internal: unary op {:?} on type {} should have been coerced",
                 op,
                 operand.ty.name()
@@ -520,17 +545,18 @@ impl Codegen {
         let l = self.lower(lhs);
         let r = self.lower(rhs);
         debug_assert_eq!(lhs.ty, rhs.ty, "binop operands must have matching types");
-        match (op, lhs.ty) {
-            (BinOp::Add, Type::I64) => self.simple_iop("add", &l, &r),
-            (BinOp::Sub, Type::I64) => self.simple_iop("sub", &l, &r),
-            (BinOp::Mul, Type::I64) => self.simple_iop("mul", &l, &r),
-            (BinOp::FloorDiv, Type::I64) => self.floor_div_i64(&l, &r),
-            (BinOp::Mod, Type::I64) => self.floor_mod_i64(&l, &r),
-            (BinOp::BitAnd, Type::I64) => self.simple_iop("and", &l, &r),
-            (BinOp::BitOr, Type::I64) => self.simple_iop("or", &l, &r),
-            (BinOp::BitXor, Type::I64) => self.simple_iop("xor", &l, &r),
-            (BinOp::Shl, Type::I64) => self.simple_iop("shl", &l, &r),
-            (BinOp::Shr, Type::I64) => self.simple_iop("ashr", &l, &r),
+        let ty = lhs.ty;
+        match (op, ty) {
+            (BinOp::Add, t) if t.is_int() => self.simple_iop("add", &l, &r, t),
+            (BinOp::Sub, t) if t.is_int() => self.simple_iop("sub", &l, &r, t),
+            (BinOp::Mul, t) if t.is_int() => self.simple_iop("mul", &l, &r, t),
+            (BinOp::FloorDiv, t) if t.is_int() => self.floor_div_int(&l, &r, t),
+            (BinOp::Mod, t) if t.is_int() => self.floor_mod_int(&l, &r, t),
+            (BinOp::BitAnd, t) if t.is_int() => self.simple_iop("and", &l, &r, t),
+            (BinOp::BitOr, t) if t.is_int() => self.simple_iop("or", &l, &r, t),
+            (BinOp::BitXor, t) if t.is_int() => self.simple_iop("xor", &l, &r, t),
+            (BinOp::Shl, t) if t.is_int() => self.simple_iop("shl", &l, &r, t),
+            (BinOp::Shr, t) if t.is_int() => self.simple_iop("ashr", &l, &r, t),
             (BinOp::Add, Type::F64) => self.simple_fop("fadd", &l, &r),
             (BinOp::Sub, Type::F64) => self.simple_fop("fsub", &l, &r),
             (BinOp::Mul, Type::F64) => self.simple_fop("fmul", &l, &r),
@@ -559,9 +585,9 @@ impl Codegen {
         }
     }
 
-    fn simple_iop(&mut self, op: &str, l: &str, r: &str) -> String {
+    fn simple_iop(&mut self, op: &str, l: &str, r: &str, ty: Type) -> String {
         let dst = self.fresh();
-        self.emit(&format!("{} = {} i64 {}, {}", dst, op, l, r));
+        self.emit(&format!("{} = {} {} {}, {}", dst, op, llvm_ty(ty), l, r));
         dst
     }
 
@@ -571,7 +597,8 @@ impl Codegen {
         dst
     }
 
-    fn floor_div_i64(&mut self, l: &str, r: &str) -> String {
+    fn floor_div_int(&mut self, l: &str, r: &str, ty: Type) -> String {
+        let t = llvm_ty(ty);
         let q = self.fresh();
         let rem = self.fresh();
         let rem_nz = self.fresh();
@@ -580,18 +607,19 @@ impl Codegen {
         let needs = self.fresh();
         let adj = self.fresh();
         let dst = self.fresh();
-        self.emit(&format!("{} = sdiv i64 {}, {}", q, l, r));
-        self.emit(&format!("{} = srem i64 {}, {}", rem, l, r));
-        self.emit(&format!("{} = icmp ne i64 {}, 0", rem_nz, rem));
-        self.emit(&format!("{} = xor i64 {}, {}", xor_sign, l, r));
-        self.emit(&format!("{} = icmp slt i64 {}, 0", signs_differ, xor_sign));
+        self.emit(&format!("{} = sdiv {} {}, {}", q, t, l, r));
+        self.emit(&format!("{} = srem {} {}, {}", rem, t, l, r));
+        self.emit(&format!("{} = icmp ne {} {}, 0", rem_nz, t, rem));
+        self.emit(&format!("{} = xor {} {}, {}", xor_sign, t, l, r));
+        self.emit(&format!("{} = icmp slt {} {}, 0", signs_differ, t, xor_sign));
         self.emit(&format!("{} = and i1 {}, {}", needs, rem_nz, signs_differ));
-        self.emit(&format!("{} = sext i1 {} to i64", adj, needs));
-        self.emit(&format!("{} = add i64 {}, {}", dst, q, adj));
+        self.emit(&format!("{} = sext i1 {} to {}", adj, needs, t));
+        self.emit(&format!("{} = add {} {}, {}", dst, t, q, adj));
         dst
     }
 
-    fn floor_mod_i64(&mut self, l: &str, r: &str) -> String {
+    fn floor_mod_int(&mut self, l: &str, r: &str, ty: Type) -> String {
+        let t = llvm_ty(ty);
         let rem = self.fresh();
         let rem_nz = self.fresh();
         let xor_sign = self.fresh();
@@ -599,13 +627,13 @@ impl Codegen {
         let needs = self.fresh();
         let adj = self.fresh();
         let dst = self.fresh();
-        self.emit(&format!("{} = srem i64 {}, {}", rem, l, r));
-        self.emit(&format!("{} = icmp ne i64 {}, 0", rem_nz, rem));
-        self.emit(&format!("{} = xor i64 {}, {}", xor_sign, rem, r));
-        self.emit(&format!("{} = icmp slt i64 {}, 0", signs_differ, xor_sign));
+        self.emit(&format!("{} = srem {} {}, {}", rem, t, l, r));
+        self.emit(&format!("{} = icmp ne {} {}, 0", rem_nz, t, rem));
+        self.emit(&format!("{} = xor {} {}, {}", xor_sign, t, rem, r));
+        self.emit(&format!("{} = icmp slt {} {}, 0", signs_differ, t, xor_sign));
         self.emit(&format!("{} = and i1 {}, {}", needs, rem_nz, signs_differ));
-        self.emit(&format!("{} = select i1 {}, i64 {}, i64 0", adj, needs, r));
-        self.emit(&format!("{} = add i64 {}, {}", dst, rem, adj));
+        self.emit(&format!("{} = select i1 {}, {} {}, {} 0", adj, needs, t, r, t));
+        self.emit(&format!("{} = add {} {}, {}", dst, t, rem, adj));
         dst
     }
 
@@ -614,26 +642,24 @@ impl Codegen {
         let l = self.lower(lhs);
         let r = self.lower(rhs);
         let dst = self.fresh();
-        match lhs.ty {
-            Type::I64 | Type::Bool => {
-                self.emit(&format!(
-                    "{} = icmp {} {} {}, {}",
-                    dst,
-                    llvm_icmp_op(op),
-                    llvm_ty(lhs.ty),
-                    l,
-                    r
-                ));
-            }
-            Type::F64 => {
-                self.emit(&format!(
-                    "{} = fcmp {} double {}, {}",
-                    dst,
-                    llvm_fcmp_op(op),
-                    l,
-                    r
-                ));
-            }
+        if lhs.ty == Type::F64 {
+            self.emit(&format!(
+                "{} = fcmp {} double {}, {}",
+                dst,
+                llvm_fcmp_op(op),
+                l,
+                r
+            ));
+        } else {
+            // Int or Bool — both LLVM integer types, use icmp.
+            self.emit(&format!(
+                "{} = icmp {} {} {}, {}",
+                dst,
+                llvm_icmp_op(op),
+                llvm_ty(lhs.ty),
+                l,
+                r
+            ));
         }
         dst
     }
@@ -644,27 +670,26 @@ impl Codegen {
         let mut acc: Option<String> = None;
         for (op, e) in rest {
             let next_op = self.lower(e);
-            // Both operands must already be the same type; check
-            // ensures CmpChain uses unified types.
             debug_assert_eq!(prev_ty, e.ty);
             let cmp = self.fresh();
-            match prev_ty {
-                Type::I64 | Type::Bool => self.emit(&format!(
+            if prev_ty == Type::F64 {
+                self.emit(&format!(
+                    "{} = fcmp {} double {}, {}",
+                    cmp,
+                    llvm_fcmp_op(*op),
+                    prev_op,
+                    next_op
+                ));
+            } else {
+                self.emit(&format!(
                     "{} = icmp {} {} {}, {}",
                     cmp,
                     llvm_icmp_op(*op),
                     llvm_ty(prev_ty),
                     prev_op,
                     next_op
-                )),
-                Type::F64 => self.emit(&format!(
-                    "{} = fcmp {} double {}, {}",
-                    cmp,
-                    llvm_fcmp_op(*op),
-                    prev_op,
-                    next_op
-                )),
-            };
+                ));
+            }
             acc = match acc {
                 None => Some(cmp),
                 Some(a) => {
@@ -709,11 +734,17 @@ impl Codegen {
 
         // Truthiness check on lhs.
         let cond = self.fresh();
-        match lhs.ty {
-            Type::I64 => self.emit(&format!("{} = icmp ne i64 {}, 0", cond, lhs_op)),
-            Type::Bool => self.emit(&format!("{} = icmp ne i1 {}, 0", cond, lhs_op)),
-            Type::F64 => self.emit(&format!("{} = fcmp one double {}, 0.0", cond, lhs_op)),
-        };
+        if lhs.ty == Type::F64 {
+            self.emit(&format!("{} = fcmp one double {}, 0.0", cond, lhs_op));
+        } else {
+            // Int or Bool — both LLVM integer types.
+            self.emit(&format!(
+                "{} = icmp ne {} {}, 0",
+                cond,
+                llvm_ty(lhs.ty),
+                lhs_op
+            ));
+        }
 
         let id = self.next_block_id;
         self.next_block_id += 1;
