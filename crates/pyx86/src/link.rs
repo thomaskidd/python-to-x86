@@ -11,6 +11,8 @@ pub fn clang_emit_elf(ll: &Path, out: &Path, opt_level: u8) -> Result<()> {
         ll.to_str().ok_or_else(|| anyhow!("non-utf8 ll path"))?,
         "-o",
         out.to_str().ok_or_else(|| anyhow!("non-utf8 out path"))?,
+        // Link libm so `floor`, `ceil`, `tan`, `pow`, etc. resolve.
+        "-lm",
     ])
 }
 

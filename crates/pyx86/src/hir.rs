@@ -270,6 +270,10 @@ pub enum Expr {
     StrLen { s: Box<TypedExpr> },
     /// String equality / inequality. Result is Bool.
     StrEq { lhs: Box<TypedExpr>, rhs: Box<TypedExpr>, negated: bool },
+    /// Call to a math runtime / LLVM intrinsic. The `name` is the
+    /// LLVM symbol to invoke (e.g. `llvm.sqrt.f64`, `tan`). Single-arg
+    /// f64 → f64 only in v0.24.
+    MathCall { intrinsic: &'static str, arg: Box<TypedExpr> },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

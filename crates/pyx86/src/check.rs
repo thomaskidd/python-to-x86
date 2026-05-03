@@ -96,8 +96,9 @@ fn lower_module_into(
             ast::Stmt::ImportFrom(im) => {
                 let module_name = im.module.as_ref().map(|s| s.as_str()).unwrap_or("");
                 match module_name {
-                    "pyx86.types" | "__future__" => {
-                        // Documentary / parser-side imports; no action.
+                    "pyx86.types" | "__future__" | "math" => {
+                        // Documentary imports; no file load. Names from
+                        // math are recognized by lower_builtin_call directly.
                     }
                     _ => {
                         // Resolve sibling file: <source_dir>/<module-as-path>.py.
@@ -1523,6 +1524,31 @@ fn lower_builtin_call(
                     lhs: Box::new(and_branch),
                     rhs: Box::new(inner),
                 },
+            )))
+        }
+        // math module functions — recognized as builtins regardless of
+        // whether `from math import …` was written. f64 → f64 each.
+        "sqrt" | "sin" | "cos" | "tan" | "exp" | "log" | "floor" | "ceil" | "fabs" => {
+            if args.len() != 1 {
+                bail!("unsupported_feature: math.{}() takes exactly 1 argument", name);
+            }
+            let inner = lower_expr(&args[0], scope, signatures)?;
+            let inner = coerce(inner, Type::F64)?;
+            let intrinsic = match name {
+                "sqrt" => "llvm.sqrt.f64",
+                "sin" => "llvm.sin.f64",
+                "cos" => "llvm.cos.f64",
+                "exp" => "llvm.exp.f64",
+                "log" => "llvm.log.f64",
+                "floor" => "llvm.floor.f64",
+                "ceil" => "llvm.ceil.f64",
+                "fabs" => "llvm.fabs.f64",
+                "tan" => "tan", // no LLVM intrinsic; libm
+                _ => unreachable!(),
+            };
+            Ok(Some(TypedExpr::new(
+                Type::F64,
+                Expr::MathCall { intrinsic, arg: Box::new(inner) },
             )))
         }
         "len" => {
