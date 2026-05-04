@@ -192,6 +192,9 @@ pub enum Stmt {
     While { cond: TypedExpr, body: Vec<Stmt> },
     Break,
     Continue,
+    /// `<list>.append(<value>)`. List must be a Var (so codegen knows
+    /// which slot to mutate); same shared heap struct as Python.
+    ListAppend { list: TypedExpr, value: TypedExpr },
 }
 
 /// An expression annotated with its result type. Operands inside `expr`

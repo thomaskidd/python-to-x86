@@ -581,6 +581,54 @@ fn lower_block(
                 out.push(Stmt::Continue);
             }
             ast::Stmt::Pass(_) => {}
+            ast::Stmt::Expr(e) => {
+                // Currently the only allowed expression-statement is
+                // `<list>.append(<value>)`. Anything else is rejected
+                // (no general expression-statements yet).
+                if let ast::Expr::Call(c) = e.value.as_ref() {
+                    if let ast::Expr::Attribute(attr) = c.func.as_ref() {
+                        if attr.attr.as_str() == "append" {
+                            // <list>.append(<value>) — list must be a Var.
+                            let list_name = match attr.value.as_ref() {
+                                ast::Expr::Name(n) => n.id.as_str().to_string(),
+                                _ => bail!(
+                                    "unsupported_feature: list.append() target must be a simple name (no nested expressions yet)"
+                                ),
+                            };
+                            let list_ty = *scope.get(&list_name).ok_or_else(|| {
+                                anyhow!(
+                                    "unsupported_feature: name `{}` is not in scope",
+                                    list_name
+                                )
+                            })?;
+                            let elem_ty = match list_ty {
+                                Type::List(id) => id.elem(),
+                                other => bail!(
+                                    "unsupported_feature: .append() on {} (only list[T] supported)",
+                                    other.name()
+                                ),
+                            };
+                            if c.args.len() != 1 || !c.keywords.is_empty() {
+                                bail!(
+                                    "unsupported_feature: list.append() takes exactly 1 positional argument"
+                                );
+                            }
+                            let value = lower_expr(&c.args[0], scope, signatures)?;
+                            let value = coerce(value, elem_ty)?;
+                            let list_expr =
+                                TypedExpr::new(list_ty, Expr::Var(list_name));
+                            out.push(Stmt::ListAppend {
+                                list: list_expr,
+                                value,
+                            });
+                            continue;
+                        }
+                    }
+                }
+                bail!(
+                    "unsupported_feature: expression statements are only supported for `list.append(...)` calls"
+                );
+            }
             other => bail!(
                 "unsupported_feature: statement `{}` is not supported",
                 stmt_kind_name(other)
