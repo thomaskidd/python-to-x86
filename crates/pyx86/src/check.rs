@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -5,11 +6,20 @@ use anyhow::{anyhow, bail, Context, Result};
 use rustpython_parser::ast;
 
 use crate::hir::{
-    BinOp, BoolOp, CmpOp, DictId, Expr, Function, ListId, Param, Program, Stmt, TupleId, Type,
-    TypedExpr, UnaryOp,
+    BinOp, BoolOp, ClassDef, ClassId, CmpOp, DictId, Expr, Function, ListId, Param, Program, Stmt,
+    TupleId, Type, TypedExpr, UnaryOp,
 };
 use crate::parser;
 use crate::parser::Module;
+
+thread_local! {
+    /// Per-`lower()` map from class name → ClassId. Populated by the
+    /// class-collection pass (Pass 0), read by parse_type_annotation
+    /// and by call/attribute lowering. Cleared at the start of each
+    /// `lower()` call.
+    static CLASS_REGISTRY: RefCell<HashMap<String, ClassId>> =
+        RefCell::new(HashMap::new());
+}
 
 const MAX_PARAMS: usize = 16;
 
@@ -26,6 +36,7 @@ struct FunctionSig {
 type SignatureTable = HashMap<String, FunctionSig>;
 
 pub fn lower(module: &Module, source_path: &Path) -> Result<Program> {
+    CLASS_REGISTRY.with(|r| r.borrow_mut().clear());
     let mut loaded: HashSet<PathBuf> = HashSet::new();
     let mut all_functions: Vec<Function> = Vec::new();
     let mut signatures: SignatureTable = HashMap::new();
@@ -78,9 +89,120 @@ fn lower_module_into(
     loaded: &mut HashSet<PathBuf>,
     _is_root: bool,
 ) -> Result<()> {
+    // Phase 0a: pre-register class names so type annotations can
+    // reference them (including in class methods of the same class).
+    for stmt in &module.body {
+        if let ast::Stmt::ClassDef(c) = stmt {
+            let name = c.name.as_str().to_string();
+            if CLASS_REGISTRY.with(|r| r.borrow().contains_key(&name))
+                || signatures.contains_key(&name)
+            {
+                bail!(
+                    "unsupported_feature: duplicate class or function `{}`",
+                    name
+                );
+            }
+            // Pre-register with empty fields; filled in below.
+            let id = ClassId::intern(ClassDef {
+                name: name.clone(),
+                fields: Vec::new(),
+            });
+            CLASS_REGISTRY.with(|r| r.borrow_mut().insert(name, id));
+        }
+    }
+
+    // Phase 0b: process each class — collect fields, register methods
+    // as mangled top-level functions (`<ClassName>.<method>`).
+    let mut local_method_defs: Vec<(ClassId, String, &ast::StmtFunctionDef)> = Vec::new();
+    for stmt in &module.body {
+        if let ast::Stmt::ClassDef(c) = stmt {
+            let name = c.name.as_str().to_string();
+            let class_id = CLASS_REGISTRY.with(|r| r.borrow()[&name]);
+            if !c.bases.is_empty() {
+                bail!(
+                    "unsupported_feature: base classes / inheritance not yet supported (in `{}`)",
+                    name
+                );
+            }
+            if !c.decorator_list.is_empty() {
+                bail!(
+                    "unsupported_feature: class decorators not supported (in `{}`)",
+                    name
+                );
+            }
+            if !c.keywords.is_empty() {
+                bail!(
+                    "unsupported_feature: class keyword args (e.g. metaclass=) not supported (in `{}`)",
+                    name
+                );
+            }
+            let mut fields: Vec<(String, Type)> = Vec::new();
+            let mut field_names: HashSet<String> = HashSet::new();
+            for inner in &c.body {
+                match inner {
+                    ast::Stmt::AnnAssign(a) => {
+                        let fname = match a.target.as_ref() {
+                            ast::Expr::Name(n) => n.id.as_str().to_string(),
+                            _ => bail!(
+                                "unsupported_feature: class field target must be a simple name (in `{}`)",
+                                name
+                            ),
+                        };
+                        if !field_names.insert(fname.clone()) {
+                            bail!(
+                                "unsupported_feature: duplicate field `{}` in class `{}`",
+                                fname,
+                                name
+                            );
+                        }
+                        let ty = parse_type_annotation(Some(&a.annotation)).ok_or_else(|| {
+                            anyhow!(
+                                "unsupported_feature: class field `{}` annotation could not be resolved (in `{}`)",
+                                fname,
+                                name
+                            )
+                        })?;
+                        if a.value.is_some() {
+                            bail!(
+                                "unsupported_feature: class field defaults not supported (on `{}` in `{}`)",
+                                fname,
+                                name
+                            );
+                        }
+                        fields.push((fname, ty));
+                    }
+                    ast::Stmt::FunctionDef(f) => {
+                        let mname = format!("{}.{}", name, f.name);
+                        if signatures.contains_key(&mname) {
+                            bail!(
+                                "unsupported_feature: duplicate method `{}` in class `{}`",
+                                f.name,
+                                name
+                            );
+                        }
+                        let sig = collect_method_signature(class_id, f)?;
+                        signatures.insert(mname.clone(), sig);
+                        local_method_defs.push((class_id, mname, f));
+                    }
+                    ast::Stmt::Pass(_) => {}
+                    other => bail!(
+                        "unsupported_feature: only field annotations, methods, and `pass` allowed in class body (got {} in `{}`)",
+                        stmt_kind_name(other),
+                        name
+                    ),
+                }
+            }
+            // Now finalize fields on the class.
+            class_id.set_fields(fields);
+        }
+    }
+
     let mut local_func_defs: Vec<&ast::StmtFunctionDef> = Vec::new();
     for stmt in &module.body {
         match stmt {
+            ast::Stmt::ClassDef(_) => {
+                // Already handled in Phase 0.
+            }
             ast::Stmt::FunctionDef(f) => {
                 let sig = collect_signature(f)?;
                 let name = f.name.as_str().to_string();
@@ -163,12 +285,146 @@ fn lower_module_into(
             ),
         }
     }
-    // Pass 2: lower bodies of THIS module's local functions.
+    // Pass 2: lower bodies of THIS module's local functions and class methods.
     for func in local_func_defs {
         let lowered = lower_function(func, signatures)?;
         all_functions.push(lowered);
     }
+    for (class_id, mname, fdef) in local_method_defs {
+        let lowered = lower_method(class_id, &mname, fdef, signatures)?;
+        all_functions.push(lowered);
+    }
     Ok(())
+}
+
+/// Build a FunctionSig for a class method. The first param is `self`
+/// of type Class(class_id), implicitly added (no annotation required
+/// — Python's convention).
+fn collect_method_signature(
+    class_id: ClassId,
+    func: &ast::StmtFunctionDef,
+) -> Result<FunctionSig> {
+    if !func.args.posonlyargs.is_empty() || !func.args.kwonlyargs.is_empty() {
+        bail!(
+            "unsupported_feature: method `{}` may not use positional-only / keyword-only params",
+            func.name
+        );
+    }
+    if func.args.vararg.is_some() || func.args.kwarg.is_some() {
+        bail!(
+            "unsupported_feature: method `{}` may not use *args / **kwargs",
+            func.name
+        );
+    }
+    if !func.decorator_list.is_empty() {
+        bail!(
+            "unsupported_feature: method decorators not yet supported (on `{}`)",
+            func.name
+        );
+    }
+    if func.args.args.is_empty() {
+        bail!(
+            "unsupported_feature: method `{}` must take `self` as its first parameter",
+            func.name
+        );
+    }
+    let first_arg = &func.args.args[0];
+    if first_arg.def.arg.as_str() != "self" {
+        bail!(
+            "unsupported_feature: method `{}` first parameter must be named `self`",
+            func.name
+        );
+    }
+    if first_arg.def.annotation.is_some() {
+        bail!(
+            "unsupported_feature: don't annotate `self` (it's implicit) (on `{}`)",
+            func.name
+        );
+    }
+    let mut params: Vec<Param> = Vec::with_capacity(func.args.args.len());
+    params.push(Param {
+        name: "self".to_string(),
+        ty: Type::Class(class_id),
+    });
+    let mut seen: HashSet<String> = HashSet::new();
+    seen.insert("self".to_string());
+    for arg in func.args.args.iter().skip(1) {
+        let name = arg.def.arg.as_str().to_string();
+        if !seen.insert(name.clone()) {
+            bail!(
+                "unsupported_feature: duplicate parameter `{}` in method `{}`",
+                name,
+                func.name
+            );
+        }
+        let ty = parse_type_annotation(arg.def.annotation.as_deref()).ok_or_else(|| {
+            anyhow!(
+                "unsupported_feature: parameter `{}` of method `{}` must be annotated",
+                name,
+                func.name
+            )
+        })?;
+        params.push(Param { name, ty });
+    }
+    let return_ty = match parse_type_annotation(func.returns.as_deref()) {
+        Some(ty) => ty,
+        // __init__ implicitly returns None — for our model we use
+        // Class(class_id) so the constructor pattern works (the body
+        // ends with `return self` semantics).
+        None if func.name.as_str() == "__init__" => Type::Class(class_id),
+        None => bail!(
+            "unsupported_feature: method `{}` requires a return annotation",
+            func.name
+        ),
+    };
+    if func.args.defaults().next().is_some() {
+        bail!(
+            "unsupported_feature: default args on methods not yet supported (on `{}`)",
+            func.name
+        );
+    }
+    let n = params.len();
+    let defaults: Vec<Option<TypedExpr>> = vec![None; n];
+    Ok(FunctionSig { params, defaults, return_ty })
+}
+
+/// Lower a method body. Same as lower_function but the function's
+/// HIR name is the mangled `<ClassName>.<method>` and the implicit
+/// `__init__` return is `self` (we synthesize it).
+fn lower_method(
+    class_id: ClassId,
+    mangled_name: &str,
+    func: &ast::StmtFunctionDef,
+    signatures: &SignatureTable,
+) -> Result<Function> {
+    let sig = signatures.get(mangled_name).expect("method sig collected");
+    let mut scope: Scope = sig.params.iter().map(|p| (p.name.clone(), p.ty)).collect();
+    if func.body.is_empty() {
+        bail!("unsupported_feature: method `{}` body is empty", func.name);
+    }
+    let mut body = lower_block(&func.body, &mut scope, 0, signatures, sig.return_ty)?;
+    // For __init__: synthesize `return self` if the body doesn't already
+    // end with a return (Python's __init__ implicitly returns None; we
+    // return self so `Foo(...)` evaluates to the instance).
+    if func.name.as_str() == "__init__"
+        && !matches!(body.last(), Some(Stmt::Return { .. }))
+    {
+        body.push(Stmt::Return {
+            value: TypedExpr::new(Type::Class(class_id), Expr::Var("self".to_string())),
+        });
+    }
+    if !block_always_returns(&body) {
+        bail!(
+            "unsupported_feature: not all paths return a value in method `{}`",
+            func.name
+        );
+    }
+    Ok(Function {
+        name: mangled_name.to_string(),
+        params: sig.params.clone(),
+        return_ty: sig.return_ty,
+        body,
+    })
 }
 
 fn collect_signature(func: &ast::StmtFunctionDef) -> Result<FunctionSig> {
@@ -328,10 +584,46 @@ fn lower_block(
     for stmt in stmts {
         match stmt {
             ast::Stmt::Assign(a) => {
-                let name = parse_assign_target(&a.targets)?;
-                let value = lower_expr(&a.value, scope, signatures)?;
-                scope.insert(name.clone(), value.ty);
-                out.push(Stmt::Let { name, value });
+                // Single-target assignment to either:
+                //   - a simple Name           → Stmt::Let
+                //   - an Attribute(obj.field) → Stmt::SetField
+                if a.targets.len() != 1 {
+                    bail!("unsupported_feature: chained assignment `a = b = ...` is not supported");
+                }
+                match &a.targets[0] {
+                    ast::Expr::Name(n) => {
+                        let name = n.id.as_str().to_string();
+                        let value = lower_expr(&a.value, scope, signatures)?;
+                        scope.insert(name.clone(), value.ty);
+                        out.push(Stmt::Let { name, value });
+                    }
+                    ast::Expr::Attribute(attr) => {
+                        let obj = lower_expr(&attr.value, scope, signatures)?;
+                        let class_id = match obj.ty {
+                            Type::Class(id) => id,
+                            other => bail!(
+                                "unsupported_feature: attribute assignment on {} not supported",
+                                other.name()
+                            ),
+                        };
+                        let field_name = attr.attr.as_str();
+                        let field_index = class_id.field_index(field_name).ok_or_else(|| {
+                            anyhow!(
+                                "unsupported_feature: class `{}` has no field `{}`",
+                                class_id.name(),
+                                field_name
+                            )
+                        })?;
+                        let field_ty = class_id.field_ty(field_name).unwrap();
+                        let value = lower_expr(&a.value, scope, signatures)?;
+                        let value = coerce(value, field_ty)?;
+                        out.push(Stmt::SetField { obj, field_index, value });
+                    }
+                    other => bail!(
+                        "unsupported_feature: assignment target `{}` not supported",
+                        expr_kind_name(other)
+                    ),
+                }
             }
             ast::Stmt::AnnAssign(a) => {
                 let name = match a.target.as_ref() {
@@ -625,8 +917,15 @@ fn lower_block(
                         }
                     }
                 }
+                // Allow any Call expression as a stmt (its side effects
+                // matter; the return value is discarded).
+                if matches!(e.value.as_ref(), ast::Expr::Call(_)) {
+                    let lowered = lower_expr(&e.value, scope, signatures)?;
+                    out.push(Stmt::ExprStmt(lowered));
+                    continue;
+                }
                 bail!(
-                    "unsupported_feature: expression statements are only supported for `list.append(...)` calls"
+                    "unsupported_feature: expression statements are only supported for call expressions (and `list.append(...)`)"
                 );
             }
             other => bail!(
@@ -670,7 +969,12 @@ fn parse_type_annotation(ann: Option<&ast::Expr>) -> Option<Type> {
             "i16" => Some(Type::I16),
             "i32" => Some(Type::I32),
             "i64" => Some(Type::I64),
-            _ => None,
+            other => {
+                // User-defined class name?
+                CLASS_REGISTRY
+                    .with(|r| r.borrow().get(other).copied())
+                    .map(Type::Class)
+            }
         },
         // `tuple[T1, T2, ...]` or `list[T]` — Subscript on the type name.
         ast::Expr::Subscript(s) => {
@@ -890,17 +1194,88 @@ fn lower_expr(e: &ast::Expr, scope: &Scope, signatures: &SignatureTable) -> Resu
             Ok(acc)
         }
         ast::Expr::Call(c) => {
+            // Method-call form: `obj.method(args...)` lowers to a regular
+            // call to the mangled function `<ClassName>.<method>` with
+            // obj prepended as `self`.
+            if let ast::Expr::Attribute(attr) = c.func.as_ref() {
+                let obj = lower_expr(&attr.value, scope, signatures)?;
+                if let Type::Class(class_id) = obj.ty {
+                    let method = attr.attr.as_str();
+                    let mangled = format!("{}.{}", class_id.name(), method);
+                    let sig = signatures.get(&mangled).ok_or_else(|| {
+                        anyhow!(
+                            "unsupported_feature: class `{}` has no method `{}`",
+                            class_id.name(),
+                            method
+                        )
+                    })?;
+                    let mut args: Vec<TypedExpr> = Vec::with_capacity(c.args.len() + 1);
+                    args.push(coerce(obj, sig.params[0].ty)?);
+                    if c.args.len() != sig.params.len() - 1 {
+                        bail!(
+                            "unsupported_feature: method `{}.{}` takes {} args, got {}",
+                            class_id.name(),
+                            method,
+                            sig.params.len() - 1,
+                            c.args.len()
+                        );
+                    }
+                    if !c.keywords.is_empty() {
+                        bail!(
+                            "unsupported_feature: keyword args on method calls not supported"
+                        );
+                    }
+                    for (i, a) in c.args.iter().enumerate() {
+                        let raw = lower_expr(a, scope, signatures)?;
+                        args.push(coerce(raw, sig.params[i + 1].ty)?);
+                    }
+                    return Ok(TypedExpr::new(
+                        sig.return_ty,
+                        Expr::Call { callee: mangled, args },
+                    ));
+                }
+                bail!(
+                    "unsupported_feature: method calls only supported on class instances (got {})",
+                    obj.ty.name()
+                );
+            }
             let callee = match c.func.as_ref() {
                 ast::Expr::Name(n) => n.id.as_str().to_string(),
                 _ => bail!(
                     "unsupported_feature: only direct calls to top-level functions are supported"
                 ),
             };
-            // Special-case the small set of supported Python builtins
-            // before the user-defined-function lookup. Builtins shadow
-            // user functions if both exist (matches CPython where the
-            // local function takes priority — but we don't allow
-            // shadowing builtins as a user function name).
+            // Class constructor: `Foo(args)` if Foo is a registered class.
+            if let Some(class_id) = CLASS_REGISTRY.with(|r| r.borrow().get(&callee).copied()) {
+                let init_name = format!("{}.__init__", callee);
+                let init_sig = signatures.get(&init_name).ok_or_else(|| {
+                    anyhow!(
+                        "unsupported_feature: class `{}` has no __init__ method",
+                        callee
+                    )
+                })?;
+                if c.args.len() != init_sig.params.len() - 1 {
+                    bail!(
+                        "unsupported_feature: `{}` __init__ takes {} args, got {}",
+                        callee,
+                        init_sig.params.len() - 1,
+                        c.args.len()
+                    );
+                }
+                if !c.keywords.is_empty() {
+                    bail!("unsupported_feature: keyword args on class constructor not supported");
+                }
+                let mut args: Vec<TypedExpr> = Vec::with_capacity(c.args.len());
+                for (i, a) in c.args.iter().enumerate() {
+                    let raw = lower_expr(a, scope, signatures)?;
+                    args.push(coerce(raw, init_sig.params[i + 1].ty)?);
+                }
+                return Ok(TypedExpr::new(
+                    Type::Class(class_id),
+                    Expr::ClassNew { class: class_id, args },
+                ));
+            }
+            // Special-case Python builtins.
             if let Some(builtin) = lower_builtin_call(&callee, &c.args, &c.keywords, scope, signatures)? {
                 return Ok(builtin);
             }
@@ -909,6 +1284,35 @@ fn lower_expr(e: &ast::Expr, scope: &Scope, signatures: &SignatureTable) -> Resu
             })?;
             let args = resolve_call_args(&callee, sig, &c.args, &c.keywords, scope, signatures)?;
             Ok(TypedExpr::new(sig.return_ty, Expr::Call { callee, args }))
+        }
+        ast::Expr::Attribute(attr) => {
+            // Field read: `obj.field`. Method references (e.g. assigning
+            // `f = obj.method`) are not supported — methods are only
+            // callable directly via `obj.method(args)`, handled in Call.
+            let obj = lower_expr(&attr.value, scope, signatures)?;
+            let class_id = match obj.ty {
+                Type::Class(id) => id,
+                other => bail!(
+                    "unsupported_feature: attribute access on non-class type {} not supported",
+                    other.name()
+                ),
+            };
+            let field_name = attr.attr.as_str();
+            let field_index = class_id.field_index(field_name).ok_or_else(|| {
+                anyhow!(
+                    "unsupported_feature: class `{}` has no field `{}`",
+                    class_id.name(),
+                    field_name
+                )
+            })?;
+            let field_ty = class_id.field_ty(field_name).unwrap();
+            Ok(TypedExpr::new(
+                field_ty,
+                Expr::FieldGet {
+                    obj: Box::new(obj),
+                    field_index,
+                },
+            ))
         }
         ast::Expr::Tuple(t) => {
             let elements: Result<Vec<TypedExpr>> = t

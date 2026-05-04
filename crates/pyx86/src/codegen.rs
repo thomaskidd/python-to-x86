@@ -61,7 +61,7 @@ pub fn emit_ll(prog: &Program, source_basename: &str) -> String {
     let print_block = match main_fn.return_ty {
         Type::I64 => "  %fmt = getelementptr inbounds [5 x i8], [5 x i8]* @.fmt_i64, i64 0, i64 0\n  call i32 (i8*, ...) @printf(i8* %fmt, i64 %r)".to_string(),
         Type::F64 => "  call void @pyx86_print_f64(double %r)".to_string(),
-        Type::I8 | Type::I16 | Type::I32 | Type::Bool | Type::Tuple(_) | Type::List(_) | Type::Str | Type::Dict(_) => {
+        Type::I8 | Type::I16 | Type::I32 | Type::Bool | Type::Tuple(_) | Type::List(_) | Type::Str | Type::Dict(_) | Type::Class(_) => {
             unreachable!("check rejects non-(I64|F64) main return types")
         }
     };
@@ -389,6 +389,20 @@ fn llvm_ty(ty: Type) -> String {
         // Same shape as a list — the slot array layout differs but the
         // outer struct has the same {len, cap, ptr} fields.
         Type::Dict(_) => "{ i64, i64, i8* }*".to_string(),
+        Type::Class(id) => {
+            let inner = id
+                .fields()
+                .iter()
+                .map(|(_, t)| llvm_ty(*t))
+                .collect::<Vec<_>>()
+                .join(", ");
+            // Empty class → use a single-byte placeholder so malloc(0) is fine.
+            if inner.is_empty() {
+                "{ i8 }*".to_string()
+            } else {
+                format!("{{ {} }}*", inner)
+            }
+        }
     }
 }
 
@@ -403,7 +417,13 @@ fn type_byte_size(ty: Type) -> u64 {
         Type::List(_) => 8,
         Type::Str => 16,
         Type::Dict(_) => 8,
+        Type::Class(_) => 8, // pointer
     }
+}
+
+/// Total bytes of all fields of a class (heap-alloc size).
+fn class_byte_size(id: crate::hir::ClassId) -> u64 {
+    id.fields().iter().map(|(_, t)| type_byte_size(*t)).sum::<u64>().max(1)
 }
 
 fn format_signature(func: &Function) -> String {
@@ -443,7 +463,7 @@ fn format_argv_parsing(func: &Function) -> String {
                     i = i
                 );
             }
-            Type::I8 | Type::I16 | Type::I32 | Type::Bool | Type::Tuple(_) | Type::List(_) | Type::Str | Type::Dict(_) => {
+            Type::I8 | Type::I16 | Type::I32 | Type::Bool | Type::Tuple(_) | Type::List(_) | Type::Str | Type::Dict(_) | Type::Class(_) => {
                 unreachable!("check rejects non-(I64|F64) main params")
             }
         }
@@ -621,6 +641,12 @@ impl Codegen {
                 Stmt::ListAppend { list, value } => {
                     self.lower_list_append(list, value);
                 }
+                Stmt::SetField { obj, field_index, value } => {
+                    self.lower_set_field(obj, *field_index, value);
+                }
+                Stmt::ExprStmt(e) => {
+                    let _ = self.lower(e);
+                }
                 Stmt::Continue => {
                     let (cnt, _) = self
                         .loop_targets
@@ -681,6 +707,8 @@ impl Codegen {
             Expr::DictGet { dict, key } => self.lower_dict_get(dict, key),
             Expr::DictHas { dict, key } => self.lower_dict_has(dict, key),
             Expr::DictLen { dict } => self.lower_dict_len(dict),
+            Expr::FieldGet { obj, field_index } => self.lower_field_get(obj, *field_index, te.ty),
+            Expr::ClassNew { class, args } => self.lower_class_new(*class, args),
         }
     }
 
@@ -1440,6 +1468,85 @@ impl Codegen {
         dst
     }
 
+    /// Read a field from a class instance. Just GEP + load.
+    fn lower_field_get(&mut self, obj: &TypedExpr, field_index: usize, result_ty: Type) -> String {
+        let obj_op = self.lower(obj);
+        let class_id = match obj.ty {
+            Type::Class(id) => id,
+            _ => panic!("internal: field_get on non-class"),
+        };
+        let class_llvm = llvm_ty(obj.ty);
+        // class_llvm is "{ ... }*"; strip trailing '*' to get the struct type.
+        let struct_ty = class_llvm.trim_end_matches('*').trim_end().to_string();
+        let _ = class_id;
+        let p = self.fresh();
+        self.emit(&format!(
+            "{} = getelementptr {sty}, {sty}* {}, i32 0, i32 {}",
+            p, obj_op, field_index,
+            sty = struct_ty
+        ));
+        let dst = self.fresh();
+        self.emit(&format!(
+            "{} = load {ft}, {ft}* {}",
+            dst, p,
+            ft = llvm_ty(result_ty)
+        ));
+        dst
+    }
+
+    /// `Foo(args...)` — allocate the struct on the heap and call
+    /// `Foo.__init__(self_ptr, args...)`. The init function returns
+    /// the same self_ptr (we synthesize that in check.rs).
+    fn lower_class_new(&mut self, class_id: crate::hir::ClassId, args: &[TypedExpr]) -> String {
+        let class_llvm = llvm_ty(Type::Class(class_id));
+        let struct_ty = class_llvm.trim_end_matches('*').trim_end().to_string();
+        let bytes = class_byte_size(class_id);
+        let raw = self.fresh();
+        self.emit(&format!("{} = call i8* @malloc(i64 {})", raw, bytes));
+        let self_p = self.fresh();
+        self.emit(&format!(
+            "{} = bitcast i8* {} to {sty}*",
+            self_p, raw,
+            sty = struct_ty
+        ));
+        // Call __init__(self_ptr, args...). The init signature has
+        // self as the first param.
+        let arg_ops: Vec<String> = args.iter().map(|a| self.lower(a)).collect();
+        let mut call_args: Vec<String> =
+            vec![format!("{sty}* {}", self_p, sty = struct_ty)];
+        for (op, ty) in arg_ops.iter().zip(args.iter().map(|a| a.ty)) {
+            call_args.push(format!("{} {}", llvm_ty(ty), op));
+        }
+        let dst = self.fresh();
+        self.emit(&format!(
+            "{} = call {sty}* @py_{}.__init__({})",
+            dst,
+            class_id.name(),
+            call_args.join(", "),
+            sty = struct_ty
+        ));
+        dst
+    }
+
+    /// `obj.field = value` — GEP + store.
+    fn lower_set_field(&mut self, obj: &TypedExpr, field_index: usize, value: &TypedExpr) {
+        let obj_op = self.lower(obj);
+        let value_op = self.lower(value);
+        let class_llvm = llvm_ty(obj.ty);
+        let struct_ty = class_llvm.trim_end_matches('*').trim_end().to_string();
+        let p = self.fresh();
+        self.emit(&format!(
+            "{} = getelementptr {sty}, {sty}* {}, i32 0, i32 {}",
+            p, obj_op, field_index,
+            sty = struct_ty
+        ));
+        self.emit(&format!(
+            "store {ft} {}, {ft}* {}",
+            value_op, p,
+            ft = llvm_ty(value.ty)
+        ));
+    }
+
     fn lower_math_call(&mut self, intrinsic: &str, arg: &TypedExpr) -> String {
         let v = self.lower(arg);
         let dst = self.fresh();
@@ -1692,6 +1799,11 @@ fn walk_stmts(stmts: &[Stmt], out: &mut Vec<(String, Type)>, seen: &mut HashSet<
                 walk_expr(list, out, seen);
                 walk_expr(value, out, seen);
             }
+            Stmt::SetField { obj, value, .. } => {
+                walk_expr(obj, out, seen);
+                walk_expr(value, out, seen);
+            }
+            Stmt::ExprStmt(e) => walk_expr(e, out, seen),
             Stmt::If { cond, then_body, else_body } => {
                 walk_expr(cond, out, seen);
                 walk_stmts(then_body, out, seen);
@@ -1762,6 +1874,12 @@ fn walk_expr(te: &TypedExpr, out: &mut Vec<(String, Type)>, seen: &mut HashSet<S
             walk_expr(key, out, seen);
         }
         Expr::DictLen { dict } => walk_expr(dict, out, seen),
+        Expr::FieldGet { obj, .. } => walk_expr(obj, out, seen),
+        Expr::ClassNew { args, .. } => {
+            for a in args {
+                walk_expr(a, out, seen);
+            }
+        }
     }
 }
 

@@ -26,10 +26,66 @@ pub struct ListId(u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct DictId(u32);
 
+/// Identifier for a class definition. Each `class Foo:` gets a unique
+/// id; same-named class redefinitions are rejected by check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ClassId(u32);
+
+#[derive(Debug, Clone)]
+pub struct ClassDef {
+    pub name: String,
+    /// (field_name, field_type) in declaration order.
+    pub fields: Vec<(String, Type)>,
+}
+
 thread_local! {
     static TUPLE_ARENA: RefCell<Vec<Vec<Type>>> = const { RefCell::new(Vec::new()) };
     static LIST_ARENA: RefCell<Vec<Type>> = const { RefCell::new(Vec::new()) };
     static DICT_ARENA: RefCell<Vec<(Type, Type)>> = const { RefCell::new(Vec::new()) };
+    static CLASS_ARENA: RefCell<Vec<ClassDef>> = const { RefCell::new(Vec::new()) };
+}
+
+impl ClassId {
+    pub fn intern(def: ClassDef) -> ClassId {
+        CLASS_ARENA.with(|a| {
+            let mut a = a.borrow_mut();
+            let id = a.len() as u32;
+            a.push(def);
+            ClassId(id)
+        })
+    }
+    pub fn name(self) -> String {
+        CLASS_ARENA.with(|a| a.borrow()[self.0 as usize].name.clone())
+    }
+    pub fn fields(self) -> Vec<(String, Type)> {
+        CLASS_ARENA.with(|a| a.borrow()[self.0 as usize].fields.clone())
+    }
+    pub fn field_index(self, name: &str) -> Option<usize> {
+        CLASS_ARENA.with(|a| {
+            a.borrow()[self.0 as usize]
+                .fields
+                .iter()
+                .position(|(n, _)| n == name)
+        })
+    }
+    pub fn field_ty(self, name: &str) -> Option<Type> {
+        CLASS_ARENA.with(|a| {
+            a.borrow()[self.0 as usize]
+                .fields
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, t)| *t)
+        })
+    }
+    /// Set the fields after pre-registration. Used by check to allow
+    /// class names to be referenced (e.g. as method param types) before
+    /// the field list is fully built.
+    pub fn set_fields(self, fields: Vec<(String, Type)>) {
+        CLASS_ARENA.with(|a| {
+            let mut a = a.borrow_mut();
+            a[self.0 as usize].fields = fields;
+        })
+    }
 }
 
 impl DictId {
@@ -141,6 +197,10 @@ pub enum Type {
     /// Read-only operations only: literal, lookup `d[k]`, len, `k in d`.
     /// Mutation (`d[k] = v`) deferred to a follow-up.
     Dict(DictId),
+    /// User-defined class instance. Stored as a heap-allocated struct
+    /// pointer; ref-semantics like Python objects. Fields and methods
+    /// resolved against the ClassDef in the arena.
+    Class(ClassId),
 }
 
 impl Type {
@@ -165,6 +225,7 @@ impl Type {
             Type::List(id) => format!("list[{}]", id.elem().name()),
             Type::Str => "str".to_string(),
             Type::Dict(id) => format!("dict[{}, {}]", id.key().name(), id.val().name()),
+            Type::Class(id) => id.name(),
         }
     }
     /// Width of the integer type in bits, or None for non-int types.
@@ -231,6 +292,16 @@ pub enum Stmt {
     /// `<list>.append(<value>)`. List must be a Var (so codegen knows
     /// which slot to mutate); same shared heap struct as Python.
     ListAppend { list: TypedExpr, value: TypedExpr },
+    /// `<obj>.<field> = <value>`. The obj expression evaluates to a
+    /// class instance pointer; the field index is resolved at check.
+    SetField {
+        obj: TypedExpr,
+        field_index: usize,
+        value: TypedExpr,
+    },
+    /// Expression evaluated for its side effect; result discarded.
+    /// Currently only used for Call expressions in stmt position.
+    ExprStmt(TypedExpr),
 }
 
 /// An expression annotated with its result type. Operands inside `expr`
@@ -323,6 +394,14 @@ pub enum Expr {
     DictHas { dict: Box<TypedExpr>, key: Box<TypedExpr> },
     /// `len(d)` — returns I64.
     DictLen { dict: Box<TypedExpr> },
+    /// Read a field of a class instance: `obj.field`. The field index
+    /// is resolved by check at lower time.
+    FieldGet { obj: Box<TypedExpr>, field_index: usize },
+    /// Construct a class instance: `Foo(args...)`. Allocates the
+    /// struct on the heap and calls `__init__(self, args...)` which
+    /// is the regular top-level function with mangled name
+    /// `Foo.__init__`.
+    ClassNew { class: ClassId, args: Vec<TypedExpr> },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
