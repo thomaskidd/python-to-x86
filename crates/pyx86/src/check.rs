@@ -5,8 +5,8 @@ use anyhow::{anyhow, bail, Context, Result};
 use rustpython_parser::ast;
 
 use crate::hir::{
-    BinOp, BoolOp, CmpOp, Expr, Function, ListId, Param, Program, Stmt, TupleId, Type, TypedExpr,
-    UnaryOp,
+    BinOp, BoolOp, CmpOp, DictId, Expr, Function, ListId, Param, Program, Stmt, TupleId, Type,
+    TypedExpr, UnaryOp,
 };
 use crate::parser;
 use crate::parser::Module;
@@ -691,9 +691,25 @@ fn parse_type_annotation(ann: Option<&ast::Expr>) -> Option<Type> {
                     Some(Type::Tuple(TupleId::intern(elems)))
                 }
                 "list" => {
-                    // `list[T]` — single element type.
                     let elem = parse_type_annotation(Some(s.slice.as_ref()))?;
                     Some(Type::List(ListId::intern(elem)))
+                }
+                "dict" => {
+                    // `dict[K, V]` — slice is a Tuple.
+                    let elem_exprs: Vec<&ast::Expr> = match s.slice.as_ref() {
+                        ast::Expr::Tuple(t) => t.elts.iter().collect(),
+                        _ => return None,
+                    };
+                    if elem_exprs.len() != 2 {
+                        return None;
+                    }
+                    let k = parse_type_annotation(Some(elem_exprs[0]))?;
+                    let v = parse_type_annotation(Some(elem_exprs[1]))?;
+                    // v0.26: only I64 keys + I64 values.
+                    if k != Type::I64 || v != Type::I64 {
+                        return None;
+                    }
+                    Some(Type::Dict(DictId::intern(k, v)))
                 }
                 _ => None,
             }
@@ -775,6 +791,35 @@ fn lower_expr(e: &ast::Expr, scope: &Scope, signatures: &SignatureTable) -> Resu
             }
         }
         ast::Expr::Compare(c) => {
+            // Special case: single-comparison `k in <container>` /
+            // `k not in <container>`. Dispatched by container type.
+            if c.ops.len() == 1
+                && matches!(c.ops[0], ast::CmpOp::In | ast::CmpOp::NotIn)
+            {
+                let key = lower_expr(&c.left, scope, signatures)?;
+                let container = lower_expr(&c.comparators[0], scope, signatures)?;
+                let negated = matches!(c.ops[0], ast::CmpOp::NotIn);
+                let result = match container.ty {
+                    Type::Dict(id) => {
+                        let key = coerce(key, id.key())?;
+                        TypedExpr::new(
+                            Type::Bool,
+                            Expr::DictHas {
+                                dict: Box::new(container),
+                                key: Box::new(key),
+                            },
+                        )
+                    }
+                    other => bail!(
+                        "unsupported_feature: `in` / `not in` on {} not supported (only dict so far)",
+                        other.name()
+                    ),
+                };
+                if negated {
+                    return Ok(TypedExpr::new(Type::Bool, Expr::Not(Box::new(result))));
+                }
+                return Ok(result);
+            }
             let first = lower_expr(&c.left, scope, signatures)?;
             let rest_ops: Result<Vec<(CmpOp, TypedExpr)>> = c
                 .ops
@@ -878,6 +923,30 @@ fn lower_expr(e: &ast::Expr, scope: &Scope, signatures: &SignatureTable) -> Resu
                 Type::Tuple(id),
                 Expr::TupleLit { elements },
             ))
+        }
+        ast::Expr::Dict(d) => {
+            // `{k: v, ...}` literal. v0.26: I64 → I64 only.
+            // Empty `{}` is rejected for now (no annotation pickup like
+            // empty list — could be added with the same re-tag trick).
+            if d.keys.is_empty() {
+                bail!(
+                    "unsupported_feature: empty dict literal `{{}}` not yet supported (annotate explicitly when implemented)"
+                );
+            }
+            // dict.keys is Vec<Option<Expr>> where None means **unpack.
+            let mut entries: Vec<(TypedExpr, TypedExpr)> = Vec::with_capacity(d.keys.len());
+            for (k, v) in d.keys.iter().zip(d.values.iter()) {
+                let k = k.as_ref().ok_or_else(|| {
+                    anyhow!("unsupported_feature: dict `**` unpacking is not supported")
+                })?;
+                let lk = lower_expr(k, scope, signatures)?;
+                let lv = lower_expr(v, scope, signatures)?;
+                let lk = coerce(lk, Type::I64)?;
+                let lv = coerce(lv, Type::I64)?;
+                entries.push((lk, lv));
+            }
+            let id = DictId::intern(Type::I64, Type::I64);
+            Ok(TypedExpr::new(Type::Dict(id), Expr::DictLit { entries }))
         }
         ast::Expr::ListComp(comp) => {
             // [<elt> for <target> in <iter> (if <cond>)*]
@@ -1149,6 +1218,18 @@ fn lower_expr(e: &ast::Expr, scope: &Scope, signatures: &SignatureTable) -> Resu
                     Expr::ListIndex {
                         list: Box::new(value),
                         index: Box::new(index),
+                    },
+                ));
+            }
+            // Dict subscripting → DictGet.
+            if let Type::Dict(id) = value.ty {
+                let key = lower_expr(&s.slice, scope, signatures)?;
+                let key = coerce(key, id.key())?;
+                return Ok(TypedExpr::new(
+                    id.val(),
+                    Expr::DictGet {
+                        dict: Box::new(value),
+                        key: Box::new(key),
                     },
                 ));
             }
@@ -1617,8 +1698,12 @@ fn lower_builtin_call(
                     Type::I64,
                     Expr::StrLen { s: Box::new(inner) },
                 ))),
+                Type::Dict(_) => Ok(Some(TypedExpr::new(
+                    Type::I64,
+                    Expr::DictLen { dict: Box::new(inner) },
+                ))),
                 other => bail!(
-                    "unsupported_feature: len() not supported on {} (only list/tuple/str)",
+                    "unsupported_feature: len() not supported on {} (only list/tuple/str/dict)",
                     other.name()
                 ),
             }
@@ -1782,8 +1867,11 @@ fn convert_cmp_op(op: &ast::CmpOp) -> Result<CmpOp> {
         ast::CmpOp::Is | ast::CmpOp::IsNot => bail!(
             "unsupported_feature: `is` / `is not` are not supported (only allowed against `None` in later slices)"
         ),
-        ast::CmpOp::In | ast::CmpOp::NotIn => bail!(
-            "unsupported_feature: `in` / `not in` are not supported (need container types first)"
+        // `In`/`NotIn` are handled out-of-band in lower_expr (Compare),
+        // since they need RHS-type-driven dispatch (DictHas vs ListIn etc.).
+        // Reaching here is an internal bug.
+        ast::CmpOp::In | ast::CmpOp::NotIn => unreachable!(
+            "in/not in should have been handled before reaching convert_cmp_op"
         ),
     })
 }

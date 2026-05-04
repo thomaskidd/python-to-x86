@@ -21,9 +21,37 @@ pub struct TupleId(u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ListId(u32);
 
+/// Identifier for an interned (key, value) pair for a dict type.
+/// Two `dict[int, float]` types share the same `DictId`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DictId(u32);
+
 thread_local! {
     static TUPLE_ARENA: RefCell<Vec<Vec<Type>>> = const { RefCell::new(Vec::new()) };
     static LIST_ARENA: RefCell<Vec<Type>> = const { RefCell::new(Vec::new()) };
+    static DICT_ARENA: RefCell<Vec<(Type, Type)>> = const { RefCell::new(Vec::new()) };
+}
+
+impl DictId {
+    pub fn intern(key: Type, value: Type) -> DictId {
+        DICT_ARENA.with(|a| {
+            let mut a = a.borrow_mut();
+            for (i, (k, v)) in a.iter().enumerate() {
+                if *k == key && *v == value {
+                    return DictId(i as u32);
+                }
+            }
+            let id = a.len() as u32;
+            a.push((key, value));
+            DictId(id)
+        })
+    }
+    pub fn key(self) -> Type {
+        DICT_ARENA.with(|a| a.borrow()[self.0 as usize].0)
+    }
+    pub fn val(self) -> Type {
+        DICT_ARENA.with(|a| a.borrow()[self.0 as usize].1)
+    }
 }
 
 impl ListId {
@@ -106,6 +134,13 @@ pub enum Type {
     /// literal, len, concat, ==/!=. Subscripting, slicing, methods
     /// deferred.
     Str,
+    /// Heap-allocated dict[K, V]. Stored as a pointer to
+    /// `{ i64 size, i64 cap, i8* slots }`. v0.26: K must be I64,
+    /// V must be I64 (extension to other types is mostly mechanical
+    /// — needs hash function per K type and stride per V type).
+    /// Read-only operations only: literal, lookup `d[k]`, len, `k in d`.
+    /// Mutation (`d[k] = v`) deferred to a follow-up.
+    Dict(DictId),
 }
 
 impl Type {
@@ -129,6 +164,7 @@ impl Type {
             }
             Type::List(id) => format!("list[{}]", id.elem().name()),
             Type::Str => "str".to_string(),
+            Type::Dict(id) => format!("dict[{}, {}]", id.key().name(), id.val().name()),
         }
     }
     /// Width of the integer type in bits, or None for non-int types.
@@ -277,6 +313,16 @@ pub enum Expr {
     /// LLVM symbol to invoke (e.g. `llvm.sqrt.f64`, `tan`). Single-arg
     /// f64 → f64 only in v0.24.
     MathCall { intrinsic: &'static str, arg: Box<TypedExpr> },
+    /// Construct a dict from N (key, value) pairs.
+    DictLit { entries: Vec<(TypedExpr, TypedExpr)> },
+    /// `d[k]` — runtime hash lookup. Returns the value or, on miss,
+    /// returns the value-type's zero (Python raises KeyError; we
+    /// don't have exceptions yet — documented divergence).
+    DictGet { dict: Box<TypedExpr>, key: Box<TypedExpr> },
+    /// `k in d` — returns Bool.
+    DictHas { dict: Box<TypedExpr>, key: Box<TypedExpr> },
+    /// `len(d)` — returns I64.
+    DictLen { dict: Box<TypedExpr> },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
