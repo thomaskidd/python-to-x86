@@ -61,7 +61,7 @@ pub fn emit_ll(prog: &Program, source_basename: &str) -> String {
     let print_block = match main_fn.return_ty {
         Type::I64 => "  %fmt = getelementptr inbounds [5 x i8], [5 x i8]* @.fmt_i64, i64 0, i64 0\n  call i32 (i8*, ...) @printf(i8* %fmt, i64 %r)".to_string(),
         Type::F64 => "  call void @pyx86_print_f64(double %r)".to_string(),
-        Type::I8 | Type::I16 | Type::I32 | Type::Bool | Type::Tuple(_) | Type::List(_) | Type::Str => {
+        Type::I8 | Type::I16 | Type::I32 | Type::Bool | Type::Tuple(_) | Type::List(_) | Type::Str | Type::Dict(_) => {
             unreachable!("check rejects non-(I64|F64) main return types")
         }
     };
@@ -80,6 +80,7 @@ declare i8* @malloc(i64)
 declare i8* @realloc(i8*, i64)
 declare i32 @memcmp(i8*, i8*, i64)
 declare void @llvm.memcpy.p0i8.p0i8.i64(i8*, i8*, i64, i1)
+declare void @llvm.memset.p0i8.i64(i8*, i8, i64, i1)
 declare double @llvm.sqrt.f64(double)
 declare double @llvm.sin.f64(double)
 declare double @llvm.cos.f64(double)
@@ -184,6 +185,136 @@ not_found:
   ret i1 false
 }
 
+; ---------------------------------------------------------------------
+; pyx86_dict_i64_lookup / pyx86_dict_i64_insert / pyx86_dict_i64_has
+; Hash-table runtime for dict[i64, i64]. Open addressing with linear
+; probing; cap is always a power of two; slot layout
+;   { i64 key, i64 value, i64 occupied (0 or 1) }
+; (24 bytes per slot — wasteful but simple). Hash of i64 key is
+; `key & (cap - 1)`.
+; ---------------------------------------------------------------------
+
+define internal i64 @pyx86_dict_i64_lookup(i8* %table_raw, i64 %key) {
+entry:
+  %tp = bitcast i8* %table_raw to { i64, i64, i8* }*
+  %cap_p = getelementptr { i64, i64, i8* }, { i64, i64, i8* }* %tp, i32 0, i32 1
+  %cap = load i64, i64* %cap_p
+  %slots_pp = getelementptr { i64, i64, i8* }, { i64, i64, i8* }* %tp, i32 0, i32 2
+  %slots_raw = load i8*, i8** %slots_pp
+  %slots = bitcast i8* %slots_raw to { i64, i64, i64 }*
+  %mask = sub i64 %cap, 1
+  %h = and i64 %key, %mask
+  %i.addr = alloca i64
+  store i64 %h, i64* %i.addr
+  br label %loop
+loop:
+  %i = load i64, i64* %i.addr
+  %slot = getelementptr { i64, i64, i64 }, { i64, i64, i64 }* %slots, i64 %i
+  %occ_p = getelementptr { i64, i64, i64 }, { i64, i64, i64 }* %slot, i32 0, i32 2
+  %occ = load i64, i64* %occ_p
+  %is_empty = icmp eq i64 %occ, 0
+  br i1 %is_empty, label %not_found, label %check
+check:
+  %k_p = getelementptr { i64, i64, i64 }, { i64, i64, i64 }* %slot, i32 0, i32 0
+  %k = load i64, i64* %k_p
+  %match = icmp eq i64 %k, %key
+  br i1 %match, label %found, label %next
+next:
+  %i_next = add i64 %i, 1
+  %i_wrap = and i64 %i_next, %mask
+  store i64 %i_wrap, i64* %i.addr
+  br label %loop
+found:
+  %v_p = getelementptr { i64, i64, i64 }, { i64, i64, i64 }* %slot, i32 0, i32 1
+  %v = load i64, i64* %v_p
+  ret i64 %v
+not_found:
+  ret i64 0
+}
+
+define internal void @pyx86_dict_i64_insert(i8* %table_raw, i64 %key, i64 %value) {
+entry:
+  %tp = bitcast i8* %table_raw to { i64, i64, i8* }*
+  %size_p = getelementptr { i64, i64, i8* }, { i64, i64, i8* }* %tp, i32 0, i32 0
+  %cap_p = getelementptr { i64, i64, i8* }, { i64, i64, i8* }* %tp, i32 0, i32 1
+  %cap = load i64, i64* %cap_p
+  %slots_pp = getelementptr { i64, i64, i8* }, { i64, i64, i8* }* %tp, i32 0, i32 2
+  %slots_raw = load i8*, i8** %slots_pp
+  %slots = bitcast i8* %slots_raw to { i64, i64, i64 }*
+  %mask = sub i64 %cap, 1
+  %h = and i64 %key, %mask
+  %i.addr = alloca i64
+  store i64 %h, i64* %i.addr
+  br label %loop
+loop:
+  %i = load i64, i64* %i.addr
+  %slot = getelementptr { i64, i64, i64 }, { i64, i64, i64 }* %slots, i64 %i
+  %occ_p = getelementptr { i64, i64, i64 }, { i64, i64, i64 }* %slot, i32 0, i32 2
+  %occ = load i64, i64* %occ_p
+  %is_empty = icmp eq i64 %occ, 0
+  br i1 %is_empty, label %do_insert, label %check
+check:
+  %k_p = getelementptr { i64, i64, i64 }, { i64, i64, i64 }* %slot, i32 0, i32 0
+  %k = load i64, i64* %k_p
+  %match = icmp eq i64 %k, %key
+  br i1 %match, label %do_overwrite, label %next
+next:
+  %i_next = add i64 %i, 1
+  %i_wrap = and i64 %i_next, %mask
+  store i64 %i_wrap, i64* %i.addr
+  br label %loop
+do_insert:
+  %k_p2 = getelementptr { i64, i64, i64 }, { i64, i64, i64 }* %slot, i32 0, i32 0
+  store i64 %key, i64* %k_p2
+  %v_p = getelementptr { i64, i64, i64 }, { i64, i64, i64 }* %slot, i32 0, i32 1
+  store i64 %value, i64* %v_p
+  store i64 1, i64* %occ_p
+  %old_size = load i64, i64* %size_p
+  %new_size = add i64 %old_size, 1
+  store i64 %new_size, i64* %size_p
+  ret void
+do_overwrite:
+  %v_p2 = getelementptr { i64, i64, i64 }, { i64, i64, i64 }* %slot, i32 0, i32 1
+  store i64 %value, i64* %v_p2
+  ret void
+}
+
+define internal i1 @pyx86_dict_i64_has(i8* %table_raw, i64 %key) {
+entry:
+  %tp = bitcast i8* %table_raw to { i64, i64, i8* }*
+  %cap_p = getelementptr { i64, i64, i8* }, { i64, i64, i8* }* %tp, i32 0, i32 1
+  %cap = load i64, i64* %cap_p
+  %slots_pp = getelementptr { i64, i64, i8* }, { i64, i64, i8* }* %tp, i32 0, i32 2
+  %slots_raw = load i8*, i8** %slots_pp
+  %slots = bitcast i8* %slots_raw to { i64, i64, i64 }*
+  %mask = sub i64 %cap, 1
+  %h = and i64 %key, %mask
+  %i.addr = alloca i64
+  store i64 %h, i64* %i.addr
+  br label %loop
+loop:
+  %i = load i64, i64* %i.addr
+  %slot = getelementptr { i64, i64, i64 }, { i64, i64, i64 }* %slots, i64 %i
+  %occ_p = getelementptr { i64, i64, i64 }, { i64, i64, i64 }* %slot, i32 0, i32 2
+  %occ = load i64, i64* %occ_p
+  %is_empty = icmp eq i64 %occ, 0
+  br i1 %is_empty, label %not_found, label %check
+check:
+  %k_p = getelementptr { i64, i64, i64 }, { i64, i64, i64 }* %slot, i32 0, i32 0
+  %k = load i64, i64* %k_p
+  %match = icmp eq i64 %k, %key
+  br i1 %match, label %found, label %next
+next:
+  %i_next = add i64 %i, 1
+  %i_wrap = and i64 %i_next, %mask
+  store i64 %i_wrap, i64* %i.addr
+  br label %loop
+found:
+  ret i1 true
+not_found:
+  ret i1 false
+}
+
 ; pyx86_pow_i64(base, exp) — int ** by binary exponentiation. For
 ; exp < 0 returns 0 (Python returns float; we have no float printer
 ; on main return, but local float values do exist — float**float
@@ -255,6 +386,9 @@ fn llvm_ty(ty: Type) -> String {
         // is bitcast to the element-typed pointer at index/append time.
         Type::List(_) => "{ i64, i64, i8* }*".to_string(),
         Type::Str => "{ i64, i8* }".to_string(),
+        // Same shape as a list — the slot array layout differs but the
+        // outer struct has the same {len, cap, ptr} fields.
+        Type::Dict(_) => "{ i64, i64, i8* }*".to_string(),
     }
 }
 
@@ -266,8 +400,9 @@ fn type_byte_size(ty: Type) -> u64 {
         Type::I32 => 4,
         Type::I64 | Type::F64 => 8,
         Type::Tuple(id) => id.with_elems(|elems| elems.iter().map(|t| type_byte_size(*t)).sum()),
-        Type::List(_) => 8, // pointer to heap struct
+        Type::List(_) => 8,
         Type::Str => 16,
+        Type::Dict(_) => 8,
     }
 }
 
@@ -308,7 +443,7 @@ fn format_argv_parsing(func: &Function) -> String {
                     i = i
                 );
             }
-            Type::I8 | Type::I16 | Type::I32 | Type::Bool | Type::Tuple(_) | Type::List(_) | Type::Str => {
+            Type::I8 | Type::I16 | Type::I32 | Type::Bool | Type::Tuple(_) | Type::List(_) | Type::Str | Type::Dict(_) => {
                 unreachable!("check rejects non-(I64|F64) main params")
             }
         }
@@ -542,6 +677,10 @@ impl Codegen {
             Expr::StrLen { s } => self.lower_str_len(s),
             Expr::StrEq { lhs, rhs, negated } => self.lower_str_eq(lhs, rhs, *negated),
             Expr::MathCall { intrinsic, arg } => self.lower_math_call(intrinsic, arg),
+            Expr::DictLit { entries } => self.lower_dict_lit(entries, te.ty),
+            Expr::DictGet { dict, key } => self.lower_dict_get(dict, key),
+            Expr::DictHas { dict, key } => self.lower_dict_has(dict, key),
+            Expr::DictLen { dict } => self.lower_dict_len(dict),
         }
     }
 
@@ -1193,6 +1332,114 @@ impl Codegen {
         p
     }
 
+    /// Build a dict[i64, i64] literal: allocate the outer struct +
+    /// the slot array (cap = next pow2 >= 2*N, min 4), then call
+    /// pyx86_dict_i64_insert for each (k, v) pair.
+    fn lower_dict_lit(&mut self, entries: &[(TypedExpr, TypedExpr)], _dict_ty: Type) -> String {
+        // Compute cap: next pow2 >= max(2 * entries.len(), 4).
+        let n = entries.len();
+        let want = (n * 2).max(4);
+        let mut cap: u64 = 4;
+        while (cap as usize) < want {
+            cap *= 2;
+        }
+        // Slot size = 24 bytes ({i64, i64, i64}).
+        let slot_bytes = cap * 24;
+
+        // Allocate the slot array (zeroed via calloc-style: malloc + memset 0).
+        let slots_raw = self.fresh();
+        self.emit(&format!("{} = call i8* @malloc(i64 {})", slots_raw, slot_bytes));
+        // Zero it. Use memcpy from a zeroed buffer? Easier: another helper.
+        // Use llvm.memset:
+        self.emit(&format!(
+            "call void @llvm.memset.p0i8.i64(i8* {}, i8 0, i64 {}, i1 false)",
+            slots_raw, slot_bytes
+        ));
+
+        // Allocate outer struct.
+        let table_raw = self.fresh();
+        self.emit(&format!("{} = call i8* @malloc(i64 24)", table_raw));
+        let tp = self.fresh();
+        self.emit(&format!(
+            "{} = bitcast i8* {} to {{ i64, i64, i8* }}*",
+            tp, table_raw
+        ));
+        // size = 0 (insert increments)
+        let size_p = self.fresh();
+        self.emit(&format!(
+            "{} = getelementptr {{ i64, i64, i8* }}, {{ i64, i64, i8* }}* {}, i32 0, i32 0",
+            size_p, tp
+        ));
+        self.emit(&format!("store i64 0, i64* {}", size_p));
+        let cap_p = self.fresh();
+        self.emit(&format!(
+            "{} = getelementptr {{ i64, i64, i8* }}, {{ i64, i64, i8* }}* {}, i32 0, i32 1",
+            cap_p, tp
+        ));
+        self.emit(&format!("store i64 {}, i64* {}", cap, cap_p));
+        let slots_p = self.fresh();
+        self.emit(&format!(
+            "{} = getelementptr {{ i64, i64, i8* }}, {{ i64, i64, i8* }}* {}, i32 0, i32 2",
+            slots_p, tp
+        ));
+        self.emit(&format!("store i8* {}, i8** {}", slots_raw, slots_p));
+
+        // Insert each entry via the runtime helper.
+        for (k, v) in entries {
+            let k_op = self.lower(k);
+            let v_op = self.lower(v);
+            self.emit(&format!(
+                "call void @pyx86_dict_i64_insert(i8* {}, i64 {}, i64 {})",
+                table_raw, k_op, v_op
+            ));
+        }
+        tp
+    }
+
+    fn lower_dict_get(&mut self, dict: &TypedExpr, key: &TypedExpr) -> String {
+        let dict_op = self.lower(dict);
+        let key_op = self.lower(key);
+        let table_raw = self.fresh();
+        self.emit(&format!(
+            "{} = bitcast {{ i64, i64, i8* }}* {} to i8*",
+            table_raw, dict_op
+        ));
+        let dst = self.fresh();
+        self.emit(&format!(
+            "{} = call i64 @pyx86_dict_i64_lookup(i8* {}, i64 {})",
+            dst, table_raw, key_op
+        ));
+        dst
+    }
+
+    fn lower_dict_has(&mut self, dict: &TypedExpr, key: &TypedExpr) -> String {
+        let dict_op = self.lower(dict);
+        let key_op = self.lower(key);
+        let table_raw = self.fresh();
+        self.emit(&format!(
+            "{} = bitcast {{ i64, i64, i8* }}* {} to i8*",
+            table_raw, dict_op
+        ));
+        let dst = self.fresh();
+        self.emit(&format!(
+            "{} = call i1 @pyx86_dict_i64_has(i8* {}, i64 {})",
+            dst, table_raw, key_op
+        ));
+        dst
+    }
+
+    fn lower_dict_len(&mut self, dict: &TypedExpr) -> String {
+        let dict_op = self.lower(dict);
+        let p = self.fresh();
+        self.emit(&format!(
+            "{} = getelementptr {{ i64, i64, i8* }}, {{ i64, i64, i8* }}* {}, i32 0, i32 0",
+            p, dict_op
+        ));
+        let dst = self.fresh();
+        self.emit(&format!("{} = load i64, i64* {}", dst, p));
+        dst
+    }
+
     fn lower_math_call(&mut self, intrinsic: &str, arg: &TypedExpr) -> String {
         let v = self.lower(arg);
         let dst = self.fresh();
@@ -1504,6 +1751,17 @@ fn walk_expr(te: &TypedExpr, out: &mut Vec<(String, Type)>, seen: &mut HashSet<S
         }
         Expr::StrLen { s } => walk_expr(s, out, seen),
         Expr::MathCall { arg, .. } => walk_expr(arg, out, seen),
+        Expr::DictLit { entries } => {
+            for (k, v) in entries {
+                walk_expr(k, out, seen);
+                walk_expr(v, out, seen);
+            }
+        }
+        Expr::DictGet { dict, key } | Expr::DictHas { dict, key } => {
+            walk_expr(dict, out, seen);
+            walk_expr(key, out, seen);
+        }
+        Expr::DictLen { dict } => walk_expr(dict, out, seen),
     }
 }
 
