@@ -19,6 +19,10 @@ thread_local! {
     /// `lower()` call.
     static CLASS_REGISTRY: RefCell<HashMap<String, ClassId>> =
         RefCell::new(HashMap::new());
+    /// The class currently being lowered (a method body). Set by
+    /// `lower_method` and used by `super()` resolution. None when
+    /// lowering top-level functions.
+    static CURRENT_CLASS: RefCell<Option<ClassId>> = const { RefCell::new(None) };
 }
 
 const MAX_PARAMS: usize = 16;
@@ -102,10 +106,11 @@ fn lower_module_into(
                     name
                 );
             }
-            // Pre-register with empty fields; filled in below.
+            // Pre-register with empty fields and no parent; filled in below.
             let id = ClassId::intern(ClassDef {
                 name: name.clone(),
                 fields: Vec::new(),
+                parent: None,
             });
             CLASS_REGISTRY.with(|r| r.borrow_mut().insert(name, id));
         }
@@ -118,12 +123,35 @@ fn lower_module_into(
         if let ast::Stmt::ClassDef(c) = stmt {
             let name = c.name.as_str().to_string();
             let class_id = CLASS_REGISTRY.with(|r| r.borrow()[&name]);
-            if !c.bases.is_empty() {
+            // Single-inheritance base.
+            let parent_id: Option<ClassId> = if c.bases.is_empty() {
+                None
+            } else if c.bases.len() == 1 {
+                let base_expr = &c.bases[0];
+                let base_name = match base_expr {
+                    ast::Expr::Name(n) => n.id.as_str(),
+                    _ => bail!(
+                        "unsupported_feature: base class must be a simple class name (in `{}`)",
+                        name
+                    ),
+                };
+                let base_id = CLASS_REGISTRY
+                    .with(|r| r.borrow().get(base_name).copied())
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "unsupported_feature: base class `{}` of `{}` is not defined",
+                            base_name,
+                            name
+                        )
+                    })?;
+                Some(base_id)
+            } else {
                 bail!(
-                    "unsupported_feature: base classes / inheritance not yet supported (in `{}`)",
+                    "unsupported_feature: multiple inheritance is not supported (in `{}`)",
                     name
                 );
-            }
+            };
+            class_id.set_parent(parent_id);
             if !c.decorator_list.is_empty() {
                 bail!(
                     "unsupported_feature: class decorators not supported (in `{}`)",
@@ -136,8 +164,14 @@ fn lower_module_into(
                     name
                 );
             }
-            let mut fields: Vec<(String, Type)> = Vec::new();
-            let mut field_names: HashSet<String> = HashSet::new();
+            // Start the field list with the parent's fields (prepended) so
+            // the layout prefix matches the parent.
+            let mut fields: Vec<(String, Type)> = match parent_id {
+                Some(p) => p.fields(),
+                None => Vec::new(),
+            };
+            let mut field_names: HashSet<String> =
+                fields.iter().map(|(n, _)| n.clone()).collect();
             for inner in &c.body {
                 match inner {
                     ast::Stmt::AnnAssign(a) => {
@@ -402,7 +436,10 @@ fn lower_method(
     if func.body.is_empty() {
         bail!("unsupported_feature: method `{}` body is empty", func.name);
     }
-    let mut body = lower_block(&func.body, &mut scope, 0, signatures, sig.return_ty)?;
+    let prev = CURRENT_CLASS.with(|c| c.replace(Some(class_id)));
+    let body_result = lower_block(&func.body, &mut scope, 0, signatures, sig.return_ty);
+    CURRENT_CLASS.with(|c| *c.borrow_mut() = prev);
+    let mut body = body_result?;
     // For __init__: synthesize `return self` if the body doesn't already
     // end with a return (Python's __init__ implicitly returns None; we
     // return self so `Foo(...)` evaluates to the instance).
@@ -1232,6 +1269,75 @@ fn lower_expr(e: &ast::Expr, scope: &Scope, signatures: &SignatureTable) -> Resu
             Ok(acc)
         }
         ast::Expr::Call(c) => {
+            // `super().method(args)` — resolved at compile time to a
+            // direct call into the parent class's method with `self` as
+            // the receiver. The form `super()` standalone is not
+            // supported (we don't synthesize a proxy object).
+            if let ast::Expr::Attribute(attr) = c.func.as_ref() {
+                if let ast::Expr::Call(inner) = attr.value.as_ref() {
+                    if matches!(inner.func.as_ref(), ast::Expr::Name(n) if n.id.as_str() == "super")
+                    {
+                        if !inner.args.is_empty() || !inner.keywords.is_empty() {
+                            bail!(
+                                "unsupported_feature: only zero-arg `super()` is supported"
+                            );
+                        }
+                        let cur_class = CURRENT_CLASS
+                            .with(|c| *c.borrow())
+                            .ok_or_else(|| {
+                                anyhow!(
+                                    "unsupported_feature: `super()` is only valid inside a method"
+                                )
+                            })?;
+                        let parent = cur_class.parent().ok_or_else(|| {
+                            anyhow!(
+                                "unsupported_feature: class `{}` has no parent — `super()` is invalid here",
+                                cur_class.name()
+                            )
+                        })?;
+                        let method = attr.attr.as_str();
+                        let (_resolved_class, mangled) =
+                            resolve_method(parent, method, signatures).ok_or_else(|| {
+                                anyhow!(
+                                    "unsupported_feature: no method `{}` found on `{}` or its ancestors",
+                                    method,
+                                    parent.name()
+                                )
+                            })?;
+                        let sig = signatures.get(&mangled).unwrap();
+                        // self is always the receiver — pull it from scope.
+                        let self_ty = *scope.get("self").ok_or_else(|| {
+                            anyhow!(
+                                "unsupported_feature: `super()` requires a `self` in scope"
+                            )
+                        })?;
+                        let self_expr = TypedExpr::new(self_ty, Expr::Var("self".to_string()));
+                        let mut args: Vec<TypedExpr> = Vec::with_capacity(c.args.len() + 1);
+                        args.push(coerce(self_expr, sig.params[0].ty)?);
+                        if c.args.len() != sig.params.len() - 1 {
+                            bail!(
+                                "unsupported_feature: super().{} takes {} args, got {}",
+                                method,
+                                sig.params.len() - 1,
+                                c.args.len()
+                            );
+                        }
+                        if !c.keywords.is_empty() {
+                            bail!(
+                                "unsupported_feature: keyword args on super() method calls not supported"
+                            );
+                        }
+                        for (i, a) in c.args.iter().enumerate() {
+                            let raw = lower_expr(a, scope, signatures)?;
+                            args.push(coerce(raw, sig.params[i + 1].ty)?);
+                        }
+                        return Ok(TypedExpr::new(
+                            sig.return_ty,
+                            Expr::Call { callee: mangled, args },
+                        ));
+                    }
+                }
+            }
             // Method-call form: `obj.method(args...)` lowers to a regular
             // call to the mangled function `<ClassName>.<method>` with
             // obj prepended as `self`.
@@ -1239,7 +1345,14 @@ fn lower_expr(e: &ast::Expr, scope: &Scope, signatures: &SignatureTable) -> Resu
                 let obj = lower_expr(&attr.value, scope, signatures)?;
                 if let Type::Class(class_id) = obj.ty {
                     let method = attr.attr.as_str();
-                    let mangled = format!("{}.{}", class_id.name(), method);
+                    let (_resolved_class, mangled) =
+                        resolve_method(class_id, method, signatures).ok_or_else(|| {
+                            anyhow!(
+                                "unsupported_feature: class `{}` has no method `{}` (and no ancestor defines it)",
+                                class_id.name(),
+                                method
+                            )
+                        })?;
                     let sig = signatures.get(&mangled).ok_or_else(|| {
                         anyhow!(
                             "unsupported_feature: class `{}` has no method `{}`",
@@ -1285,13 +1398,16 @@ fn lower_expr(e: &ast::Expr, scope: &Scope, signatures: &SignatureTable) -> Resu
             };
             // Class constructor: `Foo(args)` if Foo is a registered class.
             if let Some(class_id) = CLASS_REGISTRY.with(|r| r.borrow().get(&callee).copied()) {
-                let init_name = format!("{}.__init__", callee);
-                let init_sig = signatures.get(&init_name).ok_or_else(|| {
-                    anyhow!(
-                        "unsupported_feature: class `{}` has no __init__ method",
-                        callee
-                    )
-                })?;
+                // Resolve __init__ via the inheritance chain — a subclass
+                // without its own __init__ uses the parent's.
+                let (init_class, init_name) =
+                    resolve_method(class_id, "__init__", signatures).ok_or_else(|| {
+                        anyhow!(
+                            "unsupported_feature: class `{}` has no __init__ method (and no ancestor defines one)",
+                            callee
+                        )
+                    })?;
+                let init_sig = signatures.get(&init_name).unwrap();
                 if c.args.len() != init_sig.params.len() - 1 {
                     bail!(
                         "unsupported_feature: `{}` __init__ takes {} args, got {}",
@@ -1310,7 +1426,7 @@ fn lower_expr(e: &ast::Expr, scope: &Scope, signatures: &SignatureTable) -> Resu
                 }
                 return Ok(TypedExpr::new(
                     Type::Class(class_id),
-                    Expr::ClassNew { class: class_id, args },
+                    Expr::ClassNew { class: class_id, init_class, args },
                 ));
             }
             // Special-case Python builtins.
@@ -1792,6 +1908,38 @@ fn lower_expr(e: &ast::Expr, scope: &Scope, signatures: &SignatureTable) -> Resu
     }
 }
 
+/// Resolve a method on a class by walking the inheritance chain.
+/// Returns the mangled name (`<ClassName>.<method>`) of the first
+/// matching definition, walking from `class_id` up via `parent()`.
+fn resolve_method(
+    class_id: ClassId,
+    method: &str,
+    signatures: &SignatureTable,
+) -> Option<(ClassId, String)> {
+    let mut cur = Some(class_id);
+    while let Some(c) = cur {
+        let mangled = format!("{}.{}", c.name(), method);
+        if signatures.contains_key(&mangled) {
+            return Some((c, mangled));
+        }
+        cur = c.parent();
+    }
+    None
+}
+
+/// Test whether `descendant` inherits transitively from `ancestor`
+/// (including equality).
+fn is_subclass_of(descendant: ClassId, ancestor: ClassId) -> bool {
+    let mut cur = Some(descendant);
+    while let Some(c) = cur {
+        if c == ancestor {
+            return true;
+        }
+        cur = c.parent();
+    }
+    false
+}
+
 /// Reject a syntactic negative literal in an index/bound position.
 /// Used by string indexing/slicing in v0.31 — Python's negative indexing
 /// is deferred. Runtime negative values are not detected; this only
@@ -2136,6 +2284,17 @@ fn coerce(e: TypedExpr, target: Type) -> Result<TypedExpr> {
             if elements.is_empty() {
                 return Ok(TypedExpr::new(target, Expr::SetLit { elements: Vec::new() }));
             }
+        }
+    }
+    // Class subtyping: B inheriting transitively from A can flow into a
+    // slot annotated A. Lowered as Expr::Coerce, which codegen emits as a
+    // struct-pointer bitcast (no-op at runtime; layout prefix matches).
+    if let (Type::Class(b), Type::Class(a)) = (e.ty, target) {
+        if is_subclass_of(b, a) {
+            return Ok(TypedExpr::new(
+                target,
+                Expr::Coerce { inner: Box::new(e) },
+            ));
         }
     }
     let allowed = match (e.ty, target) {
