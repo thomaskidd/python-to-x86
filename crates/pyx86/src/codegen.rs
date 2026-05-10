@@ -800,7 +800,9 @@ impl Codegen {
             Expr::SetHas { set, key } => self.lower_set_has(set, key),
             Expr::SetLen { set } => self.lower_set_len(set),
             Expr::FieldGet { obj, field_index } => self.lower_field_get(obj, *field_index, te.ty),
-            Expr::ClassNew { class, args } => self.lower_class_new(*class, args),
+            Expr::ClassNew { class, init_class, args } => {
+                self.lower_class_new(*class, *init_class, args)
+            }
         }
     }
 
@@ -845,6 +847,19 @@ impl Codegen {
                 // ValueError / OverflowError for those; documented divergence.
                 let dst = self.fresh();
                 self.emit(&format!("{} = fptosi double {} to {}", dst, inner_op, llvm_ty(b)));
+                dst
+            }
+            // Class subtyping: B → A (B inherits from A). Layout prefix
+            // matches by construction; emit a struct-pointer bitcast.
+            (Type::Class(_), Type::Class(_)) => {
+                let dst = self.fresh();
+                self.emit(&format!(
+                    "{} = bitcast {} {} to {}",
+                    dst,
+                    llvm_ty(inner.ty),
+                    inner_op,
+                    llvm_ty(target)
+                ));
                 dst
             }
             // Int width changes
@@ -1679,38 +1694,60 @@ impl Codegen {
         dst
     }
 
-    /// `Foo(args...)` — allocate the struct on the heap and call
-    /// `Foo.__init__(self_ptr, args...)`. The init function returns
-    /// the same self_ptr (we synthesize that in check.rs).
-    fn lower_class_new(&mut self, class_id: crate::hir::ClassId, args: &[TypedExpr]) -> String {
-        let class_llvm = llvm_ty(Type::Class(class_id));
-        let struct_ty = class_llvm.trim_end_matches('*').trim_end().to_string();
+    /// `Foo(args...)` — allocate the outer struct on the heap and call
+    /// `<init_class>.__init__(self_ptr_as_init_class, args...)`. The init
+    /// function returns its self type; we discard it and use our own
+    /// outer-typed pointer (same memory). With inheritance, `init_class`
+    /// may be an ancestor of `class_id`; we bitcast the pointer for the
+    /// call due to layout prefix compatibility.
+    fn lower_class_new(
+        &mut self,
+        class_id: crate::hir::ClassId,
+        init_class: crate::hir::ClassId,
+        args: &[TypedExpr],
+    ) -> String {
+        let outer_llvm = llvm_ty(Type::Class(class_id));
+        let outer_sty = outer_llvm.trim_end_matches('*').trim_end().to_string();
+        let init_llvm = llvm_ty(Type::Class(init_class));
+        let init_sty = init_llvm.trim_end_matches('*').trim_end().to_string();
         let bytes = class_byte_size(class_id);
         let raw = self.fresh();
         self.emit(&format!("{} = call i8* @malloc(i64 {})", raw, bytes));
-        let self_p = self.fresh();
+        let self_outer = self.fresh();
         self.emit(&format!(
             "{} = bitcast i8* {} to {sty}*",
-            self_p, raw,
-            sty = struct_ty
+            self_outer, raw,
+            sty = outer_sty
         ));
-        // Call __init__(self_ptr, args...). The init signature has
-        // self as the first param.
+        // For the __init__ call we need the receiver typed as the init's
+        // owning class. Same memory, different LLVM type.
+        let self_init = if class_id == init_class {
+            self_outer.clone()
+        } else {
+            let p = self.fresh();
+            self.emit(&format!(
+                "{} = bitcast {osty}* {} to {isty}*",
+                p, self_outer,
+                osty = outer_sty,
+                isty = init_sty
+            ));
+            p
+        };
         let arg_ops: Vec<String> = args.iter().map(|a| self.lower(a)).collect();
         let mut call_args: Vec<String> =
-            vec![format!("{sty}* {}", self_p, sty = struct_ty)];
+            vec![format!("{sty}* {}", self_init, sty = init_sty)];
         for (op, ty) in arg_ops.iter().zip(args.iter().map(|a| a.ty)) {
             call_args.push(format!("{} {}", llvm_ty(ty), op));
         }
-        let dst = self.fresh();
+        let _discarded = self.fresh();
         self.emit(&format!(
-            "{} = call {sty}* @py_{}.__init__({})",
-            dst,
-            class_id.name(),
+            "{} = call {isty}* @py_{}.__init__({})",
+            _discarded,
+            init_class.name(),
             call_args.join(", "),
-            sty = struct_ty
+            isty = init_sty
         ));
-        dst
+        self_outer
     }
 
     /// `obj.field = value` — GEP + store.

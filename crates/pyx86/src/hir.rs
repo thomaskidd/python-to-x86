@@ -40,8 +40,12 @@ pub struct ClassId(u32);
 #[derive(Debug, Clone)]
 pub struct ClassDef {
     pub name: String,
-    /// (field_name, field_type) in declaration order.
+    /// (field_name, field_type) in declaration order. For a subclass,
+    /// the parent's fields are **prepended** before the subclass's own,
+    /// so the underlying struct prefix matches the parent's layout.
     pub fields: Vec<(String, Type)>,
+    /// Parent class for single inheritance (v0.33). None for root classes.
+    pub parent: Option<ClassId>,
 }
 
 thread_local! {
@@ -91,6 +95,15 @@ impl ClassId {
         CLASS_ARENA.with(|a| {
             let mut a = a.borrow_mut();
             a[self.0 as usize].fields = fields;
+        })
+    }
+    pub fn parent(self) -> Option<ClassId> {
+        CLASS_ARENA.with(|a| a.borrow()[self.0 as usize].parent)
+    }
+    pub fn set_parent(self, parent: Option<ClassId>) {
+        CLASS_ARENA.with(|a| {
+            let mut a = a.borrow_mut();
+            a[self.0 as usize].parent = parent;
         })
     }
 }
@@ -464,7 +477,12 @@ pub enum Expr {
     /// struct on the heap and calls `__init__(self, args...)` which
     /// is the regular top-level function with mangled name
     /// `Foo.__init__`.
-    ClassNew { class: ClassId, args: Vec<TypedExpr> },
+    /// `class` is the outer instantiated class (determines allocation
+    /// size + result type). `init_class` is the class that owns the
+    /// `__init__` being called (may be `class` or a parent, walking the
+    /// chain). With single inheritance the layout is prefix-compatible
+    /// so codegen bitcasts the `self_ptr` to `init_class` for the call.
+    ClassNew { class: ClassId, init_class: ClassId, args: Vec<TypedExpr> },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
