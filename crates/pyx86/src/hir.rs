@@ -392,6 +392,14 @@ pub enum Expr {
     /// (Str-typed interpolations are passed through directly; this variant
     /// is never emitted for Str inputs.)
     FormatToStr { inner: Box<TypedExpr> },
+    /// `s[i]` — single-char substring. Result is a fresh 1-byte heap-allocated str.
+    /// No bounds check; index must be non-negative (check rejects literal
+    /// negatives at compile time).
+    StrIndex { s: Box<TypedExpr>, index: Box<TypedExpr> },
+    /// `s[start:stop]` — substring. Bounds are clamped to [0, len(s)] at
+    /// runtime. Result is a fresh heap-allocated copy. `start` and `stop`
+    /// are both I64; defaults (0 and StrLen) are substituted by check.
+    StrSlice { s: Box<TypedExpr>, start: Box<TypedExpr>, stop: Box<TypedExpr> },
     /// Call to a math runtime / LLVM intrinsic. The `name` is the
     /// LLVM symbol to invoke (e.g. `llvm.sqrt.f64`, `tan`). Single-arg
     /// f64 → f64 only in v0.24.

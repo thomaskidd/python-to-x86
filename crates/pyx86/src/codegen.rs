@@ -782,6 +782,8 @@ impl Codegen {
             Expr::StrLen { s } => self.lower_str_len(s),
             Expr::StrEq { lhs, rhs, negated } => self.lower_str_eq(lhs, rhs, *negated),
             Expr::FormatToStr { inner } => self.lower_format_to_str(inner),
+            Expr::StrIndex { s, index } => self.lower_str_index(s, index),
+            Expr::StrSlice { s, start, stop } => self.lower_str_slice(s, start, stop),
             Expr::MathCall { intrinsic, arg } => self.lower_math_call(intrinsic, arg),
             Expr::DictLit { entries } => self.lower_dict_lit(entries, te.ty),
             Expr::DictGet { dict, key } => self.lower_dict_get(dict, key),
@@ -1835,6 +1837,120 @@ impl Codegen {
         }
     }
 
+    /// `s[i]` — extract one byte, return a fresh 1-byte heap-backed str.
+    fn lower_str_index(&mut self, s: &TypedExpr, index: &TypedExpr) -> String {
+        let sv = self.lower(s);
+        let iv = self.lower(index);
+        let data = self.fresh();
+        self.emit(&format!("{} = extractvalue {{ i64, i8* }} {}, 1", data, sv));
+        let p = self.fresh();
+        self.emit(&format!("{} = getelementptr i8, i8* {}, i64 {}", p, data, iv));
+        let c = self.fresh();
+        self.emit(&format!("{} = load i8, i8* {}", c, p));
+        let buf = self.fresh();
+        self.emit(&format!("{} = call i8* @malloc(i64 1)", buf));
+        self.emit(&format!("store i8 {}, i8* {}", c, buf));
+        let s0 = self.fresh();
+        self.emit(&format!(
+            "{} = insertvalue {{ i64, i8* }} undef, i64 1, 0",
+            s0
+        ));
+        let s1 = self.fresh();
+        self.emit(&format!(
+            "{} = insertvalue {{ i64, i8* }} {}, i8* {}, 1",
+            s1, s0, buf
+        ));
+        s1
+    }
+
+    /// `s[start:stop]` — clamp bounds to [0, len], memcpy a fresh buffer.
+    fn lower_str_slice(&mut self, s: &TypedExpr, start: &TypedExpr, stop: &TypedExpr) -> String {
+        let sv = self.lower(s);
+        let len = self.fresh();
+        self.emit(&format!("{} = extractvalue {{ i64, i8* }} {}, 0", len, sv));
+        let data = self.fresh();
+        self.emit(&format!("{} = extractvalue {{ i64, i8* }} {}, 1", data, sv));
+        let start_v = self.lower(start);
+        let stop_v = self.lower(stop);
+
+        // clamp start: max(0, min(start, len))
+        let start_lt_zero = self.fresh();
+        self.emit(&format!("{} = icmp slt i64 {}, 0", start_lt_zero, start_v));
+        let start_clamped_lo = self.fresh();
+        self.emit(&format!(
+            "{} = select i1 {}, i64 0, i64 {}",
+            start_clamped_lo, start_lt_zero, start_v
+        ));
+        let start_gt_len = self.fresh();
+        self.emit(&format!(
+            "{} = icmp sgt i64 {}, {}",
+            start_gt_len, start_clamped_lo, len
+        ));
+        let start_c = self.fresh();
+        self.emit(&format!(
+            "{} = select i1 {}, i64 {}, i64 {}",
+            start_c, start_gt_len, len, start_clamped_lo
+        ));
+
+        // clamp stop: max(0, min(stop, len))
+        let stop_lt_zero = self.fresh();
+        self.emit(&format!("{} = icmp slt i64 {}, 0", stop_lt_zero, stop_v));
+        let stop_clamped_lo = self.fresh();
+        self.emit(&format!(
+            "{} = select i1 {}, i64 0, i64 {}",
+            stop_clamped_lo, stop_lt_zero, stop_v
+        ));
+        let stop_gt_len = self.fresh();
+        self.emit(&format!(
+            "{} = icmp sgt i64 {}, {}",
+            stop_gt_len, stop_clamped_lo, len
+        ));
+        let stop_c = self.fresh();
+        self.emit(&format!(
+            "{} = select i1 {}, i64 {}, i64 {}",
+            stop_c, stop_gt_len, len, stop_clamped_lo
+        ));
+
+        // out_len = max(0, stop_c - start_c)
+        let diff = self.fresh();
+        self.emit(&format!("{} = sub i64 {}, {}", diff, stop_c, start_c));
+        let diff_neg = self.fresh();
+        self.emit(&format!("{} = icmp slt i64 {}, 0", diff_neg, diff));
+        let out_len = self.fresh();
+        self.emit(&format!(
+            "{} = select i1 {}, i64 0, i64 {}",
+            out_len, diff_neg, diff
+        ));
+
+        // alloc_n = max(1, out_len) — avoid 0-byte malloc
+        let is_zero = self.fresh();
+        self.emit(&format!("{} = icmp eq i64 {}, 0", is_zero, out_len));
+        let alloc_n = self.fresh();
+        self.emit(&format!(
+            "{} = select i1 {}, i64 1, i64 {}",
+            alloc_n, is_zero, out_len
+        ));
+        let buf = self.fresh();
+        self.emit(&format!("{} = call i8* @malloc(i64 {})", buf, alloc_n));
+        let src = self.fresh();
+        self.emit(&format!("{} = getelementptr i8, i8* {}, i64 {}", src, data, start_c));
+        self.emit(&format!(
+            "call void @llvm.memcpy.p0i8.p0i8.i64(i8* {}, i8* {}, i64 {}, i1 false)",
+            buf, src, out_len
+        ));
+        let s0 = self.fresh();
+        self.emit(&format!(
+            "{} = insertvalue {{ i64, i8* }} undef, i64 {}, 0",
+            s0, out_len
+        ));
+        let s1 = self.fresh();
+        self.emit(&format!(
+            "{} = insertvalue {{ i64, i8* }} {}, i8* {}, 1",
+            s1, s0, buf
+        ));
+        s1
+    }
+
     fn lower_str_len(&mut self, s: &TypedExpr) -> String {
         let v = self.lower(s);
         let dst = self.fresh();
@@ -2063,6 +2179,15 @@ fn walk_expr(te: &TypedExpr, out: &mut Vec<(String, Type)>, seen: &mut HashSet<S
         }
         Expr::StrLen { s } => walk_expr(s, out, seen),
         Expr::FormatToStr { inner } => walk_expr(inner, out, seen),
+        Expr::StrIndex { s, index } => {
+            walk_expr(s, out, seen);
+            walk_expr(index, out, seen);
+        }
+        Expr::StrSlice { s, start, stop } => {
+            walk_expr(s, out, seen);
+            walk_expr(start, out, seen);
+            walk_expr(stop, out, seen);
+        }
         Expr::MathCall { arg, .. } => walk_expr(arg, out, seen),
         Expr::DictLit { entries } => {
             for (k, v) in entries {
