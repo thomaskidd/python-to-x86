@@ -61,8 +61,9 @@ pub fn emit_ll(prog: &Program, source_basename: &str) -> String {
     let print_block = match main_fn.return_ty {
         Type::I64 => "  %fmt = getelementptr inbounds [5 x i8], [5 x i8]* @.fmt_i64, i64 0, i64 0\n  call i32 (i8*, ...) @printf(i8* %fmt, i64 %r)".to_string(),
         Type::F64 => "  call void @pyx86_print_f64(double %r)".to_string(),
-        Type::I8 | Type::I16 | Type::I32 | Type::Bool | Type::Tuple(_) | Type::List(_) | Type::Str | Type::Dict(_) | Type::Class(_) => {
-            unreachable!("check rejects non-(I64|F64) main return types")
+        Type::Str => "  %r_len = extractvalue { i64, i8* } %r, 0\n  %r_data = extractvalue { i64, i8* } %r, 1\n  %r_len32 = trunc i64 %r_len to i32\n  %fmt_repr = getelementptr inbounds [8 x i8], [8 x i8]* @.fmt_str_repr, i64 0, i64 0\n  call i32 (i8*, ...) @printf(i8* %fmt_repr, i32 %r_len32, i8* %r_data)".to_string(),
+        Type::I8 | Type::I16 | Type::I32 | Type::Bool | Type::Tuple(_) | Type::List(_) | Type::Dict(_) | Type::Class(_) => {
+            unreachable!("check rejects this main return type")
         }
     };
 
@@ -94,6 +95,10 @@ declare double @tan(double)
 @.fmt_i64 = private unnamed_addr constant [5 x i8] c\"%ld\\0A\\00\"
 @.fmt_f64_g = private unnamed_addr constant [6 x i8] c\"%.17g\\00\"
 @.fmt_str_nl = private unnamed_addr constant [4 x i8] c\"%s\\0A\\00\"
+@.fmt_i64_buf = private unnamed_addr constant [4 x i8] c\"%ld\\00\"
+@.s_true = private unnamed_addr constant [5 x i8] c\"True\\00\"
+@.s_false = private unnamed_addr constant [6 x i8] c\"False\\00\"
+@.fmt_str_repr = private unnamed_addr constant [8 x i8] c\"'%.*s'\\0A\\00\"
 
 {str_globals}
 {runtime}{defs}define i32 @main(i32 %argc, i8** %argv) {{
@@ -417,6 +422,19 @@ skip_mul:
 loop_exit:
   %r_final = load i64, i64* %r.addr
   ret i64 %r_final
+}
+
+; pyx86_i64_to_str — format an i64 in base 10, return a fresh str struct.
+; Buffer is 24 bytes (enough for -9223372036854775808 + NUL).
+define internal { i64, i8* } @pyx86_i64_to_str(i64 %x) {
+entry:
+  %buf = call i8* @malloc(i64 24)
+  %fmt = getelementptr inbounds [4 x i8], [4 x i8]* @.fmt_i64_buf, i64 0, i64 0
+  %n = call i32 (i8*, i8*, ...) @sprintf(i8* %buf, i8* %fmt, i64 %x)
+  %len = sext i32 %n to i64
+  %s0 = insertvalue { i64, i8* } undef, i64 %len, 0
+  %s1 = insertvalue { i64, i8* } %s0, i8* %buf, 1
+  ret { i64, i8* } %s1
 }
 
 ";
@@ -763,6 +781,7 @@ impl Codegen {
             Expr::StrConcat { lhs, rhs } => self.lower_str_concat(lhs, rhs),
             Expr::StrLen { s } => self.lower_str_len(s),
             Expr::StrEq { lhs, rhs, negated } => self.lower_str_eq(lhs, rhs, *negated),
+            Expr::FormatToStr { inner } => self.lower_format_to_str(inner),
             Expr::MathCall { intrinsic, arg } => self.lower_math_call(intrinsic, arg),
             Expr::DictLit { entries } => self.lower_dict_lit(entries, te.ty),
             Expr::DictGet { dict, key } => self.lower_dict_get(dict, key),
@@ -1749,6 +1768,73 @@ impl Codegen {
         s1
     }
 
+    /// Format an integer/bool to a `{ i64, i8* }` str struct.
+    /// Dispatches on `inner.ty`. Str-typed inputs are not passed here
+    /// (check.rs unwraps them).
+    fn lower_format_to_str(&mut self, inner: &TypedExpr) -> String {
+        match inner.ty {
+            Type::I64 => {
+                let v = self.lower(inner);
+                let dst = self.fresh();
+                self.emit(&format!(
+                    "{} = call {{ i64, i8* }} @pyx86_i64_to_str(i64 {})",
+                    dst, v
+                ));
+                dst
+            }
+            Type::I8 | Type::I16 | Type::I32 => {
+                let v = self.lower(inner);
+                let widened = self.fresh();
+                self.emit(&format!(
+                    "{} = sext {ity} {} to i64",
+                    widened, v, ity = llvm_ty(inner.ty)
+                ));
+                let dst = self.fresh();
+                self.emit(&format!(
+                    "{} = call {{ i64, i8* }} @pyx86_i64_to_str(i64 {})",
+                    dst, widened
+                ));
+                dst
+            }
+            Type::Bool => {
+                let v = self.lower(inner);
+                // Build both candidate str structs, select.
+                let true_data = self.fresh();
+                self.emit(&format!(
+                    "{} = getelementptr inbounds [5 x i8], [5 x i8]* @.s_true, i64 0, i64 0",
+                    true_data
+                ));
+                let false_data = self.fresh();
+                self.emit(&format!(
+                    "{} = getelementptr inbounds [6 x i8], [6 x i8]* @.s_false, i64 0, i64 0",
+                    false_data
+                ));
+                let chosen_len = self.fresh();
+                self.emit(&format!(
+                    "{} = select i1 {}, i64 4, i64 5",
+                    chosen_len, v
+                ));
+                let chosen_data = self.fresh();
+                self.emit(&format!(
+                    "{} = select i1 {}, i8* {}, i8* {}",
+                    chosen_data, v, true_data, false_data
+                ));
+                let s0 = self.fresh();
+                self.emit(&format!(
+                    "{} = insertvalue {{ i64, i8* }} undef, i64 {}, 0",
+                    s0, chosen_len
+                ));
+                let s1 = self.fresh();
+                self.emit(&format!(
+                    "{} = insertvalue {{ i64, i8* }} {}, i8* {}, 1",
+                    s1, s0, chosen_data
+                ));
+                s1
+            }
+            other => panic!("internal: lower_format_to_str on unsupported type {:?}", other),
+        }
+    }
+
     fn lower_str_len(&mut self, s: &TypedExpr) -> String {
         let v = self.lower(s);
         let dst = self.fresh();
@@ -1976,6 +2062,7 @@ fn walk_expr(te: &TypedExpr, out: &mut Vec<(String, Type)>, seen: &mut HashSet<S
             walk_expr(rhs, out, seen);
         }
         Expr::StrLen { s } => walk_expr(s, out, seen),
+        Expr::FormatToStr { inner } => walk_expr(inner, out, seen),
         Expr::MathCall { arg, .. } => walk_expr(arg, out, seen),
         Expr::DictLit { entries } => {
             for (k, v) in entries {
