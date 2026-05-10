@@ -1256,6 +1256,46 @@ fn lower_expr(e: &ast::Expr, scope: &Scope, signatures: &SignatureTable) -> Resu
             let rest = rest_ops?;
             if rest.len() == 1 {
                 let (op, rhs) = rest.into_iter().next().unwrap();
+                // Class instance == / != → dispatch to __eq__.
+                if let (Type::Class(lc), Type::Class(rc)) = (first.ty, rhs.ty) {
+                    if matches!(op, CmpOp::Eq | CmpOp::Ne) {
+                        if lc != rc {
+                            bail!(
+                                "unsupported_feature: == between class instances must use the same class type ({} vs {})",
+                                lc.name(),
+                                rc.name()
+                            );
+                        }
+                        let (_owner, mangled) = resolve_method(lc, "__eq__", signatures)
+                            .ok_or_else(|| {
+                                anyhow!(
+                                    "unsupported_feature: class `{}` has no `__eq__` method (define one to use `==`)",
+                                    lc.name()
+                                )
+                            })?;
+                        let sig = signatures.get(&mangled).unwrap();
+                        if sig.params.len() != 2 || sig.return_ty != Type::Bool {
+                            bail!(
+                                "unsupported_feature: `__eq__` on `{}` must take (self, other) and return `bool`",
+                                lc.name()
+                            );
+                        }
+                        let lhs_arg = coerce(first, sig.params[0].ty)?;
+                        let rhs_arg = coerce(rhs, sig.params[1].ty)?;
+                        let call = TypedExpr::new(
+                            Type::Bool,
+                            Expr::Call { callee: mangled, args: vec![lhs_arg, rhs_arg] },
+                        );
+                        if matches!(op, CmpOp::Ne) {
+                            return Ok(TypedExpr::new(Type::Bool, Expr::Not(Box::new(call))));
+                        }
+                        return Ok(call);
+                    } else {
+                        bail!(
+                            "unsupported_feature: only == and != are supported between class instances (no <, >, etc.)"
+                        );
+                    }
+                }
                 // String comparison: only ==/!= supported.
                 if first.ty == Type::Str || rhs.ty == Type::Str {
                     if first.ty != Type::Str || rhs.ty != Type::Str {
@@ -2100,6 +2140,30 @@ fn lower_joined_str(
                     Type::F64 => bail!(
                         "unsupported_feature: f64 interpolation in f-strings is deferred (see specs/slice-v0.30-fstrings.md)"
                     ),
+                    Type::Class(cid) => {
+                        // Class instance — resolve __repr__ via the
+                        // inheritance chain and call it. The result is
+                        // a Str that flows into the StrConcat.
+                        let (_repr_owner, mangled) = resolve_method(cid, "__repr__", signatures)
+                            .ok_or_else(|| {
+                                anyhow!(
+                                    "unsupported_feature: class `{}` has no `__repr__` method (define one to interpolate it in an f-string)",
+                                    cid.name()
+                                )
+                            })?;
+                        let sig = signatures.get(&mangled).unwrap();
+                        if sig.params.len() != 1 || sig.return_ty != Type::Str {
+                            bail!(
+                                "unsupported_feature: `__repr__` on `{}` must take only `self` and return `str`",
+                                cid.name()
+                            );
+                        }
+                        let arg = coerce(inner, sig.params[0].ty)?;
+                        TypedExpr::new(
+                            Type::Str,
+                            Expr::Call { callee: mangled, args: vec![arg] },
+                        )
+                    }
                     other => bail!(
                         "unsupported_feature: cannot interpolate value of type {} in an f-string",
                         other.name()
@@ -2582,6 +2646,38 @@ fn lower_builtin_call(
             Ok(Some(TypedExpr::new(
                 Type::Set(id),
                 Expr::SetLit { elements: Vec::new() },
+            )))
+        }
+        "repr" => {
+            if args.len() != 1 || !kwargs.is_empty() {
+                bail!("unsupported_feature: repr() takes exactly 1 positional argument");
+            }
+            let inner = lower_expr(&args[0], scope, signatures)?;
+            let cid = match inner.ty {
+                Type::Class(c) => c,
+                other => bail!(
+                    "unsupported_feature: repr() is only supported on class instances in v0.35 (got {}); use f-strings for primitives",
+                    other.name()
+                ),
+            };
+            let (_owner, mangled) = resolve_method(cid, "__repr__", signatures)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "unsupported_feature: class `{}` has no `__repr__` method",
+                        cid.name()
+                    )
+                })?;
+            let sig = signatures.get(&mangled).unwrap();
+            if sig.params.len() != 1 || sig.return_ty != Type::Str {
+                bail!(
+                    "unsupported_feature: `__repr__` on `{}` must take only `self` and return `str`",
+                    cid.name()
+                );
+            }
+            let arg = coerce(inner, sig.params[0].ty)?;
+            Ok(Some(TypedExpr::new(
+                Type::Str,
+                Expr::Call { callee: mangled, args: vec![arg] },
             )))
         }
         "min" | "max" => {
