@@ -621,20 +621,18 @@ fn lower_block(
                     }
                     ast::Expr::Subscript(s) => {
                         let container = lower_expr(&s.value, scope, signatures)?;
-                        let dict_id = match container.ty {
-                            Type::Dict(id) => id,
-                            Type::List(_) => bail!(
-                                "unsupported_feature: list subscript-assignment `lst[i] = v` is not supported in v0.28 (deferred)"
-                            ),
+                        let (key_ty, value_ty) = match container.ty {
+                            Type::Dict(id) => (id.key(), id.val()),
+                            Type::List(id) => (Type::I64, id.elem()),
                             other => bail!(
                                 "unsupported_feature: subscript-assignment on {} is not supported",
                                 other.name()
                             ),
                         };
                         let key = lower_expr(&s.slice, scope, signatures)?;
-                        let key = coerce(key, dict_id.key())?;
+                        let key = coerce(key, key_ty)?;
                         let value = lower_expr(&a.value, scope, signatures)?;
-                        let value = coerce(value, dict_id.val())?;
+                        let value = coerce(value, value_ty)?;
                         out.push(Stmt::SetSubscript { container, key, value });
                     }
                     other => bail!(
