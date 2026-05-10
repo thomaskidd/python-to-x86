@@ -6,8 +6,8 @@ use anyhow::{anyhow, bail, Context, Result};
 use rustpython_parser::ast;
 
 use crate::hir::{
-    BinOp, BoolOp, ClassDef, ClassId, CmpOp, DictId, Expr, Function, ListId, Param, Program, Stmt,
-    TupleId, Type, TypedExpr, UnaryOp,
+    BinOp, BoolOp, ClassDef, ClassId, CmpOp, DictId, Expr, Function, ListId, Param, Program, SetId,
+    Stmt, TupleId, Type, TypedExpr, UnaryOp,
 };
 use crate::parser;
 use crate::parser::Module;
@@ -931,6 +931,31 @@ fn lower_block(
                             });
                             continue;
                         }
+                        if attr.attr.as_str() == "add" {
+                            // <set>.add(<value>) — intercept only when the
+                            // receiver is actually a set. Otherwise (e.g.
+                            // a class method named `add`) fall through to
+                            // the regular method-call statement handling.
+                            if let ast::Expr::Name(n) = attr.value.as_ref() {
+                                let set_name = n.id.as_str().to_string();
+                                if let Some(&set_ty) = scope.get(&set_name) {
+                                    if let Type::Set(id) = set_ty {
+                                        if c.args.len() != 1 || !c.keywords.is_empty() {
+                                            bail!(
+                                                "unsupported_feature: set.add() takes exactly 1 positional argument"
+                                            );
+                                        }
+                                        let value =
+                                            lower_expr(&c.args[0], scope, signatures)?;
+                                        let value = coerce(value, id.elem())?;
+                                        let set_expr =
+                                            TypedExpr::new(set_ty, Expr::Var(set_name));
+                                        out.push(Stmt::SetAdd { set: set_expr, value });
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 // Allow any Call expression as a stmt (its side effects
@@ -1009,6 +1034,14 @@ fn parse_type_annotation(ann: Option<&ast::Expr>) -> Option<Type> {
                         return None;
                     }
                     Some(Type::Dict(DictId::intern(k, v)))
+                }
+                "set" => {
+                    let elem = parse_type_annotation(Some(s.slice.as_ref()))?;
+                    // v0.32: only I64 elements.
+                    if elem != Type::I64 {
+                        return None;
+                    }
+                    Some(Type::Set(SetId::intern(elem)))
                 }
                 _ => None,
             }
@@ -1109,8 +1142,18 @@ fn lower_expr(e: &ast::Expr, scope: &Scope, signatures: &SignatureTable) -> Resu
                             },
                         )
                     }
+                    Type::Set(id) => {
+                        let key = coerce(key, id.elem())?;
+                        TypedExpr::new(
+                            Type::Bool,
+                            Expr::SetHas {
+                                set: Box::new(container),
+                                key: Box::new(key),
+                            },
+                        )
+                    }
                     other => bail!(
-                        "unsupported_feature: `in` / `not in` on {} not supported (only dict so far)",
+                        "unsupported_feature: `in` / `not in` on {} not supported (only dict / set so far)",
                         other.name()
                     ),
                 };
@@ -1342,6 +1385,19 @@ fn lower_expr(e: &ast::Expr, scope: &Scope, signatures: &SignatureTable) -> Resu
             }
             let id = DictId::intern(Type::I64, Type::I64);
             Ok(TypedExpr::new(Type::Dict(id), Expr::DictLit { entries }))
+        }
+        ast::Expr::Set(s) => {
+            // `{e1, e2, ...}` set literal. v0.32: i64 elements only.
+            // (Empty `{}` is a dict in Python, not a set — handled in the
+            // Dict arm and re-tagged via coerce.)
+            let mut elements: Vec<TypedExpr> = Vec::with_capacity(s.elts.len());
+            for e in &s.elts {
+                let v = lower_expr(e, scope, signatures)?;
+                let v = coerce(v, Type::I64)?;
+                elements.push(v);
+            }
+            let id = SetId::intern(Type::I64);
+            Ok(TypedExpr::new(Type::Set(id), Expr::SetLit { elements }))
         }
         ast::Expr::ListComp(comp) => {
             // [<elt> for <target> in <iter> (if <cond>)*]
@@ -2074,6 +2130,14 @@ fn coerce(e: TypedExpr, target: Type) -> Result<TypedExpr> {
             }
         }
     }
+    // And for empty sets — `s: set[T] = set()` lowers to an empty SetLit.
+    if let (Type::Set(_), Type::Set(_)) = (e.ty, target) {
+        if let Expr::SetLit { elements } = &e.expr {
+            if elements.is_empty() {
+                return Ok(TypedExpr::new(target, Expr::SetLit { elements: Vec::new() }));
+            }
+        }
+    }
     let allowed = match (e.ty, target) {
         // Float → int: lossy, rejected.
         (Type::F64, t) if t.is_int() => {
@@ -2249,11 +2313,28 @@ fn lower_builtin_call(
                     Type::I64,
                     Expr::DictLen { dict: Box::new(inner) },
                 ))),
+                Type::Set(_) => Ok(Some(TypedExpr::new(
+                    Type::I64,
+                    Expr::SetLen { set: Box::new(inner) },
+                ))),
                 other => bail!(
-                    "unsupported_feature: len() not supported on {} (only list/tuple/str/dict)",
+                    "unsupported_feature: len() not supported on {} (only list/tuple/str/dict/set)",
                     other.name()
                 ),
             }
+        }
+        "set" => {
+            // Empty-set constructor `set()`. Reject `set(iter)` for now.
+            if !args.is_empty() {
+                bail!(
+                    "unsupported_feature: set() with arguments is not yet supported (use a literal `{{a, b, c}}` instead)"
+                );
+            }
+            let id = SetId::intern(Type::I64);
+            Ok(Some(TypedExpr::new(
+                Type::Set(id),
+                Expr::SetLit { elements: Vec::new() },
+            )))
         }
         "min" | "max" => {
             if args.len() != 2 {
