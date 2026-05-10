@@ -44,8 +44,15 @@ pub struct ClassDef {
     /// the parent's fields are **prepended** before the subclass's own,
     /// so the underlying struct prefix matches the parent's layout.
     pub fields: Vec<(String, Type)>,
-    /// Parent class for single inheritance (v0.33). None for root classes.
+    /// Parent class for single concrete inheritance (v0.33). None for
+    /// root classes. ABC bases (v0.34) are not represented here — they
+    /// only contribute abstract-method names.
     pub parent: Option<ClassId>,
+    /// v0.34: names of methods that are declared `@abstractmethod`
+    /// (in this class or inherited from any parent/ABC) and have not
+    /// yet been overridden with a concrete implementation. A class is
+    /// abstract iff this list is non-empty.
+    pub abstract_methods: Vec<String>,
 }
 
 thread_local! {
@@ -105,6 +112,18 @@ impl ClassId {
             let mut a = a.borrow_mut();
             a[self.0 as usize].parent = parent;
         })
+    }
+    pub fn abstract_methods(self) -> Vec<String> {
+        CLASS_ARENA.with(|a| a.borrow()[self.0 as usize].abstract_methods.clone())
+    }
+    pub fn set_abstract_methods(self, methods: Vec<String>) {
+        CLASS_ARENA.with(|a| {
+            let mut a = a.borrow_mut();
+            a[self.0 as usize].abstract_methods = methods;
+        })
+    }
+    pub fn is_abstract(self) -> bool {
+        CLASS_ARENA.with(|a| !a.borrow()[self.0 as usize].abstract_methods.is_empty())
     }
 }
 
@@ -289,6 +308,12 @@ impl Type {
     }
     pub fn is_tuple(self) -> bool {
         matches!(self, Type::Tuple(_))
+    }
+    /// True iff `self` is a `Type::Class(c)` whose class is abstract
+    /// (has unimplemented abstract methods). Used by check to reject
+    /// abstract types in value-flow positions until vtables land.
+    pub fn is_abstract_class(self) -> bool {
+        matches!(self, Type::Class(c) if c.is_abstract())
     }
 }
 
@@ -480,9 +505,12 @@ pub enum Expr {
     /// `class` is the outer instantiated class (determines allocation
     /// size + result type). `init_class` is the class that owns the
     /// `__init__` being called (may be `class` or a parent, walking the
-    /// chain). With single inheritance the layout is prefix-compatible
-    /// so codegen bitcasts the `self_ptr` to `init_class` for the call.
-    ClassNew { class: ClassId, init_class: ClassId, args: Vec<TypedExpr> },
+    /// chain). `None` means no `__init__` exists in the chain — codegen
+    /// allocates and returns without calling any init function (Python's
+    /// implicit `object.__init__`; only valid with zero args). With
+    /// single inheritance the layout is prefix-compatible so codegen
+    /// bitcasts the `self_ptr` to `init_class` for the call.
+    ClassNew { class: ClassId, init_class: Option<ClassId>, args: Vec<TypedExpr> },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
