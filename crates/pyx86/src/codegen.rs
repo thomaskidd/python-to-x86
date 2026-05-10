@@ -1608,25 +1608,52 @@ impl Codegen {
         ));
     }
 
-    /// `d[k] = v` for `Type::Dict`. Lowers to `pyx86_dict_i64_insert`,
-    /// which handles both new insertion and overwrite, plus growth.
+    /// `container[key] = value` for either `Type::Dict` or `Type::List`.
     fn lower_set_subscript(&mut self, container: &TypedExpr, key: &TypedExpr, value: &TypedExpr) {
-        assert!(
-            matches!(container.ty, Type::Dict(_)),
-            "internal: SetSubscript on non-dict type"
-        );
-        let dict_op = self.lower(container);
-        let key_op = self.lower(key);
-        let value_op = self.lower(value);
-        let table_raw = self.fresh();
-        self.emit(&format!(
-            "{} = bitcast {{ i64, i64, i8* }}* {} to i8*",
-            table_raw, dict_op
-        ));
-        self.emit(&format!(
-            "call void @pyx86_dict_i64_insert(i8* {}, i64 {}, i64 {})",
-            table_raw, key_op, value_op
-        ));
+        match container.ty {
+            Type::Dict(_) => {
+                let dict_op = self.lower(container);
+                let key_op = self.lower(key);
+                let value_op = self.lower(value);
+                let table_raw = self.fresh();
+                self.emit(&format!(
+                    "{} = bitcast {{ i64, i64, i8* }}* {} to i8*",
+                    table_raw, dict_op
+                ));
+                self.emit(&format!(
+                    "call void @pyx86_dict_i64_insert(i8* {}, i64 {}, i64 {})",
+                    table_raw, key_op, value_op
+                ));
+            }
+            Type::List(id) => {
+                let elem_llvm = llvm_ty(id.elem());
+                let list_op = self.lower(container);
+                let idx_op = self.lower(key);
+                let value_op = self.lower(value);
+                let data_p = self.fresh();
+                self.emit(&format!(
+                    "{} = getelementptr {{ i64, i64, i8* }}, {{ i64, i64, i8* }}* {}, i32 0, i32 2",
+                    data_p, list_op
+                ));
+                let data_raw = self.fresh();
+                self.emit(&format!("{} = load i8*, i8** {}", data_raw, data_p));
+                let data_typed = self.fresh();
+                self.emit(&format!(
+                    "{} = bitcast i8* {} to {}*",
+                    data_typed, data_raw, elem_llvm
+                ));
+                let slot = self.fresh();
+                self.emit(&format!(
+                    "{} = getelementptr {ety}, {ety}* {}, i64 {}",
+                    slot, data_typed, idx_op, ety = elem_llvm
+                ));
+                self.emit(&format!(
+                    "store {ety} {}, {ety}* {}",
+                    value_op, slot, ety = elem_llvm
+                ));
+            }
+            other => panic!("internal: SetSubscript on unsupported type {:?}", other),
+        }
     }
 
     fn lower_math_call(&mut self, intrinsic: &str, arg: &TypedExpr) -> String {
