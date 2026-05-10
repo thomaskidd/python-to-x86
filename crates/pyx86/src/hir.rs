@@ -299,6 +299,13 @@ pub enum Stmt {
         field_index: usize,
         value: TypedExpr,
     },
+    /// `<container>[<key>] = <value>`. In v0.28, `container.ty` must be
+    /// `Type::Dict`. Codegen lowers to `pyx86_dict_i64_insert`.
+    SetSubscript {
+        container: TypedExpr,
+        key: TypedExpr,
+        value: TypedExpr,
+    },
     /// Expression evaluated for its side effect; result discarded.
     /// Currently only used for Call expressions in stmt position.
     ExprStmt(TypedExpr),

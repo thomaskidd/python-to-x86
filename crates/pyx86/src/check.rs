@@ -619,6 +619,24 @@ fn lower_block(
                         let value = coerce(value, field_ty)?;
                         out.push(Stmt::SetField { obj, field_index, value });
                     }
+                    ast::Expr::Subscript(s) => {
+                        let container = lower_expr(&s.value, scope, signatures)?;
+                        let dict_id = match container.ty {
+                            Type::Dict(id) => id,
+                            Type::List(_) => bail!(
+                                "unsupported_feature: list subscript-assignment `lst[i] = v` is not supported in v0.28 (deferred)"
+                            ),
+                            other => bail!(
+                                "unsupported_feature: subscript-assignment on {} is not supported",
+                                other.name()
+                            ),
+                        };
+                        let key = lower_expr(&s.slice, scope, signatures)?;
+                        let key = coerce(key, dict_id.key())?;
+                        let value = lower_expr(&a.value, scope, signatures)?;
+                        let value = coerce(value, dict_id.val())?;
+                        out.push(Stmt::SetSubscript { container, key, value });
+                    }
                     other => bail!(
                         "unsupported_feature: assignment target `{}` not supported",
                         expr_kind_name(other)
@@ -935,27 +953,6 @@ fn lower_block(
         }
     }
     Ok(out)
-}
-
-fn parse_assign_target(targets: &[ast::Expr]) -> Result<String> {
-    if targets.len() != 1 {
-        bail!(
-            "unsupported_feature: chained assignment `a = b = ...` is not supported (use separate statements)"
-        );
-    }
-    match &targets[0] {
-        ast::Expr::Name(n) => Ok(n.id.as_str().to_string()),
-        ast::Expr::Tuple(_) | ast::Expr::List(_) => {
-            bail!("unsupported_feature: tuple/list unpacking on assignment is not supported")
-        }
-        ast::Expr::Subscript(_) | ast::Expr::Attribute(_) => {
-            bail!("unsupported_feature: subscript / attribute assignment is not supported")
-        }
-        other => bail!(
-            "unsupported_feature: assignment target `{}` is not supported",
-            expr_kind_name(other)
-        ),
-    }
 }
 
 fn parse_type_annotation(ann: Option<&ast::Expr>) -> Option<Type> {
@@ -1330,13 +1327,9 @@ fn lower_expr(e: &ast::Expr, scope: &Scope, signatures: &SignatureTable) -> Resu
         }
         ast::Expr::Dict(d) => {
             // `{k: v, ...}` literal. v0.26: I64 → I64 only.
-            // Empty `{}` is rejected for now (no annotation pickup like
-            // empty list — could be added with the same re-tag trick).
-            if d.keys.is_empty() {
-                bail!(
-                    "unsupported_feature: empty dict literal `{{}}` not yet supported (annotate explicitly when implemented)"
-                );
-            }
+            // Empty `{}` is lowered as `DictLit { entries: [] }` and can be
+            // coerced to any concrete `dict[K, V]` via the empty-dict re-tag
+            // in `coerce` — same trick as empty lists.
             // dict.keys is Vec<Option<Expr>> where None means **unpack.
             let mut entries: Vec<(TypedExpr, TypedExpr)> = Vec::with_capacity(d.keys.len());
             for (k, v) in d.keys.iter().zip(d.values.iter()) {
@@ -1928,6 +1921,14 @@ fn coerce(e: TypedExpr, target: Type) -> Result<TypedExpr> {
         if let Expr::ListLit { elements } = &e.expr {
             if elements.is_empty() {
                 return Ok(TypedExpr::new(target, Expr::ListLit { elements: Vec::new() }));
+            }
+        }
+    }
+    // Same trick for empty dict literals: `d: dict[K, V] = {}` works.
+    if let (Type::Dict(_), Type::Dict(_)) = (e.ty, target) {
+        if let Expr::DictLit { entries } = &e.expr {
+            if entries.is_empty() {
+                return Ok(TypedExpr::new(target, Expr::DictLit { entries: Vec::new() }));
             }
         }
     }

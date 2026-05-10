@@ -232,18 +232,76 @@ not_found:
   ret i64 0
 }
 
-define internal void @pyx86_dict_i64_insert(i8* %table_raw, i64 %key, i64 %value) {
+; Grow the dict to 2x its current capacity. Called by insert when load
+; factor reaches 75%. The outer-struct pointer stays valid; only the
+; slot array is reallocated. Old slot memory is leaked (v1 ref-counting
+; not yet wired up; v0.28 ships consistent with v0.27 in this respect).
+define internal void @pyx86_dict_i64_grow(i8* %table_raw) {
 entry:
+  %g.i.addr = alloca i64
   %tp = bitcast i8* %table_raw to { i64, i64, i8* }*
   %size_p = getelementptr { i64, i64, i8* }, { i64, i64, i8* }* %tp, i32 0, i32 0
   %cap_p = getelementptr { i64, i64, i8* }, { i64, i64, i8* }* %tp, i32 0, i32 1
-  %cap = load i64, i64* %cap_p
   %slots_pp = getelementptr { i64, i64, i8* }, { i64, i64, i8* }* %tp, i32 0, i32 2
+  %old_cap = load i64, i64* %cap_p
+  %old_slots_raw = load i8*, i8** %slots_pp
+  %old_slots = bitcast i8* %old_slots_raw to { i64, i64, i64 }*
+  %new_cap = mul i64 %old_cap, 2
+  %new_bytes = mul i64 %new_cap, 24
+  %new_slots_raw = call i8* @malloc(i64 %new_bytes)
+  call void @llvm.memset.p0i8.i64(i8* %new_slots_raw, i8 0, i64 %new_bytes, i1 false)
+  store i8* %new_slots_raw, i8** %slots_pp
+  store i64 %new_cap, i64* %cap_p
+  store i64 0, i64* %size_p
+  store i64 0, i64* %g.i.addr
+  br label %g_loop
+g_loop:
+  %g_i = load i64, i64* %g.i.addr
+  %g_done = icmp uge i64 %g_i, %old_cap
+  br i1 %g_done, label %g_ret, label %g_body
+g_body:
+  %g_slot = getelementptr { i64, i64, i64 }, { i64, i64, i64 }* %old_slots, i64 %g_i
+  %g_occ_p = getelementptr { i64, i64, i64 }, { i64, i64, i64 }* %g_slot, i32 0, i32 2
+  %g_occ = load i64, i64* %g_occ_p
+  %g_is_occ = icmp ne i64 %g_occ, 0
+  br i1 %g_is_occ, label %g_reinsert, label %g_skip
+g_reinsert:
+  %g_k_p = getelementptr { i64, i64, i64 }, { i64, i64, i64 }* %g_slot, i32 0, i32 0
+  %g_k = load i64, i64* %g_k_p
+  %g_v_p = getelementptr { i64, i64, i64 }, { i64, i64, i64 }* %g_slot, i32 0, i32 1
+  %g_v = load i64, i64* %g_v_p
+  call void @pyx86_dict_i64_insert(i8* %table_raw, i64 %g_k, i64 %g_v)
+  br label %g_skip
+g_skip:
+  %g_i_next = add i64 %g_i, 1
+  store i64 %g_i_next, i64* %g.i.addr
+  br label %g_loop
+g_ret:
+  ret void
+}
+
+define internal void @pyx86_dict_i64_insert(i8* %table_raw, i64 %key, i64 %value) {
+entry:
+  %i.addr = alloca i64
+  %tp = bitcast i8* %table_raw to { i64, i64, i8* }*
+  %size_p = getelementptr { i64, i64, i8* }, { i64, i64, i8* }* %tp, i32 0, i32 0
+  %cap_p = getelementptr { i64, i64, i8* }, { i64, i64, i8* }* %tp, i32 0, i32 1
+  %slots_pp = getelementptr { i64, i64, i8* }, { i64, i64, i8* }* %tp, i32 0, i32 2
+  %sz0 = load i64, i64* %size_p
+  %cap0 = load i64, i64* %cap_p
+  %sz4 = mul i64 %sz0, 4
+  %cap3 = mul i64 %cap0, 3
+  %need_grow = icmp uge i64 %sz4, %cap3
+  br i1 %need_grow, label %do_grow, label %probe_init
+do_grow:
+  call void @pyx86_dict_i64_grow(i8* %table_raw)
+  br label %probe_init
+probe_init:
+  %cap = load i64, i64* %cap_p
   %slots_raw = load i8*, i8** %slots_pp
   %slots = bitcast i8* %slots_raw to { i64, i64, i64 }*
   %mask = sub i64 %cap, 1
   %h = and i64 %key, %mask
-  %i.addr = alloca i64
   store i64 %h, i64* %i.addr
   br label %loop
 loop:
@@ -643,6 +701,9 @@ impl Codegen {
                 }
                 Stmt::SetField { obj, field_index, value } => {
                     self.lower_set_field(obj, *field_index, value);
+                }
+                Stmt::SetSubscript { container, key, value } => {
+                    self.lower_set_subscript(container, key, value);
                 }
                 Stmt::ExprStmt(e) => {
                     let _ = self.lower(e);
@@ -1547,6 +1608,27 @@ impl Codegen {
         ));
     }
 
+    /// `d[k] = v` for `Type::Dict`. Lowers to `pyx86_dict_i64_insert`,
+    /// which handles both new insertion and overwrite, plus growth.
+    fn lower_set_subscript(&mut self, container: &TypedExpr, key: &TypedExpr, value: &TypedExpr) {
+        assert!(
+            matches!(container.ty, Type::Dict(_)),
+            "internal: SetSubscript on non-dict type"
+        );
+        let dict_op = self.lower(container);
+        let key_op = self.lower(key);
+        let value_op = self.lower(value);
+        let table_raw = self.fresh();
+        self.emit(&format!(
+            "{} = bitcast {{ i64, i64, i8* }}* {} to i8*",
+            table_raw, dict_op
+        ));
+        self.emit(&format!(
+            "call void @pyx86_dict_i64_insert(i8* {}, i64 {}, i64 {})",
+            table_raw, key_op, value_op
+        ));
+    }
+
     fn lower_math_call(&mut self, intrinsic: &str, arg: &TypedExpr) -> String {
         let v = self.lower(arg);
         let dst = self.fresh();
@@ -1801,6 +1883,11 @@ fn walk_stmts(stmts: &[Stmt], out: &mut Vec<(String, Type)>, seen: &mut HashSet<
             }
             Stmt::SetField { obj, value, .. } => {
                 walk_expr(obj, out, seen);
+                walk_expr(value, out, seen);
+            }
+            Stmt::SetSubscript { container, key, value } => {
+                walk_expr(container, out, seen);
+                walk_expr(key, out, seen);
                 walk_expr(value, out, seen);
             }
             Stmt::ExprStmt(e) => walk_expr(e, out, seen),
