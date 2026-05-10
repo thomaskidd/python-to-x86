@@ -1628,6 +1628,53 @@ fn lower_expr(e: &ast::Expr, scope: &Scope, signatures: &SignatureTable) -> Resu
                     },
                 ));
             }
+            // String indexing / slicing.
+            if value.ty == Type::Str {
+                if let ast::Expr::Slice(slc) = s.slice.as_ref() {
+                    if slc.step.is_some() {
+                        bail!(
+                            "unsupported_feature: string slice step (`s[::2]`) is not supported"
+                        );
+                    }
+                    reject_negative_index_expr(slc.lower.as_deref(), "string slice lower bound")?;
+                    reject_negative_index_expr(slc.upper.as_deref(), "string slice upper bound")?;
+                    let start = match slc.lower.as_deref() {
+                        Some(e) => {
+                            let v = lower_expr(e, scope, signatures)?;
+                            coerce(v, Type::I64)?
+                        }
+                        None => TypedExpr::new(Type::I64, Expr::ConstI64(0)),
+                    };
+                    let stop = match slc.upper.as_deref() {
+                        Some(e) => {
+                            let v = lower_expr(e, scope, signatures)?;
+                            coerce(v, Type::I64)?
+                        }
+                        None => TypedExpr::new(
+                            Type::I64,
+                            Expr::StrLen { s: Box::new(value.clone()) },
+                        ),
+                    };
+                    return Ok(TypedExpr::new(
+                        Type::Str,
+                        Expr::StrSlice {
+                            s: Box::new(value),
+                            start: Box::new(start),
+                            stop: Box::new(stop),
+                        },
+                    ));
+                }
+                reject_negative_index_expr(Some(s.slice.as_ref()), "string index")?;
+                let index = lower_expr(&s.slice, scope, signatures)?;
+                let index = coerce(index, Type::I64)?;
+                return Ok(TypedExpr::new(
+                    Type::Str,
+                    Expr::StrIndex {
+                        s: Box::new(value),
+                        index: Box::new(index),
+                    },
+                ));
+            }
             let id = match value.ty {
                 Type::Tuple(id) => id,
                 other => bail!(
@@ -1687,6 +1734,24 @@ fn lower_expr(e: &ast::Expr, scope: &Scope, signatures: &SignatureTable) -> Resu
             expr_kind_name(other)
         ),
     }
+}
+
+/// Reject a syntactic negative literal in an index/bound position.
+/// Used by string indexing/slicing in v0.31 — Python's negative indexing
+/// is deferred. Runtime negative values are not detected; this only
+/// catches the literal form `s[-1]` / `s[-3:-1]`.
+fn reject_negative_index_expr(e: Option<&ast::Expr>, what: &str) -> Result<()> {
+    let Some(e) = e else { return Ok(()) };
+    if let ast::Expr::UnaryOp(u) = e {
+        if matches!(u.op, ast::UnaryOp::USub) {
+            bail!(
+                "unsupported_feature: negative {} (`{}`) is not supported (Python negative-indexing is deferred)",
+                what,
+                "-..."
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Lower an f-string (`ast::Expr::JoinedStr`) to a chain of `StrConcat`
