@@ -1192,10 +1192,74 @@ fn lower_expr(e: &ast::Expr, scope: &Scope, signatures: &SignatureTable) -> Resu
             };
             let lhs = lower_expr(&b.left, scope, signatures)?;
             let rhs = lower_expr(&b.right, scope, signatures)?;
+            // Operator overloading: dispatch class+class BinOps to the
+            // dunder method on the lhs's class (no reflected ops in
+            // v0.36; reject if classes differ).
+            if let (Type::Class(lc), Type::Class(rc)) = (lhs.ty, rhs.ty) {
+                let dunder = binop_dunder(op);
+                if lc != rc {
+                    bail!(
+                        "unsupported_feature: `{}` between class instances must use the same class type ({} vs {})",
+                        binop_symbol(op),
+                        lc.name(),
+                        rc.name()
+                    );
+                }
+                let (_owner, mangled) = resolve_method(lc, dunder, signatures)
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "unsupported_feature: class `{}` has no `{}` method (define one to use `{}`)",
+                            lc.name(), dunder, binop_symbol(op)
+                        )
+                    })?;
+                let sig = signatures.get(&mangled).unwrap();
+                if sig.params.len() != 2 {
+                    bail!(
+                        "unsupported_feature: `{}` on `{}` must take (self, other)",
+                        dunder, lc.name()
+                    );
+                }
+                let lhs_arg = coerce(lhs, sig.params[0].ty)?;
+                let rhs_arg = coerce(rhs, sig.params[1].ty)?;
+                return Ok(TypedExpr::new(
+                    sig.return_ty,
+                    Expr::Call { callee: mangled, args: vec![lhs_arg, rhs_arg] },
+                ));
+            }
             apply_binop(op, lhs, rhs)
         }
         ast::Expr::UnaryOp(u) => {
             let operand = lower_expr(&u.operand, scope, signatures)?;
+            // Unary on class instances → dispatch to __neg__ for USub.
+            // Other unary ops (UAdd, Not, Invert) are not yet
+            // overloaded for classes (defer until needed).
+            if let Type::Class(cid) = operand.ty {
+                if matches!(u.op, ast::UnaryOp::USub) {
+                    let (_owner, mangled) = resolve_method(cid, "__neg__", signatures)
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "unsupported_feature: class `{}` has no `__neg__` method (define one to use unary `-`)",
+                                cid.name()
+                            )
+                        })?;
+                    let sig = signatures.get(&mangled).unwrap();
+                    if sig.params.len() != 1 {
+                        bail!(
+                            "unsupported_feature: `__neg__` on `{}` must take only `self`",
+                            cid.name()
+                        );
+                    }
+                    let arg = coerce(operand, sig.params[0].ty)?;
+                    return Ok(TypedExpr::new(
+                        sig.return_ty,
+                        Expr::Call { callee: mangled, args: vec![arg] },
+                    ));
+                }
+                bail!(
+                    "unsupported_feature: unary operator on class `{}` is only supported via `__neg__`",
+                    cid.name()
+                );
+            }
             match u.op {
                 ast::UnaryOp::USub => apply_unop(UnaryOp::Neg, operand),
                 ast::UnaryOp::UAdd => apply_unop(UnaryOp::Pos, operand),
@@ -1256,16 +1320,17 @@ fn lower_expr(e: &ast::Expr, scope: &Scope, signatures: &SignatureTable) -> Resu
             let rest = rest_ops?;
             if rest.len() == 1 {
                 let (op, rhs) = rest.into_iter().next().unwrap();
-                // Class instance == / != → dispatch to __eq__.
+                // Class instance ==/!= → __eq__; ordering → __lt__/__le__/__gt__/__ge__.
                 if let (Type::Class(lc), Type::Class(rc)) = (first.ty, rhs.ty) {
+                    if lc != rc {
+                        bail!(
+                            "unsupported_feature: `{}` between class instances must use the same class type ({} vs {})",
+                            cmp_symbol(op),
+                            lc.name(),
+                            rc.name()
+                        );
+                    }
                     if matches!(op, CmpOp::Eq | CmpOp::Ne) {
-                        if lc != rc {
-                            bail!(
-                                "unsupported_feature: == between class instances must use the same class type ({} vs {})",
-                                lc.name(),
-                                rc.name()
-                            );
-                        }
                         let (_owner, mangled) = resolve_method(lc, "__eq__", signatures)
                             .ok_or_else(|| {
                                 anyhow!(
@@ -1290,11 +1355,29 @@ fn lower_expr(e: &ast::Expr, scope: &Scope, signatures: &SignatureTable) -> Resu
                             return Ok(TypedExpr::new(Type::Bool, Expr::Not(Box::new(call))));
                         }
                         return Ok(call);
-                    } else {
+                    }
+                    // Ordering comparison via __lt__ / __le__ / __gt__ / __ge__.
+                    let dunder = cmp_dunder(op).unwrap();
+                    let (_owner, mangled) = resolve_method(lc, dunder, signatures)
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "unsupported_feature: class `{}` has no `{}` method (define one to use `{}`)",
+                                lc.name(), dunder, cmp_symbol(op)
+                            )
+                        })?;
+                    let sig = signatures.get(&mangled).unwrap();
+                    if sig.params.len() != 2 || sig.return_ty != Type::Bool {
                         bail!(
-                            "unsupported_feature: only == and != are supported between class instances (no <, >, etc.)"
+                            "unsupported_feature: `{}` on `{}` must take (self, other) and return `bool`",
+                            dunder, lc.name()
                         );
                     }
+                    let lhs_arg = coerce(first, sig.params[0].ty)?;
+                    let rhs_arg = coerce(rhs, sig.params[1].ty)?;
+                    return Ok(TypedExpr::new(
+                        Type::Bool,
+                        Expr::Call { callee: mangled, args: vec![lhs_arg, rhs_arg] },
+                    ));
                 }
                 // String comparison: only ==/!= supported.
                 if first.ty == Type::Str || rhs.ty == Type::Str {
@@ -2016,6 +2099,64 @@ fn lower_expr(e: &ast::Expr, scope: &Scope, signatures: &SignatureTable) -> Resu
             "unsupported_feature: expression form `{}` is not supported",
             expr_kind_name(other)
         ),
+    }
+}
+
+/// Map a `BinOp` to its Python dunder method name.
+fn binop_dunder(op: BinOp) -> &'static str {
+    match op {
+        BinOp::Add => "__add__",
+        BinOp::Sub => "__sub__",
+        BinOp::Mul => "__mul__",
+        BinOp::TrueDiv => "__truediv__",
+        BinOp::FloorDiv => "__floordiv__",
+        BinOp::Mod => "__mod__",
+        BinOp::Pow => "__pow__",
+        BinOp::BitAnd => "__and__",
+        BinOp::BitOr => "__or__",
+        BinOp::BitXor => "__xor__",
+        BinOp::Shl => "__lshift__",
+        BinOp::Shr => "__rshift__",
+    }
+}
+
+fn binop_symbol(op: BinOp) -> &'static str {
+    match op {
+        BinOp::Add => "+",
+        BinOp::Sub => "-",
+        BinOp::Mul => "*",
+        BinOp::TrueDiv => "/",
+        BinOp::FloorDiv => "//",
+        BinOp::Mod => "%",
+        BinOp::Pow => "**",
+        BinOp::BitAnd => "&",
+        BinOp::BitOr => "|",
+        BinOp::BitXor => "^",
+        BinOp::Shl => "<<",
+        BinOp::Shr => ">>",
+    }
+}
+
+/// Map an ordering `CmpOp` to its Python dunder method name. Returns
+/// None for `Eq` / `Ne` since those are handled by the `__eq__` path.
+fn cmp_dunder(op: CmpOp) -> Option<&'static str> {
+    match op {
+        CmpOp::Lt => Some("__lt__"),
+        CmpOp::Le => Some("__le__"),
+        CmpOp::Gt => Some("__gt__"),
+        CmpOp::Ge => Some("__ge__"),
+        CmpOp::Eq | CmpOp::Ne => None,
+    }
+}
+
+fn cmp_symbol(op: CmpOp) -> &'static str {
+    match op {
+        CmpOp::Lt => "<",
+        CmpOp::Le => "<=",
+        CmpOp::Gt => ">",
+        CmpOp::Ge => ">=",
+        CmpOp::Eq => "==",
+        CmpOp::Ne => "!=",
     }
 }
 
