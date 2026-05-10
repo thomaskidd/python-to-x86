@@ -1694,22 +1694,20 @@ impl Codegen {
         dst
     }
 
-    /// `Foo(args...)` — allocate the outer struct on the heap and call
-    /// `<init_class>.__init__(self_ptr_as_init_class, args...)`. The init
-    /// function returns its self type; we discard it and use our own
-    /// outer-typed pointer (same memory). With inheritance, `init_class`
-    /// may be an ancestor of `class_id`; we bitcast the pointer for the
-    /// call due to layout prefix compatibility.
+    /// `Foo(args...)` — allocate the outer struct on the heap and, if
+    /// `init_class.is_some()`, call its `__init__(self_ptr, args...)`.
+    /// With inheritance, `init_class` may be an ancestor of `class_id`;
+    /// we bitcast the pointer for the call due to layout prefix
+    /// compatibility. With `init_class = None`, no init call is emitted
+    /// (Python's implicit `object.__init__`).
     fn lower_class_new(
         &mut self,
         class_id: crate::hir::ClassId,
-        init_class: crate::hir::ClassId,
+        init_class: Option<crate::hir::ClassId>,
         args: &[TypedExpr],
     ) -> String {
         let outer_llvm = llvm_ty(Type::Class(class_id));
         let outer_sty = outer_llvm.trim_end_matches('*').trim_end().to_string();
-        let init_llvm = llvm_ty(Type::Class(init_class));
-        let init_sty = init_llvm.trim_end_matches('*').trim_end().to_string();
         let bytes = class_byte_size(class_id);
         let raw = self.fresh();
         self.emit(&format!("{} = call i8* @malloc(i64 {})", raw, bytes));
@@ -1719,34 +1717,46 @@ impl Codegen {
             self_outer, raw,
             sty = outer_sty
         ));
-        // For the __init__ call we need the receiver typed as the init's
-        // owning class. Same memory, different LLVM type.
-        let self_init = if class_id == init_class {
-            self_outer.clone()
-        } else {
-            let p = self.fresh();
+        // Zero the allocation so unset fields read as 0 (matches
+        // Python's implicit defaults when no __init__ runs).
+        if init_class.is_none() {
             self.emit(&format!(
-                "{} = bitcast {osty}* {} to {isty}*",
-                p, self_outer,
-                osty = outer_sty,
+                "call void @llvm.memset.p0i8.i64(i8* {}, i8 0, i64 {}, i1 false)",
+                raw, bytes
+            ));
+        }
+        if let Some(ic) = init_class {
+            let init_llvm = llvm_ty(Type::Class(ic));
+            let init_sty = init_llvm.trim_end_matches('*').trim_end().to_string();
+            // For the __init__ call we need the receiver typed as the init's
+            // owning class. Same memory, different LLVM type.
+            let self_init = if class_id == ic {
+                self_outer.clone()
+            } else {
+                let p = self.fresh();
+                self.emit(&format!(
+                    "{} = bitcast {osty}* {} to {isty}*",
+                    p, self_outer,
+                    osty = outer_sty,
+                    isty = init_sty
+                ));
+                p
+            };
+            let arg_ops: Vec<String> = args.iter().map(|a| self.lower(a)).collect();
+            let mut call_args: Vec<String> =
+                vec![format!("{sty}* {}", self_init, sty = init_sty)];
+            for (op, ty) in arg_ops.iter().zip(args.iter().map(|a| a.ty)) {
+                call_args.push(format!("{} {}", llvm_ty(ty), op));
+            }
+            let _discarded = self.fresh();
+            self.emit(&format!(
+                "{} = call {isty}* @py_{}.__init__({})",
+                _discarded,
+                ic.name(),
+                call_args.join(", "),
                 isty = init_sty
             ));
-            p
-        };
-        let arg_ops: Vec<String> = args.iter().map(|a| self.lower(a)).collect();
-        let mut call_args: Vec<String> =
-            vec![format!("{sty}* {}", self_init, sty = init_sty)];
-        for (op, ty) in arg_ops.iter().zip(args.iter().map(|a| a.ty)) {
-            call_args.push(format!("{} {}", llvm_ty(ty), op));
         }
-        let _discarded = self.fresh();
-        self.emit(&format!(
-            "{} = call {isty}* @py_{}.__init__({})",
-            _discarded,
-            init_class.name(),
-            call_args.join(", "),
-            isty = init_sty
-        ));
         self_outer
     }
 

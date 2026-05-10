@@ -41,6 +41,18 @@ type SignatureTable = HashMap<String, FunctionSig>;
 
 pub fn lower(module: &Module, source_path: &Path) -> Result<Program> {
     CLASS_REGISTRY.with(|r| r.borrow_mut().clear());
+    // Pre-register `ABC` as a sentinel class with no fields, no methods,
+    // and no abstract methods. Used to recognize `class Foo(ABC):` at
+    // pass 0b. v0.34 marks classes as abstract via their declared
+    // @abstractmethod decorators, not via ABC inheritance directly
+    // (matches Python: `class C(ABC): pass; C()` is allowed).
+    let abc_id = ClassId::intern(ClassDef {
+        name: "ABC".to_string(),
+        fields: Vec::new(),
+        parent: None,
+        abstract_methods: Vec::new(),
+    });
+    CLASS_REGISTRY.with(|r| r.borrow_mut().insert("ABC".to_string(), abc_id));
     let mut loaded: HashSet<PathBuf> = HashSet::new();
     let mut all_functions: Vec<Function> = Vec::new();
     let mut signatures: SignatureTable = HashMap::new();
@@ -111,6 +123,7 @@ fn lower_module_into(
                 name: name.clone(),
                 fields: Vec::new(),
                 parent: None,
+                abstract_methods: Vec::new(),
             });
             CLASS_REGISTRY.with(|r| r.borrow_mut().insert(name, id));
         }
@@ -123,12 +136,19 @@ fn lower_module_into(
         if let ast::Stmt::ClassDef(c) = stmt {
             let name = c.name.as_str().to_string();
             let class_id = CLASS_REGISTRY.with(|r| r.borrow()[&name]);
-            // Single-inheritance base.
+            // v0.34 keeps single-base inheritance (from v0.33). The base
+            // may be either a concrete class or an abstract one — the
+            // only difference is that the subclass inherits any
+            // unimplemented abstract methods. The sentinel `ABC` itself
+            // is a valid base; it has no fields and no methods, so
+            // `class Foo(ABC):` is equivalent to no base for layout but
+            // signals "this class participates in the ABC protocol".
+            // Multi-base interface-style inheritance is deferred to a
+            // later slice (needs vtables to be useful anyway).
             let parent_id: Option<ClassId> = if c.bases.is_empty() {
                 None
             } else if c.bases.len() == 1 {
-                let base_expr = &c.bases[0];
-                let base_name = match base_expr {
+                let base_name = match &c.bases[0] {
                     ast::Expr::Name(n) => n.id.as_str(),
                     _ => bail!(
                         "unsupported_feature: base class must be a simple class name (in `{}`)",
@@ -147,8 +167,7 @@ fn lower_module_into(
                 Some(base_id)
             } else {
                 bail!(
-                    "unsupported_feature: multiple inheritance is not supported (in `{}`)",
-                    name
+                    "unsupported_feature: multiple inheritance is not supported in v0.34 (only single-base; interface-style ABCs are deferred)"
                 );
             };
             class_id.set_parent(parent_id);
@@ -172,6 +191,11 @@ fn lower_module_into(
             };
             let mut field_names: HashSet<String> =
                 fields.iter().map(|(n, _)| n.clone()).collect();
+            // Seed unimplemented-abstract set with what we inherit.
+            let mut unimplemented: HashSet<String> = match parent_id {
+                Some(p) => p.abstract_methods().into_iter().collect(),
+                None => HashSet::new(),
+            };
             for inner in &c.body {
                 match inner {
                     ast::Stmt::AnnAssign(a) => {
@@ -206,17 +230,32 @@ fn lower_module_into(
                         fields.push((fname, ty));
                     }
                     ast::Stmt::FunctionDef(f) => {
+                        let is_abstract_decorated = f.decorator_list.iter().any(|d| {
+                            matches!(d, ast::Expr::Name(n) if n.id.as_str() == "abstractmethod")
+                        });
                         let mname = format!("{}.{}", name, f.name);
-                        if signatures.contains_key(&mname) {
-                            bail!(
-                                "unsupported_feature: duplicate method `{}` in class `{}`",
-                                f.name,
-                                name
-                            );
+                        if is_abstract_decorated {
+                            // Abstract methods are recorded in the
+                            // abstract set and don't get lowered or
+                            // registered in `signatures`. (We also don't
+                            // care about their body — Python idiomatically
+                            // uses `pass` or `...`.)
+                            unimplemented.insert(f.name.as_str().to_string());
+                        } else {
+                            if signatures.contains_key(&mname) {
+                                bail!(
+                                    "unsupported_feature: duplicate method `{}` in class `{}`",
+                                    f.name,
+                                    name
+                                );
+                            }
+                            let sig = collect_method_signature(class_id, f)?;
+                            signatures.insert(mname.clone(), sig);
+                            local_method_defs.push((class_id, mname, f));
+                            // A concrete method override removes the
+                            // method name from the unimplemented set.
+                            unimplemented.remove(f.name.as_str());
                         }
-                        let sig = collect_method_signature(class_id, f)?;
-                        signatures.insert(mname.clone(), sig);
-                        local_method_defs.push((class_id, mname, f));
                     }
                     ast::Stmt::Pass(_) => {}
                     other => bail!(
@@ -226,8 +265,11 @@ fn lower_module_into(
                     ),
                 }
             }
-            // Now finalize fields on the class.
+            // Now finalize fields + abstract-method set on the class.
             class_id.set_fields(fields);
+            let mut unimplemented_vec: Vec<String> = unimplemented.into_iter().collect();
+            unimplemented_vec.sort();
+            class_id.set_abstract_methods(unimplemented_vec);
         }
     }
 
@@ -252,7 +294,7 @@ fn lower_module_into(
             ast::Stmt::ImportFrom(im) => {
                 let module_name = im.module.as_ref().map(|s| s.as_str()).unwrap_or("");
                 match module_name {
-                    "pyx86.types" | "__future__" | "math" => {
+                    "pyx86.types" | "__future__" | "math" | "abc" => {
                         // Documentary imports; no file load. Names from
                         // math are recognized by lower_builtin_call directly.
                     }
@@ -398,6 +440,7 @@ fn collect_method_signature(
                 func.name
             )
         })?;
+        reject_abstract_type(ty, "method parameter type")?;
         params.push(Param { name, ty });
     }
     let return_ty = match parse_type_annotation(func.returns.as_deref()) {
@@ -411,6 +454,7 @@ fn collect_method_signature(
             func.name
         ),
     };
+    reject_abstract_type(return_ty, "method return type")?;
     if func.args.defaults().next().is_some() {
         bail!(
             "unsupported_feature: default args on methods not yet supported (on `{}`)",
@@ -510,6 +554,7 @@ fn collect_signature(func: &ast::StmtFunctionDef) -> Result<FunctionSig> {
                 func.name
             )
         })?;
+        reject_abstract_type(ty, "function parameter type")?;
         params.push(Param { name, ty });
     }
 
@@ -520,6 +565,7 @@ fn collect_signature(func: &ast::StmtFunctionDef) -> Result<FunctionSig> {
             func.name
         ),
     };
+    reject_abstract_type(return_ty, "function return type")?;
 
     let raw_defaults: Vec<&ast::Expr> = func.args.defaults().collect();
     let n = params.len();
@@ -696,6 +742,7 @@ fn lower_block(
                         name
                     )
                 })?;
+                reject_abstract_type(declared_ty, "local variable type")?;
                 let value_expr = a.value.as_deref().ok_or_else(|| {
                     anyhow!(
                         "unsupported_feature: bare annotation `{}: <type>` (no value) is not supported",
@@ -1398,15 +1445,39 @@ fn lower_expr(e: &ast::Expr, scope: &Scope, signatures: &SignatureTable) -> Resu
             };
             // Class constructor: `Foo(args)` if Foo is a registered class.
             if let Some(class_id) = CLASS_REGISTRY.with(|r| r.borrow().get(&callee).copied()) {
+                if class_id.is_abstract() {
+                    bail!(
+                        "unsupported_feature: cannot instantiate abstract class `{}`: missing implementations of {:?}",
+                        callee,
+                        class_id.abstract_methods()
+                    );
+                }
                 // Resolve __init__ via the inheritance chain — a subclass
-                // without its own __init__ uses the parent's.
-                let (init_class, init_name) =
-                    resolve_method(class_id, "__init__", signatures).ok_or_else(|| {
-                        anyhow!(
-                            "unsupported_feature: class `{}` has no __init__ method (and no ancestor defines one)",
-                            callee
-                        )
-                    })?;
+                // without its own __init__ uses the parent's. If none
+                // exists anywhere AND no args are passed, allocate
+                // without calling any init (Python's implicit
+                // `object.__init__()`).
+                let resolved = resolve_method(class_id, "__init__", signatures);
+                let (init_class, init_name) = match resolved {
+                    Some(r) => r,
+                    None => {
+                        if !c.args.is_empty() || !c.keywords.is_empty() {
+                            bail!(
+                                "unsupported_feature: class `{}` has no __init__ method (and no ancestor defines one), so `{}()` must be called with no arguments",
+                                callee,
+                                callee
+                            );
+                        }
+                        return Ok(TypedExpr::new(
+                            Type::Class(class_id),
+                            Expr::ClassNew {
+                                class: class_id,
+                                init_class: None,
+                                args: Vec::new(),
+                            },
+                        ));
+                    }
+                };
                 let init_sig = signatures.get(&init_name).unwrap();
                 if c.args.len() != init_sig.params.len() - 1 {
                     bail!(
@@ -1426,7 +1497,7 @@ fn lower_expr(e: &ast::Expr, scope: &Scope, signatures: &SignatureTable) -> Resu
                 }
                 return Ok(TypedExpr::new(
                     Type::Class(class_id),
-                    Expr::ClassNew { class: class_id, init_class, args },
+                    Expr::ClassNew { class: class_id, init_class: Some(init_class), args },
                 ));
             }
             // Special-case Python builtins.
@@ -1906,6 +1977,24 @@ fn lower_expr(e: &ast::Expr, scope: &Scope, signatures: &SignatureTable) -> Resu
             expr_kind_name(other)
         ),
     }
+}
+
+/// Reject `Type::Class(c)` for an abstract `c` used as a value type.
+/// `what` describes the context for the error message ("parameter type",
+/// "return type", "local variable type"). Until vtables land, abstract
+/// classes can only appear as base-class specifications, never as the
+/// static type of a value.
+fn reject_abstract_type(ty: Type, what: &str) -> Result<()> {
+    if let Type::Class(c) = ty {
+        if c.is_abstract() {
+            bail!(
+                "unsupported_feature: using abstract class `{}` as a {} is deferred to the vtable slice — polymorphism on ABCs needs dynamic dispatch",
+                c.name(),
+                what
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Resolve a method on a class by walking the inheritance chain.
