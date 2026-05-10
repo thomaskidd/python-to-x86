@@ -387,6 +387,11 @@ pub enum Expr {
     StrLen { s: Box<TypedExpr> },
     /// String equality / inequality. Result is Bool.
     StrEq { lhs: Box<TypedExpr>, rhs: Box<TypedExpr>, negated: bool },
+    /// Format an integer/bool value as a Str. Used in f-string lowering.
+    /// `inner.ty` is one of I8/I16/I32/I64/Bool. Heap-allocates the buffer.
+    /// (Str-typed interpolations are passed through directly; this variant
+    /// is never emitted for Str inputs.)
+    FormatToStr { inner: Box<TypedExpr> },
     /// Call to a math runtime / LLVM intrinsic. The `name` is the
     /// LLVM symbol to invoke (e.g. `llvm.sqrt.f64`, `tan`). Single-arg
     /// f64 → f64 only in v0.24.

@@ -59,9 +59,9 @@ pub fn lower(module: &Module, source_path: &Path) -> Result<Program> {
         bail!("unsupported_feature: no `main` function defined at the top level");
     }
     let main_sig = signatures.get("main").unwrap();
-    if !matches!(main_sig.return_ty, Type::I64 | Type::F64) {
+    if !matches!(main_sig.return_ty, Type::I64 | Type::F64 | Type::Str) {
         bail!(
-            "unsupported_feature: `main` must return `int` or `float`, found {}",
+            "unsupported_feature: `main` must return `int`, `float`, or `str`, found {}",
             main_sig.return_ty.name()
         );
     }
@@ -1681,11 +1681,90 @@ fn lower_expr(e: &ast::Expr, scope: &Scope, signatures: &SignatureTable) -> Resu
                 },
             ))
         }
+        ast::Expr::JoinedStr(js) => lower_joined_str(&js.values, scope, signatures),
         other => bail!(
             "unsupported_feature: expression form `{}` is not supported",
             expr_kind_name(other)
         ),
     }
+}
+
+/// Lower an f-string (`ast::Expr::JoinedStr`) to a chain of `StrConcat`
+/// over `StrLit` and `FormatToStr` (for non-Str interpolations) /
+/// passthrough (for Str interpolations).
+fn lower_joined_str(
+    values: &[ast::Expr],
+    scope: &Scope,
+    signatures: &SignatureTable,
+) -> Result<TypedExpr> {
+    // Empty f-string `f""` would be a JoinedStr with no values.
+    if values.is_empty() {
+        return Ok(TypedExpr::new(Type::Str, Expr::StrLit(String::new())));
+    }
+    let mut segments: Vec<TypedExpr> = Vec::with_capacity(values.len());
+    for v in values {
+        let seg = match v {
+            ast::Expr::Constant(c) => match &c.value {
+                ast::Constant::Str(s) => {
+                    if !s.is_ascii() {
+                        bail!(
+                            "unsupported_feature: non-ASCII text in f-string is not yet supported"
+                        );
+                    }
+                    if s.bytes().any(|b| b == b'\\' || b == b'\'') {
+                        bail!(
+                            "unsupported_feature: backslash or single-quote inside f-string is not yet supported"
+                        );
+                    }
+                    TypedExpr::new(Type::Str, Expr::StrLit(s.clone()))
+                }
+                _ => bail!(
+                    "unsupported_feature: only str literal segments are allowed in f-strings"
+                ),
+            },
+            ast::Expr::FormattedValue(fv) => {
+                if !fv.conversion.is_none() {
+                    bail!(
+                        "unsupported_feature: f-string conversions (`!r`, `!s`, `!a`) are not supported"
+                    );
+                }
+                if fv.format_spec.is_some() {
+                    bail!(
+                        "unsupported_feature: f-string format specs (`{{x:.2f}}`, etc.) are not supported"
+                    );
+                }
+                let inner = lower_expr(&fv.value, scope, signatures)?;
+                match inner.ty {
+                    Type::Str => inner,
+                    Type::I8 | Type::I16 | Type::I32 | Type::I64 | Type::Bool => {
+                        TypedExpr::new(Type::Str, Expr::FormatToStr { inner: Box::new(inner) })
+                    }
+                    Type::F64 => bail!(
+                        "unsupported_feature: f64 interpolation in f-strings is deferred (see specs/slice-v0.30-fstrings.md)"
+                    ),
+                    other => bail!(
+                        "unsupported_feature: cannot interpolate value of type {} in an f-string",
+                        other.name()
+                    ),
+                }
+            }
+            other => bail!(
+                "unsupported_feature: f-string segment kind `{}` is not supported",
+                expr_kind_name(other)
+            ),
+        };
+        segments.push(seg);
+    }
+    // Fold segments left-to-right via StrConcat.
+    let mut iter = segments.into_iter();
+    let first = iter.next().unwrap();
+    let folded = iter.fold(first, |acc, seg| {
+        TypedExpr::new(
+            Type::Str,
+            Expr::StrConcat { lhs: Box::new(acc), rhs: Box::new(seg) },
+        )
+    });
+    Ok(folded)
 }
 
 /// Apply a binary op given lowered operands. Handles type promotion
