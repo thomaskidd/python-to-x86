@@ -26,6 +26,12 @@ pub struct ListId(u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct DictId(u32);
 
+/// Identifier for an interned element type for a set. Two `set[int]`
+/// types share the same `SetId`. Layout-identical to a `dict[int, _]`
+/// at the runtime level — see v0.32 spec.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SetId(u32);
+
 /// Identifier for a class definition. Each `class Foo:` gets a unique
 /// id; same-named class redefinitions are rejected by check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -42,6 +48,7 @@ thread_local! {
     static TUPLE_ARENA: RefCell<Vec<Vec<Type>>> = const { RefCell::new(Vec::new()) };
     static LIST_ARENA: RefCell<Vec<Type>> = const { RefCell::new(Vec::new()) };
     static DICT_ARENA: RefCell<Vec<(Type, Type)>> = const { RefCell::new(Vec::new()) };
+    static SET_ARENA: RefCell<Vec<Type>> = const { RefCell::new(Vec::new()) };
     static CLASS_ARENA: RefCell<Vec<ClassDef>> = const { RefCell::new(Vec::new()) };
 }
 
@@ -129,6 +136,25 @@ impl ListId {
     }
 }
 
+impl SetId {
+    pub fn intern(elem: Type) -> SetId {
+        SET_ARENA.with(|a| {
+            let mut a = a.borrow_mut();
+            for (i, e) in a.iter().enumerate() {
+                if *e == elem {
+                    return SetId(i as u32);
+                }
+            }
+            let id = a.len() as u32;
+            a.push(elem);
+            SetId(id)
+        })
+    }
+    pub fn elem(self) -> Type {
+        SET_ARENA.with(|a| a.borrow()[self.0 as usize])
+    }
+}
+
 impl TupleId {
     /// Intern a tuple-element list and get back its id. Idempotent
     /// for repeated calls with the same elements.
@@ -197,6 +223,12 @@ pub enum Type {
     /// Read-only operations only: literal, lookup `d[k]`, len, `k in d`.
     /// Mutation (`d[k] = v`) deferred to a follow-up.
     Dict(DictId),
+    /// `set[T]`. v0.32: T must be I64. Layout-identical to a
+    /// `dict[i64, i64]` — same `{ size, cap, slots }` heap struct,
+    /// same runtime helpers. The per-slot value field is stored as 0
+    /// and ignored on read. Kept as a distinct `Type` so the user gets
+    /// proper type errors (set ≠ dict).
+    Set(SetId),
     /// User-defined class instance. Stored as a heap-allocated struct
     /// pointer; ref-semantics like Python objects. Fields and methods
     /// resolved against the ClassDef in the arena.
@@ -225,6 +257,7 @@ impl Type {
             Type::List(id) => format!("list[{}]", id.elem().name()),
             Type::Str => "str".to_string(),
             Type::Dict(id) => format!("dict[{}, {}]", id.key().name(), id.val().name()),
+            Type::Set(id) => format!("set[{}]", id.elem().name()),
             Type::Class(id) => id.name(),
         }
     }
@@ -292,6 +325,9 @@ pub enum Stmt {
     /// `<list>.append(<value>)`. List must be a Var (so codegen knows
     /// which slot to mutate); same shared heap struct as Python.
     ListAppend { list: TypedExpr, value: TypedExpr },
+    /// `<set>.add(<value>)`. Set must be a Var so the runtime mutation
+    /// is visible through all aliases.
+    SetAdd { set: TypedExpr, value: TypedExpr },
     /// `<obj>.<field> = <value>`. The obj expression evaluates to a
     /// class instance pointer; the field index is resolved at check.
     SetField {
@@ -414,6 +450,13 @@ pub enum Expr {
     DictHas { dict: Box<TypedExpr>, key: Box<TypedExpr> },
     /// `len(d)` — returns I64.
     DictLen { dict: Box<TypedExpr> },
+    /// Construct a set from N keys. Reuses the dict[i64, i64] runtime;
+    /// values stored as 0.
+    SetLit { elements: Vec<TypedExpr> },
+    /// `k in s` — Bool. Reuses pyx86_dict_i64_has.
+    SetHas { set: Box<TypedExpr>, key: Box<TypedExpr> },
+    /// `len(s)` — I64. Reads the same size field as DictLen.
+    SetLen { set: Box<TypedExpr> },
     /// Read a field of a class instance: `obj.field`. The field index
     /// is resolved by check at lower time.
     FieldGet { obj: Box<TypedExpr>, field_index: usize },

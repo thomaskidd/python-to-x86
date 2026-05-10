@@ -62,7 +62,7 @@ pub fn emit_ll(prog: &Program, source_basename: &str) -> String {
         Type::I64 => "  %fmt = getelementptr inbounds [5 x i8], [5 x i8]* @.fmt_i64, i64 0, i64 0\n  call i32 (i8*, ...) @printf(i8* %fmt, i64 %r)".to_string(),
         Type::F64 => "  call void @pyx86_print_f64(double %r)".to_string(),
         Type::Str => "  %r_len = extractvalue { i64, i8* } %r, 0\n  %r_data = extractvalue { i64, i8* } %r, 1\n  %r_len32 = trunc i64 %r_len to i32\n  %fmt_repr = getelementptr inbounds [8 x i8], [8 x i8]* @.fmt_str_repr, i64 0, i64 0\n  call i32 (i8*, ...) @printf(i8* %fmt_repr, i32 %r_len32, i8* %r_data)".to_string(),
-        Type::I8 | Type::I16 | Type::I32 | Type::Bool | Type::Tuple(_) | Type::List(_) | Type::Dict(_) | Type::Class(_) => {
+        Type::I8 | Type::I16 | Type::I32 | Type::Bool | Type::Tuple(_) | Type::List(_) | Type::Dict(_) | Type::Set(_) | Type::Class(_) => {
             unreachable!("check rejects this main return type")
         }
     };
@@ -465,6 +465,9 @@ fn llvm_ty(ty: Type) -> String {
         // Same shape as a list — the slot array layout differs but the
         // outer struct has the same {len, cap, ptr} fields.
         Type::Dict(_) => "{ i64, i64, i8* }*".to_string(),
+        // Layout-identical to Dict at the LLVM level. The set value field
+        // in each slot is unused; that's the only behavioural difference.
+        Type::Set(_) => "{ i64, i64, i8* }*".to_string(),
         Type::Class(id) => {
             let inner = id
                 .fields()
@@ -493,6 +496,7 @@ fn type_byte_size(ty: Type) -> u64 {
         Type::List(_) => 8,
         Type::Str => 16,
         Type::Dict(_) => 8,
+        Type::Set(_) => 8,
         Type::Class(_) => 8, // pointer
     }
 }
@@ -539,7 +543,7 @@ fn format_argv_parsing(func: &Function) -> String {
                     i = i
                 );
             }
-            Type::I8 | Type::I16 | Type::I32 | Type::Bool | Type::Tuple(_) | Type::List(_) | Type::Str | Type::Dict(_) | Type::Class(_) => {
+            Type::I8 | Type::I16 | Type::I32 | Type::Bool | Type::Tuple(_) | Type::List(_) | Type::Str | Type::Dict(_) | Type::Set(_) | Type::Class(_) => {
                 unreachable!("check rejects non-(I64|F64) main params")
             }
         }
@@ -717,6 +721,9 @@ impl Codegen {
                 Stmt::ListAppend { list, value } => {
                     self.lower_list_append(list, value);
                 }
+                Stmt::SetAdd { set, value } => {
+                    self.lower_set_add(set, value);
+                }
                 Stmt::SetField { obj, field_index, value } => {
                     self.lower_set_field(obj, *field_index, value);
                 }
@@ -789,6 +796,9 @@ impl Codegen {
             Expr::DictGet { dict, key } => self.lower_dict_get(dict, key),
             Expr::DictHas { dict, key } => self.lower_dict_has(dict, key),
             Expr::DictLen { dict } => self.lower_dict_len(dict),
+            Expr::SetLit { elements } => self.lower_set_lit(elements),
+            Expr::SetHas { set, key } => self.lower_set_has(set, key),
+            Expr::SetLen { set } => self.lower_set_len(set),
             Expr::FieldGet { obj, field_index } => self.lower_field_get(obj, *field_index, te.ty),
             Expr::ClassNew { class, args } => self.lower_class_new(*class, args),
         }
@@ -1538,6 +1548,99 @@ impl Codegen {
         dst
     }
 
+    /// Build a `set[i64]` literal. Identical to lower_dict_lit but each
+    /// slot is inserted with value 0 (sets ignore the value field).
+    fn lower_set_lit(&mut self, elements: &[TypedExpr]) -> String {
+        let n = elements.len();
+        let want = (n * 2).max(4);
+        let mut cap: u64 = 4;
+        while (cap as usize) < want {
+            cap *= 2;
+        }
+        let slot_bytes = cap * 24;
+        let slots_raw = self.fresh();
+        self.emit(&format!("{} = call i8* @malloc(i64 {})", slots_raw, slot_bytes));
+        self.emit(&format!(
+            "call void @llvm.memset.p0i8.i64(i8* {}, i8 0, i64 {}, i1 false)",
+            slots_raw, slot_bytes
+        ));
+        let table_raw = self.fresh();
+        self.emit(&format!("{} = call i8* @malloc(i64 24)", table_raw));
+        let tp = self.fresh();
+        self.emit(&format!(
+            "{} = bitcast i8* {} to {{ i64, i64, i8* }}*",
+            tp, table_raw
+        ));
+        let size_p = self.fresh();
+        self.emit(&format!(
+            "{} = getelementptr {{ i64, i64, i8* }}, {{ i64, i64, i8* }}* {}, i32 0, i32 0",
+            size_p, tp
+        ));
+        self.emit(&format!("store i64 0, i64* {}", size_p));
+        let cap_p = self.fresh();
+        self.emit(&format!(
+            "{} = getelementptr {{ i64, i64, i8* }}, {{ i64, i64, i8* }}* {}, i32 0, i32 1",
+            cap_p, tp
+        ));
+        self.emit(&format!("store i64 {}, i64* {}", cap, cap_p));
+        let slots_p = self.fresh();
+        self.emit(&format!(
+            "{} = getelementptr {{ i64, i64, i8* }}, {{ i64, i64, i8* }}* {}, i32 0, i32 2",
+            slots_p, tp
+        ));
+        self.emit(&format!("store i8* {}, i8** {}", slots_raw, slots_p));
+        for e in elements {
+            let v = self.lower(e);
+            self.emit(&format!(
+                "call void @pyx86_dict_i64_insert(i8* {}, i64 {}, i64 0)",
+                table_raw, v
+            ));
+        }
+        tp
+    }
+
+    fn lower_set_has(&mut self, set: &TypedExpr, key: &TypedExpr) -> String {
+        let set_op = self.lower(set);
+        let key_op = self.lower(key);
+        let table_raw = self.fresh();
+        self.emit(&format!(
+            "{} = bitcast {{ i64, i64, i8* }}* {} to i8*",
+            table_raw, set_op
+        ));
+        let dst = self.fresh();
+        self.emit(&format!(
+            "{} = call i1 @pyx86_dict_i64_has(i8* {}, i64 {})",
+            dst, table_raw, key_op
+        ));
+        dst
+    }
+
+    fn lower_set_len(&mut self, set: &TypedExpr) -> String {
+        let set_op = self.lower(set);
+        let p = self.fresh();
+        self.emit(&format!(
+            "{} = getelementptr {{ i64, i64, i8* }}, {{ i64, i64, i8* }}* {}, i32 0, i32 0",
+            p, set_op
+        ));
+        let dst = self.fresh();
+        self.emit(&format!("{} = load i64, i64* {}", dst, p));
+        dst
+    }
+
+    fn lower_set_add(&mut self, set: &TypedExpr, value: &TypedExpr) {
+        let set_op = self.lower(set);
+        let key_op = self.lower(value);
+        let table_raw = self.fresh();
+        self.emit(&format!(
+            "{} = bitcast {{ i64, i64, i8* }}* {} to i8*",
+            table_raw, set_op
+        ));
+        self.emit(&format!(
+            "call void @pyx86_dict_i64_insert(i8* {}, i64 {}, i64 0)",
+            table_raw, key_op
+        ));
+    }
+
     fn lower_dict_len(&mut self, dict: &TypedExpr) -> String {
         let dict_op = self.lower(dict);
         let p = self.fresh();
@@ -2110,6 +2213,10 @@ fn walk_stmts(stmts: &[Stmt], out: &mut Vec<(String, Type)>, seen: &mut HashSet<
                 walk_expr(list, out, seen);
                 walk_expr(value, out, seen);
             }
+            Stmt::SetAdd { set, value } => {
+                walk_expr(set, out, seen);
+                walk_expr(value, out, seen);
+            }
             Stmt::SetField { obj, value, .. } => {
                 walk_expr(obj, out, seen);
                 walk_expr(value, out, seen);
@@ -2200,6 +2307,16 @@ fn walk_expr(te: &TypedExpr, out: &mut Vec<(String, Type)>, seen: &mut HashSet<S
             walk_expr(key, out, seen);
         }
         Expr::DictLen { dict } => walk_expr(dict, out, seen),
+        Expr::SetLit { elements } => {
+            for e in elements {
+                walk_expr(e, out, seen);
+            }
+        }
+        Expr::SetHas { set, key } => {
+            walk_expr(set, out, seen);
+            walk_expr(key, out, seen);
+        }
+        Expr::SetLen { set } => walk_expr(set, out, seen),
         Expr::FieldGet { obj, .. } => walk_expr(obj, out, seen),
         Expr::ClassNew { args, .. } => {
             for a in args {
