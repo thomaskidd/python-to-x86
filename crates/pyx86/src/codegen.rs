@@ -937,6 +937,9 @@ impl Codegen {
             Expr::ListIndex { list, index } => self.lower_list_index(list, index, te.ty),
             Expr::ListLen { list } => self.lower_list_len(list),
             Expr::ListConcat { lhs, rhs } => self.lower_list_concat(lhs, rhs, te.ty),
+            Expr::ListSlice { list, start, stop } => {
+                self.lower_list_slice(list, start, stop, te.ty)
+            }
             Expr::DoBlock { stmts, result } => {
                 self.lower_block(stmts);
                 self.lower(result)
@@ -1497,6 +1500,106 @@ impl Codegen {
 
         // Build the struct.
         self.list_build_struct(&total_len, &total_len, &new_data)
+    }
+
+    /// v0.39: `lst[start:stop]` — element-size-aware slice. Bounds
+    /// clamped to `[0, len(lst)]` at runtime, memcpy the slice into
+    /// a fresh buffer, return a new list struct.
+    fn lower_list_slice(
+        &mut self,
+        list: &TypedExpr,
+        start: &TypedExpr,
+        stop: &TypedExpr,
+        list_ty: Type,
+    ) -> String {
+        let id = match list_ty {
+            Type::List(id) => id,
+            _ => panic!("internal: ListSlice with non-list result type"),
+        };
+        let elem_size = type_byte_size(id.elem());
+
+        let list_op = self.lower(list);
+        let len = self.list_load_len(&list_op);
+        let data_raw = self.list_load_data_raw(&list_op);
+        let start_v = self.lower(start);
+        let stop_v = self.lower(stop);
+
+        // clamp start = max(0, min(start, len))
+        let s_lt0 = self.fresh();
+        self.emit(&format!("{} = icmp slt i64 {}, 0", s_lt0, start_v));
+        let s_lo = self.fresh();
+        self.emit(&format!(
+            "{} = select i1 {}, i64 0, i64 {}",
+            s_lo, s_lt0, start_v
+        ));
+        let s_gtlen = self.fresh();
+        self.emit(&format!("{} = icmp sgt i64 {}, {}", s_gtlen, s_lo, len));
+        let s_c = self.fresh();
+        self.emit(&format!(
+            "{} = select i1 {}, i64 {}, i64 {}",
+            s_c, s_gtlen, len, s_lo
+        ));
+
+        // clamp stop = max(0, min(stop, len))
+        let t_lt0 = self.fresh();
+        self.emit(&format!("{} = icmp slt i64 {}, 0", t_lt0, stop_v));
+        let t_lo = self.fresh();
+        self.emit(&format!(
+            "{} = select i1 {}, i64 0, i64 {}",
+            t_lo, t_lt0, stop_v
+        ));
+        let t_gtlen = self.fresh();
+        self.emit(&format!("{} = icmp sgt i64 {}, {}", t_gtlen, t_lo, len));
+        let t_c = self.fresh();
+        self.emit(&format!(
+            "{} = select i1 {}, i64 {}, i64 {}",
+            t_c, t_gtlen, len, t_lo
+        ));
+
+        // out_len = max(0, stop_c - start_c)
+        let diff = self.fresh();
+        self.emit(&format!("{} = sub i64 {}, {}", diff, t_c, s_c));
+        let diff_neg = self.fresh();
+        self.emit(&format!("{} = icmp slt i64 {}, 0", diff_neg, diff));
+        let out_len = self.fresh();
+        self.emit(&format!(
+            "{} = select i1 {}, i64 0, i64 {}",
+            out_len, diff_neg, diff
+        ));
+
+        // Allocate new data buffer: out_len * elem_size bytes.
+        let out_bytes = self.fresh();
+        self.emit(&format!(
+            "{} = mul i64 {}, {}",
+            out_bytes, out_len, elem_size
+        ));
+        // Avoid 0-byte malloc.
+        let nz = self.fresh();
+        self.emit(&format!("{} = icmp ne i64 {}, 0", nz, out_bytes));
+        let alloc_n = self.fresh();
+        self.emit(&format!(
+            "{} = select i1 {}, i64 {}, i64 1",
+            alloc_n, nz, out_bytes
+        ));
+        let new_data = self.fresh();
+        self.emit(&format!("{} = call i8* @malloc(i64 {})", new_data, alloc_n));
+        // Source: data_raw + start_c * elem_size.
+        let start_bytes = self.fresh();
+        self.emit(&format!(
+            "{} = mul i64 {}, {}",
+            start_bytes, s_c, elem_size
+        ));
+        let src = self.fresh();
+        self.emit(&format!(
+            "{} = getelementptr i8, i8* {}, i64 {}",
+            src, data_raw, start_bytes
+        ));
+        self.emit(&format!(
+            "call void @llvm.memcpy.p0i8.p0i8.i64(i8* {}, i8* {}, i64 {}, i1 false)",
+            new_data, src, out_bytes
+        ));
+        // Build the resulting list struct.
+        self.list_build_struct(&out_len, &out_len, &new_data)
     }
 
     /// `lst.append(value)` — mutates the heap struct in place. Grows
@@ -2735,6 +2838,11 @@ fn walk_expr(te: &TypedExpr, out: &mut Vec<(String, Type)>, seen: &mut HashSet<S
         | Expr::ListConcat { lhs, rhs } => {
             walk_expr(lhs, out, seen);
             walk_expr(rhs, out, seen);
+        }
+        Expr::ListSlice { list, start, stop } => {
+            walk_expr(list, out, seen);
+            walk_expr(start, out, seen);
+            walk_expr(stop, out, seen);
         }
         Expr::UnaryOp { operand, .. } | Expr::Not(operand) | Expr::Coerce { inner: operand } => {
             walk_expr(operand, out, seen);

@@ -556,6 +556,11 @@ pub enum Expr {
     /// runtime. Result is a fresh heap-allocated copy. `start` and `stop`
     /// are both I64; defaults (0 and StrLen) are substituted by check.
     StrSlice { s: Box<TypedExpr>, start: Box<TypedExpr>, stop: Box<TypedExpr> },
+    /// v0.39: `lst[start:stop]` — element-size-aware list slice.
+    /// Bounds clamped at runtime. Returns a fresh heap-allocated list
+    /// of the same element type. Tuple slicing is rewritten to a
+    /// `TupleLit` at check-time and never reaches this variant.
+    ListSlice { list: Box<TypedExpr>, start: Box<TypedExpr>, stop: Box<TypedExpr> },
     /// Call to a math runtime / LLVM intrinsic. The `name` is the
     /// LLVM symbol to invoke (e.g. `llvm.sqrt.f64`, `tan`). Single-arg
     /// f64 → f64 only in v0.24.
