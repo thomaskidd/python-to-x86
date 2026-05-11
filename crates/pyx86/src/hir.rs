@@ -65,6 +65,14 @@ pub struct ClassDef {
     /// v0.37: sorted vtable method names — same set on every class in
     /// the chain (derived from the root). Empty for non-chain classes.
     pub vtable_slots: Vec<String>,
+    /// v0.40: methods declared with `@property`. Accessed via
+    /// `obj.name` (no parens); resolves at check-time to a method
+    /// call. Inherited through the parent chain.
+    pub property_methods: Vec<String>,
+    /// v0.40: methods declared with `@staticmethod`. No `self` param;
+    /// called via `Cls.name(args)` or `instance.name(args)` (instance
+    /// is dropped at the call site). Inherited through the parent chain.
+    pub static_methods: Vec<String>,
 }
 
 thread_local! {
@@ -185,6 +193,46 @@ impl ClassId {
     /// emit vtable globals.
     pub fn all() -> Vec<ClassId> {
         CLASS_ARENA.with(|a| (0..a.borrow().len() as u32).map(ClassId).collect())
+    }
+    pub fn property_methods(self) -> Vec<String> {
+        CLASS_ARENA.with(|a| a.borrow()[self.0 as usize].property_methods.clone())
+    }
+    pub fn set_property_methods(self, names: Vec<String>) {
+        CLASS_ARENA.with(|a| {
+            let mut a = a.borrow_mut();
+            a[self.0 as usize].property_methods = names;
+        })
+    }
+    pub fn static_methods(self) -> Vec<String> {
+        CLASS_ARENA.with(|a| a.borrow()[self.0 as usize].static_methods.clone())
+    }
+    pub fn set_static_methods(self, names: Vec<String>) {
+        CLASS_ARENA.with(|a| {
+            let mut a = a.borrow_mut();
+            a[self.0 as usize].static_methods = names;
+        })
+    }
+    /// v0.40: walk the parent chain looking for a property named `name`.
+    pub fn has_property(self, name: &str) -> bool {
+        let mut cur = Some(self);
+        while let Some(c) = cur {
+            if c.property_methods().iter().any(|n| n == name) {
+                return true;
+            }
+            cur = c.parent();
+        }
+        false
+    }
+    /// v0.40: same for staticmethod.
+    pub fn has_static_method(self, name: &str) -> bool {
+        let mut cur = Some(self);
+        while let Some(c) = cur {
+            if c.static_methods().iter().any(|n| n == name) {
+                return true;
+            }
+            cur = c.parent();
+        }
+        false
     }
 }
 

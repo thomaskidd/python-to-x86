@@ -60,6 +60,8 @@ pub fn lower(module: &Module, source_path: &Path) -> Result<Program> {
         abstract_methods: Vec::new(),
         vtable_root: None,
         vtable_slots: Vec::new(),
+        property_methods: Vec::new(),
+        static_methods: Vec::new(),
     });
     CLASS_REGISTRY.with(|r| r.borrow_mut().insert("ABC".to_string(), abc_id));
     let mut loaded: HashSet<PathBuf> = HashSet::new();
@@ -137,6 +139,8 @@ fn lower_module_into(
                 abstract_methods: Vec::new(),
                 vtable_root: None,
                 vtable_slots: Vec::new(),
+                property_methods: Vec::new(),
+                static_methods: Vec::new(),
             });
             CLASS_REGISTRY.with(|r| r.borrow_mut().insert(name, id));
         }
@@ -145,6 +149,9 @@ fn lower_module_into(
     // Phase 0b: process each class — collect fields, register methods
     // as mangled top-level functions (`<ClassName>.<method>`).
     let mut local_method_defs: Vec<(ClassId, String, &ast::StmtFunctionDef)> = Vec::new();
+    // v0.40: @staticmethod entries lower like top-level functions, not
+    // like methods (no `self` param).
+    let mut local_static_methods: Vec<(ClassId, String, &ast::StmtFunctionDef)> = Vec::new();
     for stmt in &module.body {
         if let ast::Stmt::ClassDef(c) = stmt {
             let name = c.name.as_str().to_string();
@@ -243,10 +250,70 @@ fn lower_module_into(
                         fields.push((fname, ty));
                     }
                     ast::Stmt::FunctionDef(f) => {
-                        let is_abstract_decorated = f.decorator_list.iter().any(|d| {
-                            matches!(d, ast::Expr::Name(n) if n.id.as_str() == "abstractmethod")
-                        });
+                        let dec_name = |d: &ast::Expr| -> Option<String> {
+                            if let ast::Expr::Name(n) = d {
+                                Some(n.id.as_str().to_string())
+                            } else {
+                                None
+                            }
+                        };
+                        let decorator_names: Vec<String> =
+                            f.decorator_list.iter().filter_map(dec_name).collect();
+                        if decorator_names.len() != f.decorator_list.len() {
+                            bail!(
+                                "unsupported_feature: unrecognized decorator form on method `{}`",
+                                f.name
+                            );
+                        }
+                        if decorator_names.len() > 1 {
+                            bail!(
+                                "unsupported_feature: stacked decorators on method `{}` are not supported",
+                                f.name
+                            );
+                        }
+                        let is_abstract_decorated =
+                            decorator_names.iter().any(|d| d == "abstractmethod");
+                        let is_property = decorator_names.iter().any(|d| d == "property");
+                        let is_static = decorator_names.iter().any(|d| d == "staticmethod");
                         let mname = format!("{}.{}", name, f.name);
+                        if is_static {
+                            // v0.40: @staticmethod — no `self` param.
+                            if signatures.contains_key(&mname) {
+                                bail!(
+                                    "unsupported_feature: duplicate method `{}` in class `{}`",
+                                    f.name, name
+                                );
+                            }
+                            // Collect as a plain function signature (no self).
+                            let sig = collect_signature(f)?;
+                            signatures.insert(mname.clone(), sig);
+                            // Lower via a synthetic top-level function. We
+                            // can't reuse lower_function directly because it
+                            // expects a SignatureTable-resident sig under
+                            // the name `f.name`, but we used the mangled
+                            // name. Add it to local_static_method_defs and
+                            // lower below.
+                            local_static_methods.push((class_id, mname.clone(), f));
+                            // Record on the class.
+                            let mut sm = class_id.static_methods();
+                            if !sm.iter().any(|s| s == f.name.as_str()) {
+                                sm.push(f.name.as_str().to_string());
+                                class_id.set_static_methods(sm);
+                            }
+                            // A static override removes the name from the
+                            // unimplemented set if it was abstract above.
+                            unimplemented.remove(f.name.as_str());
+                            continue;
+                        }
+                        if is_property {
+                            // v0.40: @property — recorded; lowered as a
+                            // normal method below.
+                            let mut pm = class_id.property_methods();
+                            if !pm.iter().any(|s| s == f.name.as_str()) {
+                                pm.push(f.name.as_str().to_string());
+                                class_id.set_property_methods(pm);
+                            }
+                        }
                         if is_abstract_decorated {
                             // v0.34: record the name in the abstract set.
                             // v0.37: also register the signature so virtual
@@ -446,7 +513,44 @@ fn lower_module_into(
         let lowered = lower_method(class_id, &mname, fdef, signatures)?;
         all_functions.push(lowered);
     }
+    // v0.40: lower @staticmethod entries like normal top-level functions.
+    // Note: lower_function looks up sig by f.name; we need a variant that
+    // uses the already-stored mangled name. Open-coded here.
+    for (_class_id, mname, fdef) in local_static_methods {
+        let lowered = lower_static_method(&mname, fdef, signatures)?;
+        all_functions.push(lowered);
+    }
     Ok(())
+}
+
+/// v0.40: lower a `@staticmethod` body. Same shape as `lower_function`
+/// but the function's HIR name is the mangled `<ClassName>.<method>`.
+/// No `self` is synthesized — the user wrote a plain function in a
+/// class body.
+fn lower_static_method(
+    mangled_name: &str,
+    func: &ast::StmtFunctionDef,
+    signatures: &SignatureTable,
+) -> Result<Function> {
+    let sig = signatures.get(mangled_name).expect("static-method sig collected");
+    let mut scope: Scope = sig.params.iter().map(|p| (p.name.clone(), p.ty)).collect();
+    if func.body.is_empty() {
+        bail!("unsupported_feature: staticmethod `{}` body is empty", func.name);
+    }
+    let body = lower_block(&func.body, &mut scope, 0, signatures, sig.return_ty)?;
+    if !block_always_returns(&body) {
+        bail!(
+            "unsupported_feature: not all paths return a value in staticmethod `{}`",
+            func.name
+        );
+    }
+    Ok(Function {
+        name: mangled_name.to_string(),
+        params: sig.params.clone(),
+        return_ty: sig.return_ty,
+        body,
+        env_fields: Vec::new(),
+    })
 }
 
 /// Build a FunctionSig for a class method. The first param is `self`
@@ -468,15 +572,22 @@ fn collect_method_signature(
             func.name
         );
     }
-    // v0.34/v0.37: `@abstractmethod` is allowed here; other method
-    // decorators (`@property`, `@staticmethod`, `@classmethod`) are
-    // deferred.
+    // v0.34/v0.37: `@abstractmethod` allowed.
+    // v0.40: `@property` and `@staticmethod` allowed.
+    // `@classmethod` is still deferred.
     for d in &func.decorator_list {
-        let allowed = matches!(d, ast::Expr::Name(n) if n.id.as_str() == "abstractmethod");
+        let name = match d {
+            ast::Expr::Name(n) => n.id.as_str(),
+            _ => bail!(
+                "unsupported_feature: unrecognized decorator form on method `{}`",
+                func.name
+            ),
+        };
+        let allowed = matches!(name, "abstractmethod" | "property" | "staticmethod");
         if !allowed {
             bail!(
-                "unsupported_feature: method decorator `{:?}` on `{}` is not supported",
-                d, func.name
+                "unsupported_feature: method decorator `@{}` on `{}` is not supported",
+                name, func.name
             );
         }
     }
@@ -604,11 +715,24 @@ fn collect_signature(func: &ast::StmtFunctionDef) -> Result<FunctionSig> {
             func.name
         );
     }
-    if !func.decorator_list.is_empty() {
-        bail!(
-            "unsupported_feature: decorators are not supported (in `{}`)",
-            func.name
-        );
+    // v0.40: allow @staticmethod here (collect_signature is called for
+    // staticmethods, which lower like top-level functions). Other
+    // method decorators are out-of-scope at this entry point (the
+    // method path uses collect_method_signature instead).
+    for d in &func.decorator_list {
+        let name = match d {
+            ast::Expr::Name(n) => n.id.as_str(),
+            _ => bail!(
+                "unsupported_feature: unrecognized decorator form on `{}`",
+                func.name
+            ),
+        };
+        if name != "staticmethod" {
+            bail!(
+                "unsupported_feature: decorator `@{}` on `{}` is not supported here",
+                name, func.name
+            );
+        }
     }
     if func.args.args.len() > MAX_PARAMS {
         bail!(
@@ -774,6 +898,12 @@ fn lower_block(
                             ),
                         };
                         let field_name = attr.attr.as_str();
+                        if class_id.has_property(field_name) {
+                            bail!(
+                                "unsupported_feature: `{}.{}` is a @property; setters are not supported in v0.40",
+                                class_id.name(), field_name
+                            );
+                        }
                         let field_index = class_id.field_index(field_name).ok_or_else(|| {
                             anyhow!(
                                 "unsupported_feature: class `{}` has no field `{}`",
@@ -782,8 +912,8 @@ fn lower_block(
                             )
                         })?;
                         let field_ty = class_id.field_ty(field_name).unwrap();
-                        let value = lower_expr(&a.value, scope, signatures)?;
-                        let value = coerce(value, field_ty)?;
+                        let value =
+                            lower_expr_with_expected(&a.value, field_ty, scope, signatures)?;
                         out.push(Stmt::SetField { obj, field_index, value });
                     }
                     ast::Expr::Subscript(s) => {
@@ -1616,6 +1746,22 @@ fn lower_expr(e: &ast::Expr, scope: &Scope, signatures: &SignatureTable) -> Resu
                     }
                 }
             }
+            // v0.40: `Cls.staticmethod(args)` — receiver is a class
+            // name, not an instance. Dispatched without `self`.
+            if let ast::Expr::Attribute(attr) = c.func.as_ref() {
+                if let ast::Expr::Name(n) = attr.value.as_ref() {
+                    if let Some(class_id) =
+                        CLASS_REGISTRY.with(|r| r.borrow().get(n.id.as_str()).copied())
+                    {
+                        let method = attr.attr.as_str();
+                        if class_id.has_static_method(method) {
+                            return lower_static_method_call(
+                                class_id, method, &c.args, &c.keywords, scope, signatures,
+                            );
+                        }
+                    }
+                }
+            }
             // Method-call form: `obj.method(args...)`. For ABC-chain
             // classes calling a vtable-slot method, dispatch is virtual
             // (Expr::VirtualCall). For everything else, static dispatch
@@ -1624,6 +1770,12 @@ fn lower_expr(e: &ast::Expr, scope: &Scope, signatures: &SignatureTable) -> Resu
                 let obj = lower_expr(&attr.value, scope, signatures)?;
                 if let Type::Class(class_id) = obj.ty {
                     let method = attr.attr.as_str();
+                    // v0.40: instance.staticmethod(args) — drop self.
+                    if class_id.has_static_method(method) {
+                        return lower_static_method_call(
+                            class_id, method, &c.args, &c.keywords, scope, signatures,
+                        );
+                    }
                     // Virtual dispatch path.
                     if let Some(root) = class_id.vtable_root() {
                         let slots = class_id.vtable_slots();
@@ -1842,6 +1994,7 @@ fn lower_expr(e: &ast::Expr, scope: &Scope, signatures: &SignatureTable) -> Resu
             // Field read: `obj.field`. Method references (e.g. assigning
             // `f = obj.method`) are not supported — methods are only
             // callable directly via `obj.method(args)`, handled in Call.
+            // v0.40: property access lowers to a getter call.
             let obj = lower_expr(&attr.value, scope, signatures)?;
             let class_id = match obj.ty {
                 Type::Class(id) => id,
@@ -1851,6 +2004,28 @@ fn lower_expr(e: &ast::Expr, scope: &Scope, signatures: &SignatureTable) -> Resu
                 ),
             };
             let field_name = attr.attr.as_str();
+            // v0.40: if `name` is a @property, lower to a getter call.
+            if class_id.has_property(field_name) {
+                let (_owner, mangled) =
+                    resolve_method(class_id, field_name, signatures).ok_or_else(|| {
+                        anyhow!(
+                            "unsupported_feature: property `{}` on `{}` is declared but the getter has no signature",
+                            field_name, class_id.name()
+                        )
+                    })?;
+                let sig = signatures.get(&mangled).unwrap();
+                if sig.params.len() != 1 {
+                    bail!(
+                        "unsupported_feature: @property getter `{}` on `{}` must take only `self`",
+                        field_name, class_id.name()
+                    );
+                }
+                let self_arg = coerce(obj, sig.params[0].ty)?;
+                return Ok(TypedExpr::new(
+                    sig.return_ty,
+                    Expr::Call { callee: mangled, args: vec![self_arg] },
+                ));
+            }
             let field_index = class_id.field_index(field_name).ok_or_else(|| {
                 anyhow!(
                     "unsupported_feature: class `{}` has no field `{}`",
@@ -2467,6 +2642,60 @@ fn reject_abstract_type(ty: Type, what: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// v0.40: lower a `@staticmethod` call (`Cls.method(args)` or
+/// `instance.method(args)`). No `self` is prepended. The mangled
+/// method name is `<owner>.<method>` where `owner` walks the chain
+/// to find the first class that declares the static.
+fn lower_static_method_call(
+    class_id: ClassId,
+    method: &str,
+    args: &[ast::Expr],
+    kwargs: &[ast::Keyword],
+    scope: &Scope,
+    signatures: &SignatureTable,
+) -> Result<TypedExpr> {
+    if !kwargs.is_empty() {
+        bail!("unsupported_feature: keyword args on staticmethod calls not supported");
+    }
+    // Walk the chain to find the class that owns the static method.
+    let mut owner: Option<ClassId> = None;
+    let mut cur = Some(class_id);
+    while let Some(c) = cur {
+        if c.static_methods().iter().any(|n| n == method) {
+            owner = Some(c);
+            break;
+        }
+        cur = c.parent();
+    }
+    let owner = owner.ok_or_else(|| {
+        anyhow!(
+            "unsupported_feature: staticmethod `{}` not found on `{}` or ancestors",
+            method, class_id.name()
+        )
+    })?;
+    let mangled = format!("{}.{}", owner.name(), method);
+    let sig = signatures.get(&mangled).ok_or_else(|| {
+        anyhow!(
+            "unsupported_feature: staticmethod `{}` on `{}` has no signature",
+            method, owner.name()
+        )
+    })?;
+    if args.len() != sig.params.len() {
+        bail!(
+            "unsupported_feature: staticmethod `{}.{}` takes {} args, got {}",
+            owner.name(), method, sig.params.len(), args.len()
+        );
+    }
+    let mut lowered_args: Vec<TypedExpr> = Vec::with_capacity(args.len());
+    for (i, a) in args.iter().enumerate() {
+        lowered_args.push(lower_expr_with_expected(a, sig.params[i].ty, scope, signatures)?);
+    }
+    Ok(TypedExpr::new(
+        sig.return_ty,
+        Expr::Call { callee: mangled, args: lowered_args },
+    ))
 }
 
 /// v0.38: lower an expression with an expected type. If the expression
