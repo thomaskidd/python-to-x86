@@ -2171,14 +2171,39 @@ fn lower_expr(e: &ast::Expr, scope: &Scope, signatures: &SignatureTable) -> Resu
         }
         ast::Expr::Subscript(s) => {
             let value = lower_expr(&s.value, scope, signatures)?;
-            // List subscripting goes through ListIndex (runtime index).
-            if let Type::List(_) = value.ty {
+            // v0.39: list slicing → ListSlice; list indexing → ListIndex.
+            if let Type::List(id) = value.ty {
+                if let ast::Expr::Slice(slc) = s.slice.as_ref() {
+                    if slc.step.is_some() {
+                        bail!(
+                            "unsupported_feature: list slice step (`lst[::2]`) is not supported"
+                        );
+                    }
+                    reject_negative_index_expr(slc.lower.as_deref(), "list slice lower bound")?;
+                    reject_negative_index_expr(slc.upper.as_deref(), "list slice upper bound")?;
+                    let start = match slc.lower.as_deref() {
+                        Some(e) => coerce(lower_expr(e, scope, signatures)?, Type::I64)?,
+                        None => TypedExpr::new(Type::I64, Expr::ConstI64(0)),
+                    };
+                    let stop = match slc.upper.as_deref() {
+                        Some(e) => coerce(lower_expr(e, scope, signatures)?, Type::I64)?,
+                        None => TypedExpr::new(
+                            Type::I64,
+                            Expr::ListLen { list: Box::new(value.clone()) },
+                        ),
+                    };
+                    return Ok(TypedExpr::new(
+                        Type::List(id),
+                        Expr::ListSlice {
+                            list: Box::new(value),
+                            start: Box::new(start),
+                            stop: Box::new(stop),
+                        },
+                    ));
+                }
                 let index = lower_expr(&s.slice, scope, signatures)?;
                 let index = coerce(index, Type::I64)?;
-                let elem_ty = match value.ty {
-                    Type::List(id) => id.elem(),
-                    _ => unreachable!(),
-                };
+                let elem_ty = id.elem();
                 return Ok(TypedExpr::new(
                     elem_ty,
                     Expr::ListIndex {
@@ -2253,6 +2278,64 @@ fn lower_expr(e: &ast::Expr, scope: &Scope, signatures: &SignatureTable) -> Resu
                     other.name()
                 ),
             };
+            // v0.39: tuple slicing. Bounds must be compile-time literal
+            // ints (or omitted), since the result type depends on the
+            // selected element types.
+            if let ast::Expr::Slice(slc) = s.slice.as_ref() {
+                if slc.step.is_some() {
+                    bail!(
+                        "unsupported_feature: tuple slice step (`t[::2]`) is not supported"
+                    );
+                }
+                let arity = id.with_elems(|e| e.len()) as i64;
+                let const_bound = |opt: Option<&ast::Expr>, default: i64| -> Result<i64> {
+                    match opt {
+                        None => Ok(default),
+                        Some(ast::Expr::Constant(c)) => match &c.value {
+                            ast::Constant::Int(big) => big
+                                .try_into()
+                                .map_err(|_| anyhow!("tuple slice bound doesn't fit in i64")),
+                            _ => bail!(
+                                "unsupported_feature: tuple slice bounds must be integer literals"
+                            ),
+                        },
+                        Some(_) => bail!(
+                            "unsupported_feature: tuple slice bounds must be compile-time integer literals (got a non-literal)"
+                        ),
+                    }
+                };
+                let start_v = const_bound(slc.lower.as_deref(), 0)?;
+                let stop_v = const_bound(slc.upper.as_deref(), arity)?;
+                if start_v < 0 || stop_v < 0 {
+                    bail!(
+                        "unsupported_feature: negative tuple slice bounds are not supported"
+                    );
+                }
+                // Clamp to [0, arity].
+                let start = start_v.min(arity).max(0);
+                let stop = stop_v.min(arity).max(start);
+                // Build elements: for each i in [start, stop), emit a
+                // TupleIndex on the original value.
+                let elem_types = id.with_elems(|e| e.to_vec());
+                let mut new_elems: Vec<TypedExpr> = Vec::new();
+                let mut new_tys: Vec<Type> = Vec::new();
+                for i in start..stop {
+                    let elem_ty = elem_types[i as usize];
+                    new_elems.push(TypedExpr::new(
+                        elem_ty,
+                        Expr::TupleIndex {
+                            tuple: Box::new(value.clone()),
+                            index: i as usize,
+                        },
+                    ));
+                    new_tys.push(elem_ty);
+                }
+                let new_id = TupleId::intern(new_tys);
+                return Ok(TypedExpr::new(
+                    Type::Tuple(new_id),
+                    Expr::TupleLit { elements: new_elems },
+                ));
+            }
             let index_value = match s.slice.as_ref() {
                 ast::Expr::Constant(c) => match &c.value {
                     ast::Constant::Int(big) => {
@@ -2668,6 +2751,11 @@ fn rewrite_var_to_env(e: TypedExpr, env_names: &HashSet<String>) -> TypedExpr {
         Expr::ListConcat { lhs, rhs } => Expr::ListConcat {
             lhs: Box::new(rewrite_var_to_env(*lhs, env_names)),
             rhs: Box::new(rewrite_var_to_env(*rhs, env_names)),
+        },
+        Expr::ListSlice { list, start, stop } => Expr::ListSlice {
+            list: Box::new(rewrite_var_to_env(*list, env_names)),
+            start: Box::new(rewrite_var_to_env(*start, env_names)),
+            stop: Box::new(rewrite_var_to_env(*stop, env_names)),
         },
         Expr::DoBlock { stmts, result } => Expr::DoBlock {
             stmts,
