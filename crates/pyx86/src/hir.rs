@@ -32,6 +32,10 @@ pub struct DictId(u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SetId(u32);
 
+/// v0.38: identifier for an interned `Callable[[params], ret]` type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CallableId(u32);
+
 /// Identifier for a class definition. Each `class Foo:` gets a unique
 /// id; same-named class redefinitions are rejected by check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -69,6 +73,29 @@ thread_local! {
     static DICT_ARENA: RefCell<Vec<(Type, Type)>> = const { RefCell::new(Vec::new()) };
     static SET_ARENA: RefCell<Vec<Type>> = const { RefCell::new(Vec::new()) };
     static CLASS_ARENA: RefCell<Vec<ClassDef>> = const { RefCell::new(Vec::new()) };
+    static CALLABLE_ARENA: RefCell<Vec<(Vec<Type>, Type)>> = const { RefCell::new(Vec::new()) };
+}
+
+impl CallableId {
+    pub fn intern(params: Vec<Type>, ret: Type) -> CallableId {
+        CALLABLE_ARENA.with(|a| {
+            let mut a = a.borrow_mut();
+            for (i, (p, r)) in a.iter().enumerate() {
+                if p == &params && r == &ret {
+                    return CallableId(i as u32);
+                }
+            }
+            let id = a.len() as u32;
+            a.push((params, ret));
+            CallableId(id)
+        })
+    }
+    pub fn params(self) -> Vec<Type> {
+        CALLABLE_ARENA.with(|a| a.borrow()[self.0 as usize].0.clone())
+    }
+    pub fn ret(self) -> Type {
+        CALLABLE_ARENA.with(|a| a.borrow()[self.0 as usize].1)
+    }
 }
 
 impl ClassId {
@@ -299,6 +326,9 @@ pub enum Type {
     /// pointer; ref-semantics like Python objects. Fields and methods
     /// resolved against the ClassDef in the arena.
     Class(ClassId),
+    /// v0.38: first-class function value `Callable[[params], ret]`.
+    /// Stored as a value-typed `{ i8* fn, i8* env }` (16 bytes).
+    Callable(CallableId),
 }
 
 impl Type {
@@ -325,6 +355,15 @@ impl Type {
             Type::Dict(id) => format!("dict[{}, {}]", id.key().name(), id.val().name()),
             Type::Set(id) => format!("set[{}]", id.elem().name()),
             Type::Class(id) => id.name(),
+            Type::Callable(id) => {
+                let params = id
+                    .params()
+                    .iter()
+                    .map(|t| t.name())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("Callable[[{}], {}]", params, id.ret().name())
+            }
         }
     }
     /// Width of the integer type in bits, or None for non-int types.
@@ -363,6 +402,11 @@ pub struct Function {
     pub params: Vec<Param>,
     pub return_ty: Type,
     pub body: Vec<Stmt>,
+    /// v0.38: for lifted lambda functions, the env capture fields in
+    /// the order they're stored in the heap env struct. Empty for
+    /// ordinary functions. When non-empty, codegen prepends an
+    /// implicit `i8* %env` parameter to the LLVM signature.
+    pub env_fields: Vec<(String, Type)>,
 }
 
 #[derive(Debug)]
@@ -440,6 +484,10 @@ pub enum Expr {
     ConstBool(bool),
     /// Reference to a parameter or previously assigned local.
     Var(String),
+    /// v0.38: refers to a captured value in a lifted-lambda's env.
+    /// Codegen loads via the implicit `%env` parameter using the
+    /// `env_fields` index for `name`.
+    EnvVar(String),
     BinOp { op: BinOp, lhs: Box<TypedExpr>, rhs: Box<TypedExpr> },
     UnaryOp { op: UnaryOp, operand: Box<TypedExpr> },
     Cmp { op: CmpOp, lhs: Box<TypedExpr>, rhs: Box<TypedExpr> },
@@ -559,6 +607,25 @@ pub enum Expr {
         arg_types: Vec<Type>,
         return_ty: Type,
         args: Vec<TypedExpr>,
+    },
+    /// v0.38: build a `Callable` value. `fn_name` is the mangled name
+    /// of the lifted top-level function (`__lambda.<idx>`); its first
+    /// param is `env: i8*` and the rest match the callable's params.
+    /// `env_fields` lists the captured locals (name + type) in the
+    /// order they're stored in the env struct. `env_init` are the
+    /// values to write at the call site (in the same order).
+    LambdaValue {
+        fn_name: String,
+        env_fields: Vec<(String, Type)>,
+        env_init: Vec<TypedExpr>,
+        callable_ty: Type,
+    },
+    /// v0.38: indirect call through a `Callable` value. Codegen
+    /// extracts fn + env, prepends env to args, and indirect-calls.
+    IndirectCall {
+        callee: Box<TypedExpr>,
+        args: Vec<TypedExpr>,
+        return_ty: Type,
     },
 }
 

@@ -23,6 +23,11 @@ thread_local! {
     /// `lower_method` and used by `super()` resolution. None when
     /// lowering top-level functions.
     static CURRENT_CLASS: RefCell<Option<ClassId>> = const { RefCell::new(None) };
+    /// v0.38: lambda counter for unique lifted-function names.
+    static LAMBDA_COUNTER: RefCell<u32> = const { RefCell::new(0) };
+    /// v0.38: lifted lambda function definitions, drained into
+    /// `all_functions` at the end of `lower()`.
+    static LIFTED_FUNCTIONS: RefCell<Vec<Function>> = const { RefCell::new(Vec::new()) };
 }
 
 const MAX_PARAMS: usize = 16;
@@ -41,6 +46,8 @@ type SignatureTable = HashMap<String, FunctionSig>;
 
 pub fn lower(module: &Module, source_path: &Path) -> Result<Program> {
     CLASS_REGISTRY.with(|r| r.borrow_mut().clear());
+    LAMBDA_COUNTER.with(|c| *c.borrow_mut() = 0);
+    LIFTED_FUNCTIONS.with(|f| f.borrow_mut().clear());
     // Pre-register `ABC` as a sentinel class with no fields, no methods,
     // and no abstract methods. Used to recognize `class Foo(ABC):` at
     // pass 0b. v0.34 marks classes as abstract via their declared
@@ -93,6 +100,8 @@ pub fn lower(module: &Module, source_path: &Path) -> Result<Program> {
         }
     }
 
+    // v0.38: drain any lifted lambdas into the function list.
+    LIFTED_FUNCTIONS.with(|f| all_functions.extend(f.borrow_mut().drain(..)));
     Ok(Program { functions: all_functions })
 }
 
@@ -359,9 +368,11 @@ fn lower_module_into(
             ast::Stmt::ImportFrom(im) => {
                 let module_name = im.module.as_ref().map(|s| s.as_str()).unwrap_or("");
                 match module_name {
-                    "pyx86.types" | "__future__" | "math" | "abc" => {
+                    "pyx86.types" | "__future__" | "math" | "abc" | "typing" => {
                         // Documentary imports; no file load. Names from
                         // math are recognized by lower_builtin_call directly.
+                        // `typing.Callable` is recognized by
+                        // parse_type_annotation for callable types.
                     }
                     _ => {
                         // Resolve sibling file: <source_dir>/<module-as-path>.py.
@@ -576,6 +587,7 @@ fn lower_method(
         params: sig.params.clone(),
         return_ty: sig.return_ty,
         body,
+        env_fields: Vec::new(),
     })
 }
 
@@ -712,6 +724,7 @@ fn lower_function(func: &ast::StmtFunctionDef, signatures: &SignatureTable) -> R
         params: sig.params.clone(),
         return_ty: sig.return_ty,
         body,
+        env_fields: Vec::new(),
     })
 }
 
@@ -820,8 +833,8 @@ fn lower_block(
                         name
                     )
                 })?;
-                let value = lower_expr(value_expr, scope, signatures)?;
-                let value = coerce(value, declared_ty)?;
+                let value =
+                    lower_expr_with_expected(value_expr, declared_ty, scope, signatures)?;
                 scope.insert(name.clone(), declared_ty);
                 out.push(Stmt::Let { name, value });
             }
@@ -866,8 +879,8 @@ fn lower_block(
                     .value
                     .as_deref()
                     .ok_or_else(|| anyhow!("unsupported_feature: `return` must have a value"))?;
-                let value = lower_expr(value_expr, scope, signatures)?;
-                let value = coerce(value, return_ty)?;
+                let value =
+                    lower_expr_with_expected(value_expr, return_ty, scope, signatures)?;
                 out.push(Stmt::Return { value });
             }
             ast::Stmt::If(if_stmt) => {
@@ -1197,6 +1210,26 @@ fn parse_type_annotation(ann: Option<&ast::Expr>) -> Option<Type> {
                         return None;
                     }
                     Some(Type::Set(SetId::intern(elem)))
+                }
+                "Callable" => {
+                    // `Callable[[P1, P2, ...], R]` — slice is a Tuple of
+                    // (List of params, R).
+                    let (param_list_expr, ret_expr) = match s.slice.as_ref() {
+                        ast::Expr::Tuple(t) if t.elts.len() == 2 => {
+                            (&t.elts[0], &t.elts[1])
+                        }
+                        _ => return None,
+                    };
+                    let param_elems: Vec<&ast::Expr> = match param_list_expr {
+                        ast::Expr::List(l) => l.elts.iter().collect(),
+                        _ => return None,
+                    };
+                    let mut params: Vec<Type> = Vec::with_capacity(param_elems.len());
+                    for p in param_elems {
+                        params.push(parse_type_annotation(Some(p))?);
+                    }
+                    let ret = parse_type_annotation(Some(ret_expr))?;
+                    Some(Type::Callable(crate::hir::CallableId::intern(params, ret)))
                 }
                 _ => None,
             }
@@ -1569,8 +1602,12 @@ fn lower_expr(e: &ast::Expr, scope: &Scope, signatures: &SignatureTable) -> Resu
                             );
                         }
                         for (i, a) in c.args.iter().enumerate() {
-                            let raw = lower_expr(a, scope, signatures)?;
-                            args.push(coerce(raw, sig.params[i + 1].ty)?);
+                            args.push(lower_expr_with_expected(
+                                a,
+                                sig.params[i + 1].ty,
+                                scope,
+                                signatures,
+                            )?);
                         }
                         return Ok(TypedExpr::new(
                             sig.return_ty,
@@ -1622,8 +1659,12 @@ fn lower_expr(e: &ast::Expr, scope: &Scope, signatures: &SignatureTable) -> Resu
                             let mut args: Vec<TypedExpr> = Vec::with_capacity(c.args.len() + 1);
                             args.push(coerce(obj, sig.params[0].ty)?);
                             for (i, a) in c.args.iter().enumerate() {
-                                let raw = lower_expr(a, scope, signatures)?;
-                                args.push(coerce(raw, sig.params[i + 1].ty)?);
+                                args.push(lower_expr_with_expected(
+                                    a,
+                                    sig.params[i + 1].ty,
+                                    scope,
+                                    signatures,
+                                )?);
                             }
                             let arg_types: Vec<Type> =
                                 args.iter().map(|a| a.ty).collect();
@@ -1672,8 +1713,12 @@ fn lower_expr(e: &ast::Expr, scope: &Scope, signatures: &SignatureTable) -> Resu
                         );
                     }
                     for (i, a) in c.args.iter().enumerate() {
-                        let raw = lower_expr(a, scope, signatures)?;
-                        args.push(coerce(raw, sig.params[i + 1].ty)?);
+                        args.push(lower_expr_with_expected(
+                            a,
+                            sig.params[i + 1].ty,
+                            scope,
+                            signatures,
+                        )?);
                     }
                     return Ok(TypedExpr::new(
                         sig.return_ty,
@@ -1691,6 +1736,37 @@ fn lower_expr(e: &ast::Expr, scope: &Scope, signatures: &SignatureTable) -> Resu
                     "unsupported_feature: only direct calls to top-level functions are supported"
                 ),
             };
+            // v0.38: if the callee name is bound in scope as a Callable,
+            // indirect-call through the value.
+            if let Some(&ty) = scope.get(&callee) {
+                if let Type::Callable(cid) = ty {
+                    let cparams = cid.params();
+                    let cret = cid.ret();
+                    if c.args.len() != cparams.len() {
+                        bail!(
+                            "unsupported_feature: callable `{}` takes {} args, got {}",
+                            callee, cparams.len(), c.args.len()
+                        );
+                    }
+                    if !c.keywords.is_empty() {
+                        bail!("unsupported_feature: keyword args on indirect call not supported");
+                    }
+                    let mut args: Vec<TypedExpr> = Vec::with_capacity(c.args.len());
+                    for (i, a) in c.args.iter().enumerate() {
+                        let raw =
+                            lower_expr_with_expected(a, cparams[i], scope, signatures)?;
+                        args.push(raw);
+                    }
+                    return Ok(TypedExpr::new(
+                        cret,
+                        Expr::IndirectCall {
+                            callee: Box::new(TypedExpr::new(ty, Expr::Var(callee.clone()))),
+                            args,
+                            return_ty: cret,
+                        },
+                    ));
+                }
+            }
             // Class constructor: `Foo(args)` if Foo is a registered class.
             if let Some(class_id) = CLASS_REGISTRY.with(|r| r.borrow().get(&callee).copied()) {
                 if class_id.is_abstract() {
@@ -1740,8 +1816,12 @@ fn lower_expr(e: &ast::Expr, scope: &Scope, signatures: &SignatureTable) -> Resu
                 }
                 let mut args: Vec<TypedExpr> = Vec::with_capacity(c.args.len());
                 for (i, a) in c.args.iter().enumerate() {
-                    let raw = lower_expr(a, scope, signatures)?;
-                    args.push(coerce(raw, init_sig.params[i + 1].ty)?);
+                    args.push(lower_expr_with_expected(
+                        a,
+                        init_sig.params[i + 1].ty,
+                        scope,
+                        signatures,
+                    )?);
                 }
                 return Ok(TypedExpr::new(
                     Type::Class(class_id),
@@ -2220,6 +2300,9 @@ fn lower_expr(e: &ast::Expr, scope: &Scope, signatures: &SignatureTable) -> Resu
             ))
         }
         ast::Expr::JoinedStr(js) => lower_joined_str(&js.values, scope, signatures),
+        ast::Expr::Lambda(_) => bail!(
+            "unsupported_feature: lambdas only work in slots that expect a `Callable` type (function arg, annotated assignment, or return). Annotate the slot explicitly."
+        ),
         other => bail!(
             "unsupported_feature: expression form `{}` is not supported",
             expr_kind_name(other)
@@ -2301,6 +2384,400 @@ fn reject_abstract_type(ty: Type, what: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// v0.38: lower an expression with an expected type. If the expression
+/// is a lambda AND the expected type is `Type::Callable`, route to the
+/// lambda lifter so the lambda can be type-inferred from context.
+/// Otherwise fall through to the generic `lower_expr` + `coerce`.
+fn lower_expr_with_expected(
+    e: &ast::Expr,
+    expected: Type,
+    scope: &Scope,
+    signatures: &SignatureTable,
+) -> Result<TypedExpr> {
+    if let ast::Expr::Lambda(lam) = e {
+        return lower_lambda(lam, expected, scope, signatures);
+    }
+    let v = lower_expr(e, scope, signatures)?;
+    coerce(v, expected)
+}
+
+/// v0.38: lift an `ast::ExprLambda` into a fresh top-level function,
+/// returning an `Expr::LambdaValue` that constructs the runtime
+/// closure (`{ i8* fn, i8* env }`) at the call site.
+fn lower_lambda(
+    lam: &ast::ExprLambda,
+    expected: Type,
+    scope: &Scope,
+    signatures: &SignatureTable,
+) -> Result<TypedExpr> {
+    let cid = match expected {
+        Type::Callable(id) => id,
+        other => bail!(
+            "unsupported_feature: a lambda flowed into a slot of type {} (a non-Callable type)",
+            other.name()
+        ),
+    };
+    let expected_params = cid.params();
+    let expected_ret = cid.ret();
+
+    if lam.args.args.len() != expected_params.len() {
+        bail!(
+            "unsupported_feature: lambda has {} parameters but the expected `Callable` takes {}",
+            lam.args.args.len(),
+            expected_params.len()
+        );
+    }
+    if lam.args.vararg.is_some() || lam.args.kwarg.is_some() {
+        bail!("unsupported_feature: lambdas may not use *args / **kwargs");
+    }
+    if !lam.args.kwonlyargs.is_empty() || !lam.args.posonlyargs.is_empty() {
+        bail!("unsupported_feature: lambdas may not use keyword-only / positional-only params");
+    }
+    if lam.args.defaults().next().is_some() {
+        bail!("unsupported_feature: lambdas may not have default arguments");
+    }
+
+    // Free-variable analysis: walk the body, collect Name references that
+    // aren't lambda params and that resolve in the enclosing scope.
+    let param_names: HashSet<String> =
+        lam.args.args.iter().map(|a| a.def.arg.as_str().to_string()).collect();
+    let mut free: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    collect_free_names(&lam.body, &param_names, &mut free, &mut seen);
+    let mut env_fields: Vec<(String, Type)> = Vec::new();
+    let mut env_init: Vec<TypedExpr> = Vec::new();
+    for n in &free {
+        if let Some(&ty) = scope.get(n) {
+            env_fields.push((n.clone(), ty));
+            env_init.push(TypedExpr::new(ty, Expr::Var(n.clone())));
+        }
+        // Names not in scope: leave for lower_expr to error out on with
+        // a name-not-in-scope message (e.g. typos or top-level
+        // function refs in non-call positions).
+    }
+
+    // Lower the body in a scope with env-captures + lambda params.
+    let mut lambda_scope: Scope = HashMap::new();
+    for (n, ty) in &env_fields {
+        lambda_scope.insert(n.clone(), *ty);
+    }
+    let mut params: Vec<Param> = Vec::with_capacity(lam.args.args.len());
+    for (i, arg) in lam.args.args.iter().enumerate() {
+        let pname = arg.def.arg.as_str().to_string();
+        lambda_scope.insert(pname.clone(), expected_params[i]);
+        params.push(Param { name: pname, ty: expected_params[i] });
+    }
+    let body_expr = lower_expr(&lam.body, &lambda_scope, signatures)?;
+    let body_expr = coerce(body_expr, expected_ret)?;
+    // Rewrite captured Var references to EnvVar.
+    let env_names: HashSet<String> =
+        env_fields.iter().map(|(n, _)| n.clone()).collect();
+    let body_expr = rewrite_var_to_env(body_expr, &env_names);
+
+    let idx = LAMBDA_COUNTER.with(|c| {
+        let v = *c.borrow();
+        *c.borrow_mut() = v + 1;
+        v
+    });
+    let fn_name = format!("__lambda.{}", idx);
+
+    LIFTED_FUNCTIONS.with(|f| {
+        f.borrow_mut().push(Function {
+            name: fn_name.clone(),
+            params,
+            return_ty: expected_ret,
+            body: vec![Stmt::Return { value: body_expr }],
+            env_fields: env_fields.clone(),
+        });
+    });
+
+    let callable_ty = Type::Callable(cid);
+    Ok(TypedExpr::new(
+        callable_ty,
+        Expr::LambdaValue {
+            fn_name,
+            env_fields,
+            env_init,
+            callable_ty,
+        },
+    ))
+}
+
+/// Walk an AST expression and collect all `Name(id)` references where
+/// `id` is NOT in `bound` and hasn't been seen yet.
+fn collect_free_names(
+    e: &ast::Expr,
+    bound: &HashSet<String>,
+    out: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+) {
+    use ast::Expr as E;
+    match e {
+        E::Name(n) => {
+            let s = n.id.as_str();
+            if !bound.contains(s) && seen.insert(s.to_string()) {
+                out.push(s.to_string());
+            }
+        }
+        E::BinOp(b) => {
+            collect_free_names(&b.left, bound, out, seen);
+            collect_free_names(&b.right, bound, out, seen);
+        }
+        E::UnaryOp(u) => collect_free_names(&u.operand, bound, out, seen),
+        E::BoolOp(b) => {
+            for v in &b.values {
+                collect_free_names(v, bound, out, seen);
+            }
+        }
+        E::Compare(c) => {
+            collect_free_names(&c.left, bound, out, seen);
+            for cmp in &c.comparators {
+                collect_free_names(cmp, bound, out, seen);
+            }
+        }
+        E::Call(c) => {
+            collect_free_names(&c.func, bound, out, seen);
+            for a in &c.args {
+                collect_free_names(a, bound, out, seen);
+            }
+            for kw in &c.keywords {
+                collect_free_names(&kw.value, bound, out, seen);
+            }
+        }
+        E::Attribute(a) => collect_free_names(&a.value, bound, out, seen),
+        E::Subscript(s) => {
+            collect_free_names(&s.value, bound, out, seen);
+            collect_free_names(&s.slice, bound, out, seen);
+        }
+        E::Tuple(t) => {
+            for elt in &t.elts {
+                collect_free_names(elt, bound, out, seen);
+            }
+        }
+        E::List(l) => {
+            for elt in &l.elts {
+                collect_free_names(elt, bound, out, seen);
+            }
+        }
+        E::Set(s) => {
+            for elt in &s.elts {
+                collect_free_names(elt, bound, out, seen);
+            }
+        }
+        E::Dict(d) => {
+            for k in d.keys.iter().flatten() {
+                collect_free_names(k, bound, out, seen);
+            }
+            for v in &d.values {
+                collect_free_names(v, bound, out, seen);
+            }
+        }
+        E::IfExp(i) => {
+            collect_free_names(&i.test, bound, out, seen);
+            collect_free_names(&i.body, bound, out, seen);
+            collect_free_names(&i.orelse, bound, out, seen);
+        }
+        E::JoinedStr(j) => {
+            for v in &j.values {
+                collect_free_names(v, bound, out, seen);
+            }
+        }
+        E::FormattedValue(fv) => collect_free_names(&fv.value, bound, out, seen),
+        // No traversal needed for atoms / unhandled forms.
+        _ => {}
+    }
+}
+
+/// Walk a lowered `TypedExpr` and rewrite `Expr::Var(name)` to
+/// `Expr::EnvVar(name)` when `name` is in `env_names`. Used after
+/// lowering a lambda body so captured-variable references are
+/// converted to env-pointer accesses.
+fn rewrite_var_to_env(e: TypedExpr, env_names: &HashSet<String>) -> TypedExpr {
+    let ty = e.ty;
+    let new_expr = match e.expr {
+        Expr::Var(n) => {
+            if env_names.contains(&n) {
+                Expr::EnvVar(n)
+            } else {
+                Expr::Var(n)
+            }
+        }
+        Expr::Coerce { inner } => Expr::Coerce {
+            inner: Box::new(rewrite_var_to_env(*inner, env_names)),
+        },
+        Expr::UnaryOp { op, operand } => Expr::UnaryOp {
+            op,
+            operand: Box::new(rewrite_var_to_env(*operand, env_names)),
+        },
+        Expr::BinOp { op, lhs, rhs } => Expr::BinOp {
+            op,
+            lhs: Box::new(rewrite_var_to_env(*lhs, env_names)),
+            rhs: Box::new(rewrite_var_to_env(*rhs, env_names)),
+        },
+        Expr::Cmp { op, lhs, rhs } => Expr::Cmp {
+            op,
+            lhs: Box::new(rewrite_var_to_env(*lhs, env_names)),
+            rhs: Box::new(rewrite_var_to_env(*rhs, env_names)),
+        },
+        Expr::CmpChain { first, rest } => {
+            let first = Box::new(rewrite_var_to_env(*first, env_names));
+            let rest = rest
+                .into_iter()
+                .map(|(op, e)| (op, rewrite_var_to_env(e, env_names)))
+                .collect();
+            Expr::CmpChain { first, rest }
+        }
+        Expr::Not(inner) => Expr::Not(Box::new(rewrite_var_to_env(*inner, env_names))),
+        Expr::BoolOp { op, lhs, rhs } => Expr::BoolOp {
+            op,
+            lhs: Box::new(rewrite_var_to_env(*lhs, env_names)),
+            rhs: Box::new(rewrite_var_to_env(*rhs, env_names)),
+        },
+        Expr::Call { callee, args } => Expr::Call {
+            callee,
+            args: args
+                .into_iter()
+                .map(|a| rewrite_var_to_env(a, env_names))
+                .collect(),
+        },
+        Expr::TupleLit { elements } => Expr::TupleLit {
+            elements: elements
+                .into_iter()
+                .map(|e| rewrite_var_to_env(e, env_names))
+                .collect(),
+        },
+        Expr::TupleIndex { tuple, index } => Expr::TupleIndex {
+            tuple: Box::new(rewrite_var_to_env(*tuple, env_names)),
+            index,
+        },
+        Expr::ListLit { elements } => Expr::ListLit {
+            elements: elements
+                .into_iter()
+                .map(|e| rewrite_var_to_env(e, env_names))
+                .collect(),
+        },
+        Expr::ListIndex { list, index } => Expr::ListIndex {
+            list: Box::new(rewrite_var_to_env(*list, env_names)),
+            index: Box::new(rewrite_var_to_env(*index, env_names)),
+        },
+        Expr::ListLen { list } => Expr::ListLen {
+            list: Box::new(rewrite_var_to_env(*list, env_names)),
+        },
+        Expr::ListConcat { lhs, rhs } => Expr::ListConcat {
+            lhs: Box::new(rewrite_var_to_env(*lhs, env_names)),
+            rhs: Box::new(rewrite_var_to_env(*rhs, env_names)),
+        },
+        Expr::DoBlock { stmts, result } => Expr::DoBlock {
+            stmts,
+            result: Box::new(rewrite_var_to_env(*result, env_names)),
+        },
+        Expr::StrConcat { lhs, rhs } => Expr::StrConcat {
+            lhs: Box::new(rewrite_var_to_env(*lhs, env_names)),
+            rhs: Box::new(rewrite_var_to_env(*rhs, env_names)),
+        },
+        Expr::StrLen { s } => Expr::StrLen {
+            s: Box::new(rewrite_var_to_env(*s, env_names)),
+        },
+        Expr::StrEq { lhs, rhs, negated } => Expr::StrEq {
+            lhs: Box::new(rewrite_var_to_env(*lhs, env_names)),
+            rhs: Box::new(rewrite_var_to_env(*rhs, env_names)),
+            negated,
+        },
+        Expr::FormatToStr { inner } => Expr::FormatToStr {
+            inner: Box::new(rewrite_var_to_env(*inner, env_names)),
+        },
+        Expr::StrIndex { s, index } => Expr::StrIndex {
+            s: Box::new(rewrite_var_to_env(*s, env_names)),
+            index: Box::new(rewrite_var_to_env(*index, env_names)),
+        },
+        Expr::StrSlice { s, start, stop } => Expr::StrSlice {
+            s: Box::new(rewrite_var_to_env(*s, env_names)),
+            start: Box::new(rewrite_var_to_env(*start, env_names)),
+            stop: Box::new(rewrite_var_to_env(*stop, env_names)),
+        },
+        Expr::MathCall { intrinsic, arg } => Expr::MathCall {
+            intrinsic,
+            arg: Box::new(rewrite_var_to_env(*arg, env_names)),
+        },
+        Expr::DictLit { entries } => Expr::DictLit {
+            entries: entries
+                .into_iter()
+                .map(|(k, v)| {
+                    (
+                        rewrite_var_to_env(k, env_names),
+                        rewrite_var_to_env(v, env_names),
+                    )
+                })
+                .collect(),
+        },
+        Expr::DictGet { dict, key } => Expr::DictGet {
+            dict: Box::new(rewrite_var_to_env(*dict, env_names)),
+            key: Box::new(rewrite_var_to_env(*key, env_names)),
+        },
+        Expr::DictHas { dict, key } => Expr::DictHas {
+            dict: Box::new(rewrite_var_to_env(*dict, env_names)),
+            key: Box::new(rewrite_var_to_env(*key, env_names)),
+        },
+        Expr::DictLen { dict } => Expr::DictLen {
+            dict: Box::new(rewrite_var_to_env(*dict, env_names)),
+        },
+        Expr::SetLit { elements } => Expr::SetLit {
+            elements: elements
+                .into_iter()
+                .map(|e| rewrite_var_to_env(e, env_names))
+                .collect(),
+        },
+        Expr::SetHas { set, key } => Expr::SetHas {
+            set: Box::new(rewrite_var_to_env(*set, env_names)),
+            key: Box::new(rewrite_var_to_env(*key, env_names)),
+        },
+        Expr::SetLen { set } => Expr::SetLen {
+            set: Box::new(rewrite_var_to_env(*set, env_names)),
+        },
+        Expr::FieldGet { obj, field_index } => Expr::FieldGet {
+            obj: Box::new(rewrite_var_to_env(*obj, env_names)),
+            field_index,
+        },
+        Expr::ClassNew { class, init_class, args } => Expr::ClassNew {
+            class,
+            init_class,
+            args: args
+                .into_iter()
+                .map(|a| rewrite_var_to_env(a, env_names))
+                .collect(),
+        },
+        Expr::VirtualCall {
+            vtable_root,
+            slot,
+            method_name,
+            arg_types,
+            return_ty,
+            args,
+        } => Expr::VirtualCall {
+            vtable_root,
+            slot,
+            method_name,
+            arg_types,
+            return_ty,
+            args: args
+                .into_iter()
+                .map(|a| rewrite_var_to_env(a, env_names))
+                .collect(),
+        },
+        Expr::IndirectCall { callee, args, return_ty } => Expr::IndirectCall {
+            callee: Box::new(rewrite_var_to_env(*callee, env_names)),
+            args: args
+                .into_iter()
+                .map(|a| rewrite_var_to_env(a, env_names))
+                .collect(),
+            return_ty,
+        },
+        // Atoms + already-EnvVar: pass through.
+        other => other,
+    };
+    TypedExpr::new(ty, new_expr)
 }
 
 /// Resolve a method on a class by walking the inheritance chain.
@@ -3007,8 +3484,9 @@ fn resolve_call_args(
     }
     let mut filled: Vec<Option<TypedExpr>> = vec![None; n];
     for (i, a) in pos_args.iter().enumerate() {
-        let raw = lower_expr(a, scope, signatures)?;
-        filled[i] = Some(coerce(raw, sig.params[i].ty)?);
+        let lowered =
+            lower_expr_with_expected(a, sig.params[i].ty, scope, signatures)?;
+        filled[i] = Some(lowered);
     }
     for kw in kw_args {
         let name = kw.arg.as_ref().ok_or_else(|| {
