@@ -51,6 +51,8 @@ pub fn lower(module: &Module, source_path: &Path) -> Result<Program> {
         fields: Vec::new(),
         parent: None,
         abstract_methods: Vec::new(),
+        vtable_root: None,
+        vtable_slots: Vec::new(),
     });
     CLASS_REGISTRY.with(|r| r.borrow_mut().insert("ABC".to_string(), abc_id));
     let mut loaded: HashSet<PathBuf> = HashSet::new();
@@ -124,6 +126,8 @@ fn lower_module_into(
                 fields: Vec::new(),
                 parent: None,
                 abstract_methods: Vec::new(),
+                vtable_root: None,
+                vtable_slots: Vec::new(),
             });
             CLASS_REGISTRY.with(|r| r.borrow_mut().insert(name, id));
         }
@@ -235,12 +239,22 @@ fn lower_module_into(
                         });
                         let mname = format!("{}.{}", name, f.name);
                         if is_abstract_decorated {
-                            // Abstract methods are recorded in the
-                            // abstract set and don't get lowered or
-                            // registered in `signatures`. (We also don't
-                            // care about their body — Python idiomatically
-                            // uses `pass` or `...`.)
+                            // v0.34: record the name in the abstract set.
+                            // v0.37: also register the signature so virtual
+                            // dispatch can read return/param types. No
+                            // function body is lowered (no `Function` entry
+                            // pushed to `local_method_defs`); the body —
+                            // typically `pass` or `...` — is ignored.
                             unimplemented.insert(f.name.as_str().to_string());
+                            if signatures.contains_key(&mname) {
+                                bail!(
+                                    "unsupported_feature: duplicate method `{}` in class `{}`",
+                                    f.name,
+                                    name
+                                );
+                            }
+                            let sig = collect_method_signature(class_id, f)?;
+                            signatures.insert(mname.clone(), sig);
                         } else {
                             if signatures.contains_key(&mname) {
                                 bail!(
@@ -270,6 +284,57 @@ fn lower_module_into(
             let mut unimplemented_vec: Vec<String> = unimplemented.into_iter().collect();
             unimplemented_vec.sort();
             class_id.set_abstract_methods(unimplemented_vec);
+        }
+    }
+
+    // Phase 0c (v0.37): compute vtable_root + vtable_slots for every
+    // class that participates in an ABC chain. A class is in a chain
+    // iff it is abstract or has an ancestor with vtable_root already
+    // set. Slot layout is prefix-compatible: a descendant's slots are
+    // (parent.vtable_slots ++ sorted(new-abstracts-declared-here)). This
+    // means a `B*` can be safely bitcast to its ancestor `A*` and a
+    // vtable indexed through A still finds the right slot for any
+    // method A knows about.
+    for stmt in &module.body {
+        if let ast::Stmt::ClassDef(c) = stmt {
+            let name = c.name.as_str().to_string();
+            let class_id = CLASS_REGISTRY.with(|r| r.borrow()[&name]);
+            let parent_root = class_id.parent().and_then(|p| p.vtable_root());
+            let root = if let Some(r) = parent_root {
+                Some(r)
+            } else if class_id.is_abstract() {
+                Some(class_id)
+            } else {
+                None
+            };
+            class_id.set_vtable_root(root);
+            if root.is_some() {
+                let parent_slots: Vec<String> = match class_id.parent() {
+                    Some(p) => p.vtable_slots(),
+                    None => Vec::new(),
+                };
+                let parent_set: HashSet<String> = parent_slots.iter().cloned().collect();
+                // Re-walk this class's body to find @abstractmethod-
+                // decorated methods.
+                let mut own_new: Vec<String> = Vec::new();
+                for inner in &c.body {
+                    if let ast::Stmt::FunctionDef(f) = inner {
+                        let is_abstract = f.decorator_list.iter().any(|d| {
+                            matches!(d, ast::Expr::Name(n) if n.id.as_str() == "abstractmethod")
+                        });
+                        if is_abstract {
+                            let mname = f.name.as_str().to_string();
+                            if !parent_set.contains(&mname) {
+                                own_new.push(mname);
+                            }
+                        }
+                    }
+                }
+                own_new.sort();
+                let mut slots = parent_slots;
+                slots.extend(own_new);
+                class_id.set_vtable_slots(slots);
+            }
         }
     }
 
@@ -392,11 +457,17 @@ fn collect_method_signature(
             func.name
         );
     }
-    if !func.decorator_list.is_empty() {
-        bail!(
-            "unsupported_feature: method decorators not yet supported (on `{}`)",
-            func.name
-        );
+    // v0.34/v0.37: `@abstractmethod` is allowed here; other method
+    // decorators (`@property`, `@staticmethod`, `@classmethod`) are
+    // deferred.
+    for d in &func.decorator_list {
+        let allowed = matches!(d, ast::Expr::Name(n) if n.id.as_str() == "abstractmethod");
+        if !allowed {
+            bail!(
+                "unsupported_feature: method decorator `{:?}` on `{}` is not supported",
+                d, func.name
+            );
+        }
     }
     if func.args.args.is_empty() {
         bail!(
@@ -440,7 +511,7 @@ fn collect_method_signature(
                 func.name
             )
         })?;
-        reject_abstract_type(ty, "method parameter type")?;
+        // v0.37: abstract types now permitted (dispatched via vtable).
         params.push(Param { name, ty });
     }
     let return_ty = match parse_type_annotation(func.returns.as_deref()) {
@@ -454,7 +525,7 @@ fn collect_method_signature(
             func.name
         ),
     };
-    reject_abstract_type(return_ty, "method return type")?;
+    // v0.37: abstract types now permitted (dispatched via vtable).
     if func.args.defaults().next().is_some() {
         bail!(
             "unsupported_feature: default args on methods not yet supported (on `{}`)",
@@ -554,7 +625,7 @@ fn collect_signature(func: &ast::StmtFunctionDef) -> Result<FunctionSig> {
                 func.name
             )
         })?;
-        reject_abstract_type(ty, "function parameter type")?;
+        // v0.37: abstract types now permitted (dispatched via vtable).
         params.push(Param { name, ty });
     }
 
@@ -565,7 +636,7 @@ fn collect_signature(func: &ast::StmtFunctionDef) -> Result<FunctionSig> {
             func.name
         ),
     };
-    reject_abstract_type(return_ty, "function return type")?;
+    // v0.37: abstract types now permitted (dispatched via vtable).
 
     let raw_defaults: Vec<&ast::Expr> = func.args.defaults().collect();
     let n = params.len();
@@ -742,7 +813,7 @@ fn lower_block(
                         name
                     )
                 })?;
-                reject_abstract_type(declared_ty, "local variable type")?;
+                // v0.37: abstract types now permitted (dispatched via vtable).
                 let value_expr = a.value.as_deref().ok_or_else(|| {
                     anyhow!(
                         "unsupported_feature: bare annotation `{}: <type>` (no value) is not supported",
@@ -1508,13 +1579,67 @@ fn lower_expr(e: &ast::Expr, scope: &Scope, signatures: &SignatureTable) -> Resu
                     }
                 }
             }
-            // Method-call form: `obj.method(args...)` lowers to a regular
-            // call to the mangled function `<ClassName>.<method>` with
-            // obj prepended as `self`.
+            // Method-call form: `obj.method(args...)`. For ABC-chain
+            // classes calling a vtable-slot method, dispatch is virtual
+            // (Expr::VirtualCall). For everything else, static dispatch
+            // through the mangled name.
             if let ast::Expr::Attribute(attr) = c.func.as_ref() {
                 let obj = lower_expr(&attr.value, scope, signatures)?;
                 if let Type::Class(class_id) = obj.ty {
                     let method = attr.attr.as_str();
+                    // Virtual dispatch path.
+                    if let Some(root) = class_id.vtable_root() {
+                        let slots = class_id.vtable_slots();
+                        if let Some(slot) = slots.iter().position(|n| n == method) {
+                            // Signature: pick from class_id's resolved
+                            // method (abstract sig registered in Pass 0b
+                            // even though no body emitted). If not
+                            // resolvable, look at the root's declaration.
+                            let (_owner, mangled) = resolve_method(class_id, method, signatures)
+                                .or_else(|| resolve_method(root, method, signatures))
+                                .ok_or_else(|| {
+                                    anyhow!(
+                                        "unsupported_feature: virtual method `{}` on `{}` is in the vtable but has no signature",
+                                        method,
+                                        class_id.name()
+                                    )
+                                })?;
+                            let sig = signatures.get(&mangled).unwrap();
+                            if c.args.len() != sig.params.len() - 1 {
+                                bail!(
+                                    "unsupported_feature: method `{}.{}` takes {} args, got {}",
+                                    class_id.name(),
+                                    method,
+                                    sig.params.len() - 1,
+                                    c.args.len()
+                                );
+                            }
+                            if !c.keywords.is_empty() {
+                                bail!(
+                                    "unsupported_feature: keyword args on method calls not supported"
+                                );
+                            }
+                            let mut args: Vec<TypedExpr> = Vec::with_capacity(c.args.len() + 1);
+                            args.push(coerce(obj, sig.params[0].ty)?);
+                            for (i, a) in c.args.iter().enumerate() {
+                                let raw = lower_expr(a, scope, signatures)?;
+                                args.push(coerce(raw, sig.params[i + 1].ty)?);
+                            }
+                            let arg_types: Vec<Type> =
+                                args.iter().map(|a| a.ty).collect();
+                            return Ok(TypedExpr::new(
+                                sig.return_ty,
+                                Expr::VirtualCall {
+                                    vtable_root: root,
+                                    slot,
+                                    method_name: method.to_string(),
+                                    arg_types,
+                                    return_ty: sig.return_ty,
+                                    args,
+                                },
+                            ));
+                        }
+                    }
                     let (_resolved_class, mangled) =
                         resolve_method(class_id, method, signatures).ok_or_else(|| {
                             anyhow!(

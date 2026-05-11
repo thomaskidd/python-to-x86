@@ -31,6 +31,9 @@ pub fn emit_ll(prog: &Program, source_basename: &str) -> String {
         );
     }
 
+    // v0.37: vtable type definitions + per-class vtable globals.
+    let vtable_section = build_vtable_section(prog);
+
     // Emit string-literal globals. Each literal is `[N x i8] c"<bytes>\00"`.
     // The struct view used at runtime drops the trailing NUL from len.
     let mut str_globals = String::new();
@@ -101,6 +104,7 @@ declare double @tan(double)
 @.fmt_str_repr = private unnamed_addr constant [8 x i8] c\"'%.*s'\\0A\\00\"
 
 {str_globals}
+{vtables}
 {runtime}{defs}define i32 @main(i32 %argc, i8** %argv) {{
 entry:
 {parse}  %r = call {ret_ty} @py_main({call_args})
@@ -116,7 +120,102 @@ entry:
         call_args = py_main_call_args,
         print_block = print_block,
         str_globals = str_globals,
+        vtables = vtable_section,
     )
+}
+
+/// Build the LLVM section for v0.37 vtables: a `%VTable_<root>` type
+/// for every vtable root in use, plus an `@vtable_<class>` constant
+/// for every concrete class in an ABC chain.
+fn build_vtable_section(prog: &Program) -> String {
+    let mut out = String::new();
+    let all_classes = crate::hir::ClassId::all();
+    // Roots actually in use, paired with the max slot count among any
+    // class in their chain. The vtable LLVM type must fit the deepest
+    // descendant's slot list so descendants' @vtable globals are
+    // well-typed; ancestor casts only access a prefix of the same
+    // layout.
+    let mut roots_max: HashMap<u32, (crate::hir::ClassId, usize)> = HashMap::new();
+    for c in &all_classes {
+        if let Some(r) = c.vtable_root() {
+            let entry = roots_max
+                .entry(class_idx(r))
+                .or_insert((r, 0));
+            entry.1 = entry.1.max(c.vtable_slots().len());
+        }
+    }
+    // Emit vtable types using the deepest slot count.
+    for (_idx, (root, n)) in &roots_max {
+        if *n == 0 {
+            continue;
+        }
+        let inner = vec!["i8*"; *n].join(", ");
+        let _ = writeln!(out, "%VTable_{} = type {{ {} }}", root.name(), inner);
+    }
+    // Emit @vtable globals for each concrete class in a chain.
+    for c in &all_classes {
+        let Some(root) = c.vtable_root() else { continue };
+        if c.is_abstract() {
+            continue;
+        }
+        let slots = c.vtable_slots();
+        if slots.is_empty() {
+            continue;
+        }
+        let mut entries: Vec<String> = Vec::new();
+        for method in &slots {
+            // Resolve method by walking c up its parent chain.
+            let mut cur = Some(*c);
+            let mut resolved: Option<&Function> = None;
+            while let Some(cls) = cur {
+                let mangled = format!("{}.{}", cls.name(), method);
+                if let Some(f) = prog.functions.iter().find(|f| f.name == mangled) {
+                    resolved = Some(f);
+                    break;
+                }
+                cur = cls.parent();
+            }
+            let func = resolved.unwrap_or_else(|| {
+                panic!(
+                    "internal: vtable for `{}` slot `{}` has no concrete implementation",
+                    c.name(),
+                    method
+                )
+            });
+            let fn_ty = format_fn_pointer_type(func);
+            entries.push(format!(
+                "i8* bitcast ({fn_ty} @py_{name} to i8*)",
+                fn_ty = fn_ty,
+                name = func.name
+            ));
+        }
+        let _ = writeln!(
+            out,
+            "@vtable_{cls} = private unnamed_addr constant %VTable_{root} {{ {entries} }}",
+            cls = c.name(),
+            root = root.name(),
+            entries = entries.join(", "),
+        );
+    }
+    out
+}
+
+/// Internal helper: extract a class's arena index (for dedup in
+/// `build_vtable_section`).
+fn class_idx(c: crate::hir::ClassId) -> u32 {
+    // Bit-cast through pointer-style debug since ClassId's field is
+    // private. We use a Vec dedup based on its sort/format instead.
+    // For our needs we can just use the Debug repr's number.
+    let s = format!("{:?}", c);
+    // s looks like "ClassId(<n>)"
+    s.trim_start_matches("ClassId(").trim_end_matches(')').parse().unwrap_or(0)
+}
+
+/// LLVM function-pointer type for a method `Function`.
+/// E.g. `i64 (%pyx86.Foo*)*`.
+fn format_fn_pointer_type(func: &Function) -> String {
+    let params: Vec<String> = func.params.iter().map(|p| llvm_ty(p.ty)).collect();
+    format!("{} ({})*", llvm_ty(func.return_ty), params.join(", "))
 }
 
 const RUNTIME_HELPERS: &str = "\
@@ -469,17 +568,19 @@ fn llvm_ty(ty: Type) -> String {
         // in each slot is unused; that's the only behavioural difference.
         Type::Set(_) => "{ i64, i64, i8* }*".to_string(),
         Type::Class(id) => {
-            let inner = id
-                .fields()
-                .iter()
-                .map(|(_, t)| llvm_ty(*t))
-                .collect::<Vec<_>>()
-                .join(", ");
+            let mut parts: Vec<String> = Vec::new();
+            // v0.37: ABC-chain classes carry a vtable pointer at slot 0.
+            if id.needs_vtable() {
+                parts.push("i8*".to_string());
+            }
+            for (_, t) in id.fields() {
+                parts.push(llvm_ty(t));
+            }
             // Empty class → use a single-byte placeholder so malloc(0) is fine.
-            if inner.is_empty() {
+            if parts.is_empty() {
                 "{ i8 }*".to_string()
             } else {
-                format!("{{ {} }}*", inner)
+                format!("{{ {} }}*", parts.join(", "))
             }
         }
     }
@@ -501,9 +602,23 @@ fn type_byte_size(ty: Type) -> u64 {
     }
 }
 
-/// Total bytes of all fields of a class (heap-alloc size).
+/// Total bytes of all fields of a class (heap-alloc size). ABC-chain
+/// classes include 8 extra bytes for the vtable pointer at slot 0.
 fn class_byte_size(id: crate::hir::ClassId) -> u64 {
-    id.fields().iter().map(|(_, t)| type_byte_size(*t)).sum::<u64>().max(1)
+    let user_field_bytes: u64 =
+        id.fields().iter().map(|(_, t)| type_byte_size(*t)).sum::<u64>();
+    let vt_bytes: u64 = if id.needs_vtable() { 8 } else { 0 };
+    (user_field_bytes + vt_bytes).max(1)
+}
+
+/// Field index in the LLVM struct: user fields are shifted by 1 if the
+/// class has a vtable pointer at slot 0.
+fn field_slot_index(id: crate::hir::ClassId, field_index: usize) -> usize {
+    if id.needs_vtable() {
+        field_index + 1
+    } else {
+        field_index
+    }
 }
 
 fn format_signature(func: &Function) -> String {
@@ -803,6 +918,21 @@ impl Codegen {
             Expr::ClassNew { class, init_class, args } => {
                 self.lower_class_new(*class, *init_class, args)
             }
+            Expr::VirtualCall {
+                vtable_root,
+                slot,
+                method_name,
+                arg_types,
+                return_ty,
+                args,
+            } => self.lower_virtual_call(
+                *vtable_root,
+                *slot,
+                method_name,
+                arg_types,
+                *return_ty,
+                args,
+            ),
         }
     }
 
@@ -1668,7 +1798,9 @@ impl Codegen {
         dst
     }
 
-    /// Read a field from a class instance. Just GEP + load.
+    /// Read a field from a class instance. Just GEP + load. Field index
+    /// is the HIR user-field index; we shift by 1 for ABC-chain classes
+    /// whose LLVM slot 0 is the vtable pointer.
     fn lower_field_get(&mut self, obj: &TypedExpr, field_index: usize, result_ty: Type) -> String {
         let obj_op = self.lower(obj);
         let class_id = match obj.ty {
@@ -1676,13 +1808,12 @@ impl Codegen {
             _ => panic!("internal: field_get on non-class"),
         };
         let class_llvm = llvm_ty(obj.ty);
-        // class_llvm is "{ ... }*"; strip trailing '*' to get the struct type.
         let struct_ty = class_llvm.trim_end_matches('*').trim_end().to_string();
-        let _ = class_id;
+        let slot = field_slot_index(class_id, field_index);
         let p = self.fresh();
         self.emit(&format!(
             "{} = getelementptr {sty}, {sty}* {}, i32 0, i32 {}",
-            p, obj_op, field_index,
+            p, obj_op, slot,
             sty = struct_ty
         ));
         let dst = self.fresh();
@@ -1690,6 +1821,77 @@ impl Codegen {
             "{} = load {ft}, {ft}* {}",
             dst, p,
             ft = llvm_ty(result_ty)
+        ));
+        dst
+    }
+
+    /// v0.37: virtual method dispatch through a class instance's vtable.
+    /// Loads the vtable pointer from slot 0 of the receiver, indexes
+    /// to the right method slot, bitcasts the resulting `i8*` function
+    /// pointer to the expected signature, and calls indirectly.
+    fn lower_virtual_call(
+        &mut self,
+        vtable_root: crate::hir::ClassId,
+        slot: usize,
+        _method_name: &str,
+        arg_types: &[Type],
+        return_ty: Type,
+        args: &[TypedExpr],
+    ) -> String {
+        // Lower the receiver (args[0]).
+        assert!(!args.is_empty(), "VirtualCall must have receiver as args[0]");
+        let receiver_op = self.lower(&args[0]);
+        let receiver_llvm = llvm_ty(args[0].ty);
+        let receiver_sty = receiver_llvm.trim_end_matches('*').trim_end().to_string();
+
+        // GEP into the receiver's slot 0 (vtable pointer).
+        let vt_p = self.fresh();
+        self.emit(&format!(
+            "{} = getelementptr {sty}, {sty}* {}, i32 0, i32 0",
+            vt_p, receiver_op,
+            sty = receiver_sty
+        ));
+        let vt_raw = self.fresh();
+        self.emit(&format!("{} = load i8*, i8** {}", vt_raw, vt_p));
+        // Bitcast to %VTable_<root>*.
+        let vt = self.fresh();
+        self.emit(&format!(
+            "{} = bitcast i8* {} to %VTable_{root}*",
+            vt, vt_raw,
+            root = vtable_root.name()
+        ));
+        // GEP to the requested slot.
+        let slot_p = self.fresh();
+        self.emit(&format!(
+            "{} = getelementptr %VTable_{root}, %VTable_{root}* {}, i32 0, i32 {slot}",
+            slot_p, vt,
+            root = vtable_root.name(),
+            slot = slot,
+        ));
+        let fn_raw = self.fresh();
+        self.emit(&format!("{} = load i8*, i8** {}", fn_raw, slot_p));
+        // Bitcast to the actual function pointer type.
+        let param_tys: Vec<String> = arg_types.iter().map(|t| llvm_ty(*t)).collect();
+        let fn_ty = format!("{} ({})*", llvm_ty(return_ty), param_tys.join(", "));
+        let fn_typed = self.fresh();
+        self.emit(&format!(
+            "{} = bitcast i8* {} to {}",
+            fn_typed, fn_raw, fn_ty
+        ));
+        // Lower the remaining args and assemble the call.
+        let mut arg_ops: Vec<String> = Vec::with_capacity(args.len());
+        arg_ops.push(format!("{} {}", llvm_ty(args[0].ty), receiver_op));
+        for a in &args[1..] {
+            let v = self.lower(a);
+            arg_ops.push(format!("{} {}", llvm_ty(a.ty), v));
+        }
+        let ret_str = llvm_ty(return_ty);
+        // Void-returning functions can't be assigned. None of our return
+        // types are void, so always assign.
+        let dst = self.fresh();
+        self.emit(&format!(
+            "{} = call {} {}({})",
+            dst, ret_str, fn_typed, arg_ops.join(", ")
         ));
         dst
     }
@@ -1724,6 +1926,25 @@ impl Codegen {
                 "call void @llvm.memset.p0i8.i64(i8* {}, i8 0, i64 {}, i1 false)",
                 raw, bytes
             ));
+        }
+        // v0.37: ABC-chain classes get a vtable pointer at slot 0.
+        if class_id.needs_vtable() {
+            let vt_slot = self.fresh();
+            self.emit(&format!(
+                "{} = getelementptr {sty}, {sty}* {}, i32 0, i32 0",
+                vt_slot, self_outer,
+                sty = outer_sty
+            ));
+            // Cast the typed @vtable_<class> global pointer to i8* for storage.
+            let vt_root = class_id.vtable_root().expect("needs_vtable implies vtable_root");
+            let vt_cast = self.fresh();
+            self.emit(&format!(
+                "{} = bitcast %VTable_{root}* @vtable_{cls} to i8*",
+                vt_cast,
+                root = vt_root.name(),
+                cls = class_id.name()
+            ));
+            self.emit(&format!("store i8* {}, i8** {}", vt_cast, vt_slot));
         }
         if let Some(ic) = init_class {
             let init_llvm = llvm_ty(Type::Class(ic));
@@ -1760,16 +1981,22 @@ impl Codegen {
         self_outer
     }
 
-    /// `obj.field = value` — GEP + store.
+    /// `obj.field = value` — GEP + store. Field index shifted by 1 for
+    /// ABC-chain classes.
     fn lower_set_field(&mut self, obj: &TypedExpr, field_index: usize, value: &TypedExpr) {
         let obj_op = self.lower(obj);
         let value_op = self.lower(value);
+        let class_id = match obj.ty {
+            Type::Class(id) => id,
+            _ => panic!("internal: set_field on non-class"),
+        };
         let class_llvm = llvm_ty(obj.ty);
         let struct_ty = class_llvm.trim_end_matches('*').trim_end().to_string();
+        let slot = field_slot_index(class_id, field_index);
         let p = self.fresh();
         self.emit(&format!(
             "{} = getelementptr {sty}, {sty}* {}, i32 0, i32 {}",
-            p, obj_op, field_index,
+            p, obj_op, slot,
             sty = struct_ty
         ));
         self.emit(&format!(
@@ -2366,6 +2593,11 @@ fn walk_expr(te: &TypedExpr, out: &mut Vec<(String, Type)>, seen: &mut HashSet<S
         Expr::SetLen { set } => walk_expr(set, out, seen),
         Expr::FieldGet { obj, .. } => walk_expr(obj, out, seen),
         Expr::ClassNew { args, .. } => {
+            for a in args {
+                walk_expr(a, out, seen);
+            }
+        }
+        Expr::VirtualCall { args, .. } => {
             for a in args {
                 walk_expr(a, out, seen);
             }

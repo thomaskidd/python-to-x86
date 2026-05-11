@@ -53,6 +53,14 @@ pub struct ClassDef {
     /// yet been overridden with a concrete implementation. A class is
     /// abstract iff this list is non-empty.
     pub abstract_methods: Vec<String>,
+    /// v0.37: the topmost abstract ancestor (inclusive of self if self
+    /// is abstract). `None` if this class is not in an ABC chain.
+    /// All classes in the chain share the same vtable type, and
+    /// instances carry a vtable pointer in slot 0.
+    pub vtable_root: Option<ClassId>,
+    /// v0.37: sorted vtable method names — same set on every class in
+    /// the chain (derived from the root). Empty for non-chain classes.
+    pub vtable_slots: Vec<String>,
 }
 
 thread_local! {
@@ -124,6 +132,32 @@ impl ClassId {
     }
     pub fn is_abstract(self) -> bool {
         CLASS_ARENA.with(|a| !a.borrow()[self.0 as usize].abstract_methods.is_empty())
+    }
+    pub fn vtable_root(self) -> Option<ClassId> {
+        CLASS_ARENA.with(|a| a.borrow()[self.0 as usize].vtable_root)
+    }
+    pub fn set_vtable_root(self, root: Option<ClassId>) {
+        CLASS_ARENA.with(|a| {
+            let mut a = a.borrow_mut();
+            a[self.0 as usize].vtable_root = root;
+        })
+    }
+    pub fn vtable_slots(self) -> Vec<String> {
+        CLASS_ARENA.with(|a| a.borrow()[self.0 as usize].vtable_slots.clone())
+    }
+    pub fn set_vtable_slots(self, slots: Vec<String>) {
+        CLASS_ARENA.with(|a| {
+            let mut a = a.borrow_mut();
+            a[self.0 as usize].vtable_slots = slots;
+        })
+    }
+    pub fn needs_vtable(self) -> bool {
+        self.vtable_root().is_some()
+    }
+    /// All interned class ids in declaration order. Used by codegen to
+    /// emit vtable globals.
+    pub fn all() -> Vec<ClassId> {
+        CLASS_ARENA.with(|a| (0..a.borrow().len() as u32).map(ClassId).collect())
     }
 }
 
@@ -511,6 +545,21 @@ pub enum Expr {
     /// single inheritance the layout is prefix-compatible so codegen
     /// bitcasts the `self_ptr` to `init_class` for the call.
     ClassNew { class: ClassId, init_class: Option<ClassId>, args: Vec<TypedExpr> },
+    /// v0.37: virtual method call dispatched via the receiver's vtable.
+    /// `vtable_root` identifies the chain (and thus the LLVM vtable
+    /// type). `slot` is the index into the canonical vtable slot list.
+    /// `method_name` is the unmangled method name (used for an
+    /// `@py_<class>.<name>` symbol reference and for IR readability).
+    /// `arg_types` includes `self`'s type as the first entry; `args` is
+    /// the same length and prepends the receiver.
+    VirtualCall {
+        vtable_root: ClassId,
+        slot: usize,
+        method_name: String,
+        arg_types: Vec<Type>,
+        return_ty: Type,
+        args: Vec<TypedExpr>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
