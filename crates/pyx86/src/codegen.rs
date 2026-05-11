@@ -11,11 +11,33 @@ thread_local! {
     /// codegen. Each gets a unique global symbol `@.str.<idx>`. Cleared
     /// at the start of every emit_ll call.
     static STR_LITS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    /// v0.38: map from lifted-lambda function name to its LLVM
+    /// function-pointer type (e.g. `i64 (i8*, i64)*`). Used by
+    /// `lower_lambda_value` to construct the bitcast to i8*.
+    static LIFTED_FUNCTION_TYPES: RefCell<HashMap<String, String>> =
+        RefCell::new(HashMap::new());
 }
 
 pub fn emit_ll(prog: &Program, source_basename: &str) -> String {
     let basename = sanitize_module_id(source_basename);
     STR_LITS.with(|s| s.borrow_mut().clear());
+    // v0.38: pre-register lifted-lambda function types so
+    // `lower_lambda_value` can build the bitcast.
+    LIFTED_FUNCTION_TYPES.with(|t| {
+        let mut t = t.borrow_mut();
+        t.clear();
+        for func in &prog.functions {
+            if !func.env_fields.is_empty() || func.name.starts_with("__lambda.") {
+                // i8* env + each param.
+                let mut param_tys: Vec<String> = vec!["i8*".to_string()];
+                for p in &func.params {
+                    param_tys.push(llvm_ty(p.ty));
+                }
+                let fty = format!("{} ({})*", llvm_ty(func.return_ty), param_tys.join(", "));
+                t.insert(func.name.clone(), fty);
+            }
+        }
+    });
 
     let mut function_defs = String::new();
     for func in &prog.functions {
@@ -65,7 +87,7 @@ pub fn emit_ll(prog: &Program, source_basename: &str) -> String {
         Type::I64 => "  %fmt = getelementptr inbounds [5 x i8], [5 x i8]* @.fmt_i64, i64 0, i64 0\n  call i32 (i8*, ...) @printf(i8* %fmt, i64 %r)".to_string(),
         Type::F64 => "  call void @pyx86_print_f64(double %r)".to_string(),
         Type::Str => "  %r_len = extractvalue { i64, i8* } %r, 0\n  %r_data = extractvalue { i64, i8* } %r, 1\n  %r_len32 = trunc i64 %r_len to i32\n  %fmt_repr = getelementptr inbounds [8 x i8], [8 x i8]* @.fmt_str_repr, i64 0, i64 0\n  call i32 (i8*, ...) @printf(i8* %fmt_repr, i32 %r_len32, i8* %r_data)".to_string(),
-        Type::I8 | Type::I16 | Type::I32 | Type::Bool | Type::Tuple(_) | Type::List(_) | Type::Dict(_) | Type::Set(_) | Type::Class(_) => {
+        Type::I8 | Type::I16 | Type::I32 | Type::Bool | Type::Tuple(_) | Type::List(_) | Type::Dict(_) | Type::Set(_) | Type::Class(_) | Type::Callable(_) => {
             unreachable!("check rejects this main return type")
         }
     };
@@ -583,6 +605,8 @@ fn llvm_ty(ty: Type) -> String {
                 format!("{{ {} }}*", parts.join(", "))
             }
         }
+        // v0.38: Callable is a value-typed fat pointer { fn_ptr, env_ptr }.
+        Type::Callable(_) => "{ i8*, i8* }".to_string(),
     }
 }
 
@@ -599,6 +623,7 @@ fn type_byte_size(ty: Type) -> u64 {
         Type::Dict(_) => 8,
         Type::Set(_) => 8,
         Type::Class(_) => 8, // pointer
+        Type::Callable(_) => 16, // fat pointer
     }
 }
 
@@ -622,11 +647,21 @@ fn field_slot_index(id: crate::hir::ClassId, field_index: usize) -> usize {
 }
 
 fn format_signature(func: &Function) -> String {
-    func.params
-        .iter()
-        .map(|p| format!("{} %p_{}", llvm_ty(p.ty), p.name))
-        .collect::<Vec<_>>()
-        .join(", ")
+    let mut parts: Vec<String> = Vec::new();
+    // v0.38: lifted lambdas take an implicit `i8* %env` as their first
+    // LLVM parameter — even if they don't capture anything, so the
+    // IndirectCall signature is uniform.
+    if is_lifted_lambda(func) {
+        parts.push("i8* %env".to_string());
+    }
+    for p in &func.params {
+        parts.push(format!("{} %p_{}", llvm_ty(p.ty), p.name));
+    }
+    parts.join(", ")
+}
+
+fn is_lifted_lambda(func: &Function) -> bool {
+    !func.env_fields.is_empty() || func.name.starts_with("__lambda.")
 }
 
 fn format_argv_parsing(func: &Function) -> String {
@@ -658,7 +693,7 @@ fn format_argv_parsing(func: &Function) -> String {
                     i = i
                 );
             }
-            Type::I8 | Type::I16 | Type::I32 | Type::Bool | Type::Tuple(_) | Type::List(_) | Type::Str | Type::Dict(_) | Type::Set(_) | Type::Class(_) => {
+            Type::I8 | Type::I16 | Type::I32 | Type::Bool | Type::Tuple(_) | Type::List(_) | Type::Str | Type::Dict(_) | Type::Set(_) | Type::Class(_) | Type::Callable(_) => {
                 unreachable!("check rejects non-(I64|F64) main params")
             }
         }
@@ -675,6 +710,11 @@ struct Codegen {
     loop_targets: Vec<(String, String)>,
     /// Variable scope: name → type (set when entering function).
     locals: HashMap<String, Type>,
+    /// v0.38: env capture fields for the function currently being
+    /// lowered. Empty for ordinary functions; populated for lifted
+    /// lambdas. Used to lower `Expr::EnvVar` and to size the env
+    /// struct on access.
+    env_fields: Vec<(String, Type)>,
 }
 
 impl Codegen {
@@ -686,6 +726,7 @@ impl Codegen {
             block_terminated: false,
             loop_targets: Vec::new(),
             locals: HashMap::new(),
+            env_fields: Vec::new(),
         }
     }
 
@@ -708,6 +749,7 @@ impl Codegen {
     }
 
     fn lower_function(&mut self, func: &Function) {
+        self.env_fields = func.env_fields.clone();
         self.open_block("entry");
 
         // Seed locals scope with params + collected let-introduced names.
@@ -933,6 +975,16 @@ impl Codegen {
                 *return_ty,
                 args,
             ),
+            Expr::EnvVar(name) => self.lower_env_var(name, te.ty),
+            Expr::LambdaValue {
+                fn_name,
+                env_fields,
+                env_init,
+                callable_ty,
+            } => self.lower_lambda_value(fn_name, env_fields, env_init, *callable_ty),
+            Expr::IndirectCall { callee, args, return_ty } => {
+                self.lower_indirect_call(callee, args, *return_ty)
+            }
         }
     }
 
@@ -1829,6 +1881,166 @@ impl Codegen {
     /// Loads the vtable pointer from slot 0 of the receiver, indexes
     /// to the right method slot, bitcasts the resulting `i8*` function
     /// pointer to the expected signature, and calls indirectly.
+    /// v0.38: read a captured value from the implicit `%env` parameter.
+    /// `env_layout` (struct of all env fields, in order) is reconstructed
+    /// from the current function's `env_fields`.
+    fn lower_env_var(&mut self, name: &str, result_ty: Type) -> String {
+        let env_struct = self.env_struct_type();
+        let field_idx = self
+            .env_fields
+            .iter()
+            .position(|(n, _)| n == name)
+            .expect("internal: EnvVar without matching env_field");
+        let env_typed = self.fresh();
+        self.emit(&format!(
+            "{} = bitcast i8* %env to {est}*",
+            env_typed,
+            est = env_struct
+        ));
+        let p = self.fresh();
+        self.emit(&format!(
+            "{} = getelementptr {est}, {est}* {}, i32 0, i32 {}",
+            p, env_typed, field_idx,
+            est = env_struct
+        ));
+        let dst = self.fresh();
+        self.emit(&format!(
+            "{} = load {ft}, {ft}* {}",
+            dst, p, ft = llvm_ty(result_ty)
+        ));
+        dst
+    }
+
+    /// Synthesize the LLVM struct type literal for the current
+    /// function's env (e.g. `{ i64, i32 }`).
+    fn env_struct_type(&self) -> String {
+        if self.env_fields.is_empty() {
+            // Placeholder type — shouldn't be hit at runtime since we
+            // never read from an empty env.
+            return "{ i8 }".to_string();
+        }
+        let inner = self.env_fields
+            .iter()
+            .map(|(_, t)| llvm_ty(*t))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("{{ {} }}", inner)
+    }
+
+    /// v0.38: construct a `{ i8* fn, i8* env }` callable value at the
+    /// site of a `lambda` expression. Mallocs the env struct, stores
+    /// each capture, builds the fat-pointer value.
+    fn lower_lambda_value(
+        &mut self,
+        fn_name: &str,
+        env_fields: &[(String, Type)],
+        env_init: &[TypedExpr],
+        _callable_ty: Type,
+    ) -> String {
+        // Lower init values first.
+        let init_ops: Vec<String> =
+            env_init.iter().map(|e| self.lower(e)).collect();
+        // Allocate env. malloc(0) is undefined; use 1 byte if empty.
+        let env_size: u64 = env_fields
+            .iter()
+            .map(|(_, t)| type_byte_size(*t))
+            .sum::<u64>()
+            .max(1);
+        let env_raw = self.fresh();
+        self.emit(&format!("{} = call i8* @malloc(i64 {})", env_raw, env_size));
+        if !env_fields.is_empty() {
+            let env_struct = if env_fields.is_empty() {
+                "{ i8 }".to_string()
+            } else {
+                let inner = env_fields
+                    .iter()
+                    .map(|(_, t)| llvm_ty(*t))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("{{ {} }}", inner)
+            };
+            let env_typed = self.fresh();
+            self.emit(&format!(
+                "{} = bitcast i8* {} to {est}*",
+                env_typed, env_raw, est = env_struct
+            ));
+            for (i, ((_, ty), op)) in env_fields.iter().zip(init_ops.iter()).enumerate() {
+                let p = self.fresh();
+                self.emit(&format!(
+                    "{} = getelementptr {est}, {est}* {}, i32 0, i32 {}",
+                    p, env_typed, i, est = env_struct
+                ));
+                self.emit(&format!(
+                    "store {ft} {}, {ft}* {}",
+                    op, p, ft = llvm_ty(*ty)
+                ));
+            }
+        }
+        // Build the function-pointer cast to i8*.
+        let lambda_fn = LIFTED_FUNCTION_TYPES
+            .with(|t| t.borrow().get(fn_name).cloned())
+            .expect("internal: lambda fn type not registered");
+        let fn_cast = self.fresh();
+        self.emit(&format!(
+            "{} = bitcast {} @py_{} to i8*",
+            fn_cast, lambda_fn, fn_name
+        ));
+        // Build the {i8*, i8*} value.
+        let s0 = self.fresh();
+        self.emit(&format!(
+            "{} = insertvalue {{ i8*, i8* }} undef, i8* {}, 0",
+            s0, fn_cast
+        ));
+        let s1 = self.fresh();
+        self.emit(&format!(
+            "{} = insertvalue {{ i8*, i8* }} {}, i8* {}, 1",
+            s1, s0, env_raw
+        ));
+        s1
+    }
+
+    /// v0.38: indirect call through a `Callable` value.
+    fn lower_indirect_call(
+        &mut self,
+        callee: &TypedExpr,
+        args: &[TypedExpr],
+        return_ty: Type,
+    ) -> String {
+        let callable_op = self.lower(callee);
+        let fn_raw = self.fresh();
+        self.emit(&format!(
+            "{} = extractvalue {{ i8*, i8* }} {}, 0",
+            fn_raw, callable_op
+        ));
+        let env_raw = self.fresh();
+        self.emit(&format!(
+            "{} = extractvalue {{ i8*, i8* }} {}, 1",
+            env_raw, callable_op
+        ));
+        // Bitcast fn_raw to the actual function pointer type.
+        let arg_param_tys: Vec<String> = std::iter::once("i8*".to_string())
+            .chain(args.iter().map(|a| llvm_ty(a.ty)))
+            .collect();
+        let fn_ty_str = format!("{} ({})*", llvm_ty(return_ty), arg_param_tys.join(", "));
+        let fn_typed = self.fresh();
+        self.emit(&format!(
+            "{} = bitcast i8* {} to {}",
+            fn_typed, fn_raw, fn_ty_str
+        ));
+        // Build the call arg list with env first.
+        let mut call_args: Vec<String> = vec![format!("i8* {}", env_raw)];
+        for a in args {
+            let v = self.lower(a);
+            call_args.push(format!("{} {}", llvm_ty(a.ty), v));
+        }
+        let dst = self.fresh();
+        self.emit(&format!(
+            "{} = call {} {}({})",
+            dst, llvm_ty(return_ty), fn_typed, call_args.join(", ")
+        ));
+        dst
+    }
+
     fn lower_virtual_call(
         &mut self,
         vtable_root: crate::hir::ClassId,
@@ -2598,6 +2810,18 @@ fn walk_expr(te: &TypedExpr, out: &mut Vec<(String, Type)>, seen: &mut HashSet<S
             }
         }
         Expr::VirtualCall { args, .. } => {
+            for a in args {
+                walk_expr(a, out, seen);
+            }
+        }
+        Expr::EnvVar(_) => {}
+        Expr::LambdaValue { env_init, .. } => {
+            for v in env_init {
+                walk_expr(v, out, seen);
+            }
+        }
+        Expr::IndirectCall { callee, args, .. } => {
+            walk_expr(callee, out, seen);
             for a in args {
                 walk_expr(a, out, seen);
             }
