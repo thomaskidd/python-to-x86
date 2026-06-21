@@ -1073,7 +1073,7 @@ fn lower_block(
                             rhs: Box::new(stop),
                         },
                     );
-                    let mut while_body = body_inner;
+                    let while_body = body_inner;
                     let incr = TypedExpr::new(
                         Type::I64,
                         Expr::BinOp {
@@ -1085,8 +1085,9 @@ fn lower_block(
                             rhs: Box::new(step),
                         },
                     );
-                    while_body.push(Stmt::Let { name: loop_var.clone(), value: incr });
-                    out.push(Stmt::While { cond, body: while_body });
+                    // Increment in the latch so `continue` advances the loop.
+                    let update = vec![Stmt::Let { name: loop_var.clone(), value: incr }];
+                    out.push(Stmt::While { cond, body: while_body, update });
                 } else {
                     // for-over-list: lower the iter, expect List type, desugar to
                     //   __lst = <iter>
@@ -1149,7 +1150,8 @@ fn lower_block(
                         ),
                     });
                     while_body.extend(body_inner);
-                    while_body.push(Stmt::Let {
+                    // Index bump in the latch so `continue` advances the loop.
+                    let update = vec![Stmt::Let {
                         name: idx_name.clone(),
                         value: TypedExpr::new(
                             Type::I64,
@@ -1159,8 +1161,8 @@ fn lower_block(
                                 rhs: Box::new(TypedExpr::new(Type::I64, Expr::ConstI64(1))),
                             },
                         ),
-                    });
-                    out.push(Stmt::While { cond, body: while_body });
+                    }];
+                    out.push(Stmt::While { cond, body: while_body, update });
                 }
             }
             ast::Stmt::While(w) => {
@@ -1172,7 +1174,7 @@ fn lower_block(
                 let cond = lower_expr(&w.test, scope, signatures)?;
                 let cond = coerce(cond, Type::Bool)?;
                 let body = lower_block(&w.body, scope, loop_depth + 1, signatures, return_ty)?;
-                out.push(Stmt::While { cond, body });
+                out.push(Stmt::While { cond, body, update: Vec::new() });
             }
             ast::Stmt::Break(_) => {
                 if loop_depth == 0 {
@@ -4071,8 +4073,9 @@ fn build_comp_loop(
                     rhs: Box::new(stop),
                 },
             );
-            let mut wbody = vec![body_stmt];
-            wbody.push(Stmt::Let {
+            let wbody = vec![body_stmt];
+            // Increment in the latch so a fused `continue` advances the loop.
+            let update = vec![Stmt::Let {
                 name: target_name.to_string(),
                 value: TypedExpr::new(
                     Type::I64,
@@ -4082,8 +4085,8 @@ fn build_comp_loop(
                         rhs: Box::new(step),
                     },
                 ),
-            });
-            stmts.push(Stmt::While { cond, body: wbody });
+            }];
+            stmts.push(Stmt::While { cond, body: wbody, update });
         }
         CompIter::List { iter } => {
             // for target in <list>:
@@ -4118,7 +4121,8 @@ fn build_comp_loop(
                 ),
             }];
             wbody.push(body_stmt);
-            wbody.push(Stmt::Let {
+            // Index bump in the latch so a fused `continue` advances the loop.
+            let update = vec![Stmt::Let {
                 name: idx_name.clone(),
                 value: TypedExpr::new(
                     Type::I64,
@@ -4128,8 +4132,8 @@ fn build_comp_loop(
                         rhs: Box::new(TypedExpr::new(Type::I64, Expr::ConstI64(1))),
                     },
                 ),
-            });
-            stmts.push(Stmt::While { cond, body: wbody });
+            }];
+            stmts.push(Stmt::While { cond, body: wbody, update });
         }
     }
     stmts
