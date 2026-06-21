@@ -483,7 +483,12 @@ pub enum Stmt {
         then_body: Vec<Stmt>,
         else_body: Vec<Stmt>,
     },
-    While { cond: TypedExpr, body: Vec<Stmt> },
+    /// `body` runs each iteration; `update` runs after `body` (the loop
+    /// latch) before re-testing `cond`. `continue` jumps to the latch, so
+    /// `update` always runs — this is where for-loop increments live so
+    /// that `continue` advances the loop correctly. Plain `while` loops
+    /// have an empty `update`.
+    While { cond: TypedExpr, body: Vec<Stmt>, update: Vec<Stmt> },
     Break,
     Continue,
     /// `<list>.append(<value>)`. List must be a Var (so codegen knows

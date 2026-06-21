@@ -839,12 +839,13 @@ impl Codegen {
                     }
                     self.open_block(&merge_lbl);
                 }
-                Stmt::While { cond, body } => {
+                Stmt::While { cond, body, update } => {
                     debug_assert_eq!(cond.ty, Type::Bool);
                     let id = self.next_block_id;
                     self.next_block_id += 1;
                     let header_lbl = format!("loop_header.{}", id);
                     let body_lbl = format!("loop_body.{}", id);
+                    let latch_lbl = format!("loop_latch.{}", id);
                     let exit_lbl = format!("loop_exit.{}", id);
                     self.emit(&format!("br label %{}", header_lbl));
                     self.block_terminated = true;
@@ -856,10 +857,18 @@ impl Codegen {
                     ));
                     self.block_terminated = true;
                     self.open_block(&body_lbl);
+                    // `continue` targets the latch so the loop `update`
+                    // (e.g. the for-loop increment) always runs.
                     self.loop_targets
-                        .push((header_lbl.clone(), exit_lbl.clone()));
+                        .push((latch_lbl.clone(), exit_lbl.clone()));
                     self.lower_block(body);
                     self.loop_targets.pop();
+                    if !self.block_terminated {
+                        self.emit(&format!("br label %{}", latch_lbl));
+                        self.block_terminated = true;
+                    }
+                    self.open_block(&latch_lbl);
+                    self.lower_block(update);
                     if !self.block_terminated {
                         self.emit(&format!("br label %{}", header_lbl));
                         self.block_terminated = true;
@@ -2821,9 +2830,10 @@ fn walk_stmts(stmts: &[Stmt], out: &mut Vec<(String, Type)>, seen: &mut HashSet<
                 walk_stmts(then_body, out, seen);
                 walk_stmts(else_body, out, seen);
             }
-            Stmt::While { cond, body } => {
+            Stmt::While { cond, body, update } => {
                 walk_expr(cond, out, seen);
                 walk_stmts(body, out, seen);
+                walk_stmts(update, out, seen);
             }
         }
     }
