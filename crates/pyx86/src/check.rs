@@ -3740,6 +3740,45 @@ fn lower_builtin_call(
                 }
             }
         }
+        "any" | "all" => {
+            // any(<genexp>) / all(<genexp>) / any(<iterable>) / all(<iterable>).
+            if args.len() != 1 {
+                bail!("unsupported_feature: {}() takes exactly 1 argument", name);
+            }
+            let is_all = name == "all";
+            let uniq = scope.len();
+            match &args[0] {
+                ast::Expr::GeneratorExp(comp) => {
+                    if comp.generators.len() != 1 {
+                        bail!(
+                            "unsupported_feature: nested generators in {}() are not supported",
+                            name
+                        );
+                    }
+                    let gen = &comp.generators[0];
+                    let (target_name, target_ty, iter, inner_scope) =
+                        lower_comp_generator(gen, scope, signatures)?;
+                    let pred =
+                        coerce(lower_expr(&comp.elt, &inner_scope, signatures)?, Type::Bool)?;
+                    let filter = lower_comp_filter(&gen.ifs, &inner_scope, signatures)?;
+                    Ok(Some(build_any_all_reduction(
+                        is_all, &target_name, target_ty, iter, pred, filter, uniq,
+                    )))
+                }
+                other => {
+                    // Plain iterable: test the truthiness of each element.
+                    let (elem_ty, iter) = lower_iterable(other, scope, signatures)?;
+                    let target_name = format!("__bool_x_{}", uniq);
+                    let pred = coerce(
+                        TypedExpr::new(elem_ty, Expr::Var(target_name.clone())),
+                        Type::Bool,
+                    )?;
+                    Ok(Some(build_any_all_reduction(
+                        is_all, &target_name, elem_ty, iter, pred, None, uniq,
+                    )))
+                }
+            }
+        }
         _ => Ok(None),
     }
 }
@@ -3918,6 +3957,56 @@ fn build_sum_reduction(
         Expr::DoBlock {
             stmts,
             result: Box::new(TypedExpr::new(acc_ty, Expr::Var(acc_name))),
+        },
+    )
+}
+
+/// Build an `any(...)`/`all(...)` reduction as a short-circuiting
+/// `DoBlock`. `pred` is the per-element `Bool` predicate (the genexp's
+/// element, or the iterable element's truthiness). `is_all` selects `all`
+/// (init `True`, break to `False` on the first failing element) versus
+/// `any` (init `False`, break to `True` on the first satisfying element).
+fn build_any_all_reduction(
+    is_all: bool,
+    target_name: &str,
+    target_ty: Type,
+    iter: CompIter,
+    pred: TypedExpr,
+    filter: Option<TypedExpr>,
+    uniq: usize,
+) -> TypedExpr {
+    let acc_name = format!("__bool_acc_{}", uniq);
+    let set_acc = |v: bool| Stmt::Let {
+        name: acc_name.clone(),
+        value: TypedExpr::new(Type::Bool, Expr::ConstBool(v)),
+    };
+    let inner = if is_all {
+        // if pred: pass  else: acc = False; break
+        Stmt::If {
+            cond: pred,
+            then_body: vec![],
+            else_body: vec![set_acc(false), Stmt::Break],
+        }
+    } else {
+        // if pred: acc = True; break
+        Stmt::If {
+            cond: pred,
+            then_body: vec![set_acc(true), Stmt::Break],
+            else_body: vec![],
+        }
+    };
+    let body_stmt = wrap_filter(filter, inner);
+    // all → init True; any → init False.
+    let mut stmts = vec![Stmt::Let {
+        name: acc_name.clone(),
+        value: TypedExpr::new(Type::Bool, Expr::ConstBool(is_all)),
+    }];
+    stmts.extend(build_comp_loop(target_name, target_ty, iter, body_stmt, uniq));
+    TypedExpr::new(
+        Type::Bool,
+        Expr::DoBlock {
+            stmts,
+            result: Box::new(TypedExpr::new(Type::Bool, Expr::Var(acc_name))),
         },
     )
 }
