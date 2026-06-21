@@ -1025,6 +1025,56 @@ fn lower_block(
                 if !f.orelse.is_empty() {
                     bail!("unsupported_feature: `else` clause on `for` is not supported");
                 }
+
+                // Fused generator expression:
+                //   for x in (<elt> for y in <it> if <c>): <body>
+                // desugars to
+                //   for y in <it>: if <c>: { x = <elt>; <body> }
+                // reusing the comprehension loop scaffold, so `break` /
+                // `continue` in <body> act on the single fused loop.
+                if let ast::Expr::GeneratorExp(comp) = f.iter.as_ref() {
+                    let x_name = match f.target.as_ref() {
+                        ast::Expr::Name(n) => n.id.as_str().to_string(),
+                        _ => bail!(
+                            "unsupported_feature: for-loop target must be a simple name (no tuple unpacking yet)"
+                        ),
+                    };
+                    if comp.generators.len() != 1 {
+                        bail!(
+                            "unsupported_feature: nested generators in a fused for-loop are not supported"
+                        );
+                    }
+                    let gen = &comp.generators[0];
+                    let uniq = scope.len();
+                    let (y_name, y_ty, comp_iter, mut body_scope) =
+                        lower_comp_generator(gen, scope, signatures)?;
+                    let elt = lower_expr(&comp.elt, &body_scope, signatures)?;
+                    let x_ty = elt.ty;
+                    let filter = lower_comp_filter(&gen.ifs, &body_scope, signatures)?;
+                    body_scope.insert(x_name.clone(), x_ty);
+                    let body_inner = lower_block(
+                        &f.body,
+                        &mut body_scope,
+                        loop_depth + 1,
+                        signatures,
+                        return_ty,
+                    )?;
+                    // Per iteration: bind x = <elt>, then run the user body.
+                    let mut per_iter =
+                        vec![Stmt::Let { name: x_name.clone(), value: elt }];
+                    per_iter.extend(body_inner);
+                    let fused: Vec<Stmt> = match filter {
+                        Some(cond) => vec![Stmt::If {
+                            cond,
+                            then_body: per_iter,
+                            else_body: Vec::new(),
+                        }],
+                        None => per_iter,
+                    };
+                    out.extend(build_comp_loop(&y_name, y_ty, comp_iter, fused, uniq));
+                    continue;
+                }
+
                 let loop_var = match f.target.as_ref() {
                     ast::Expr::Name(n) => n.id.as_str().to_string(),
                     _ => bail!(
@@ -2131,7 +2181,7 @@ fn lower_expr(e: &ast::Expr, scope: &Scope, signatures: &SignatureTable) -> Resu
                 name: acc_name.clone(),
                 value: TypedExpr::new(acc_ty, Expr::ListLit { elements: Vec::new() }),
             }];
-            stmts.extend(build_comp_loop(&target_name, target_ty, iter, body_stmt, uniq));
+            stmts.extend(build_comp_loop(&target_name, target_ty, iter, vec![body_stmt], uniq));
             return Ok(TypedExpr::new(
                 acc_ty,
                 Expr::DoBlock {
@@ -2175,7 +2225,7 @@ fn lower_expr(e: &ast::Expr, scope: &Scope, signatures: &SignatureTable) -> Resu
                 name: acc_name.clone(),
                 value: TypedExpr::new(acc_ty, Expr::DictLit { entries: Vec::new() }),
             }];
-            stmts.extend(build_comp_loop(&target_name, target_ty, iter, body_stmt, uniq));
+            stmts.extend(build_comp_loop(&target_name, target_ty, iter, vec![body_stmt], uniq));
             return Ok(TypedExpr::new(
                 acc_ty,
                 Expr::DoBlock {
@@ -2216,7 +2266,7 @@ fn lower_expr(e: &ast::Expr, scope: &Scope, signatures: &SignatureTable) -> Resu
                 name: acc_name.clone(),
                 value: TypedExpr::new(acc_ty, Expr::SetLit { elements: Vec::new() }),
             }];
-            stmts.extend(build_comp_loop(&target_name, target_ty, iter, body_stmt, uniq));
+            stmts.extend(build_comp_loop(&target_name, target_ty, iter, vec![body_stmt], uniq));
             return Ok(TypedExpr::new(
                 acc_ty,
                 Expr::DoBlock {
@@ -3953,7 +4003,7 @@ fn build_sum_reduction(
         TypedExpr::new(acc_ty, Expr::ConstI64(0))
     };
     let mut stmts = vec![Stmt::Let { name: acc_name.clone(), value: zero }];
-    stmts.extend(build_comp_loop(target_name, target_ty, iter, body_stmt, uniq));
+    stmts.extend(build_comp_loop(target_name, target_ty, iter, vec![body_stmt], uniq));
     TypedExpr::new(
         acc_ty,
         Expr::DoBlock {
@@ -4003,7 +4053,7 @@ fn build_any_all_reduction(
         name: acc_name.clone(),
         value: TypedExpr::new(Type::Bool, Expr::ConstBool(is_all)),
     }];
-    stmts.extend(build_comp_loop(target_name, target_ty, iter, body_stmt, uniq));
+    stmts.extend(build_comp_loop(target_name, target_ty, iter, vec![body_stmt], uniq));
     TypedExpr::new(
         Type::Bool,
         Expr::DoBlock {
@@ -4048,16 +4098,18 @@ fn wrap_filter(filter: Option<TypedExpr>, body: Stmt) -> Stmt {
     }
 }
 
-/// Build the `while`-loop desugar for a comprehension: a range counter or
-/// a list index walk binding `target_name` each iteration and running
-/// `body_stmt`. `uniq` disambiguates helper-var names. Returns the loop
-/// statements (caller prepends the accumulator init and wraps in a
-/// `DoBlock`). Shared by list/dict/set comprehensions.
+/// Build the `while`-loop desugar for a comprehension or fused for-loop:
+/// a range counter or a list index walk binding `target_name` each
+/// iteration and running `body`. `uniq` disambiguates helper-var names.
+/// The loop advance lives in the `while` latch (`update`) so a `continue`
+/// inside `body` advances correctly. Returns the loop statements (caller
+/// prepends any accumulator init). Shared by comprehensions, `sum`/`any`/
+/// `all` reductions, and genexp-fused for-loops.
 fn build_comp_loop(
     target_name: &str,
     target_ty: Type,
     iter: CompIter,
-    body_stmt: Stmt,
+    body: Vec<Stmt>,
     uniq: usize,
 ) -> Vec<Stmt> {
     let mut stmts: Vec<Stmt> = Vec::new();
@@ -4073,7 +4125,7 @@ fn build_comp_loop(
                     rhs: Box::new(stop),
                 },
             );
-            let wbody = vec![body_stmt];
+            let wbody = body;
             // Increment in the latch so a fused `continue` advances the loop.
             let update = vec![Stmt::Let {
                 name: target_name.to_string(),
@@ -4120,7 +4172,7 @@ fn build_comp_loop(
                     },
                 ),
             }];
-            wbody.push(body_stmt);
+            wbody.extend(body);
             // Index bump in the latch so a fused `continue` advances the loop.
             let update = vec![Stmt::Let {
                 name: idx_name.clone(),
