@@ -2091,108 +2091,27 @@ fn lower_expr(e: &ast::Expr, scope: &Scope, signatures: &SignatureTable) -> Resu
         }
         ast::Expr::ListComp(comp) => {
             // [<elt> for <target> in <iter> (if <cond>)*]
-            // Only one generator supported in v0.21.
+            // Only one generator supported (v0.21).
             if comp.generators.len() != 1 {
                 bail!(
-                    "unsupported_feature: nested generators in list comprehensions are not supported"
+                    "unsupported_feature: nested generators in comprehensions are not supported"
                 );
             }
             let gen = &comp.generators[0];
-            if gen.is_async {
-                bail!("unsupported_feature: async comprehensions are not supported");
-            }
-            let target_name = match &gen.target {
-                ast::Expr::Name(n) => n.id.as_str().to_string(),
-                _ => bail!(
-                    "unsupported_feature: comprehension target must be a simple name"
-                ),
-            };
-
-            // Determine target's type from the iter.
-            let is_range_call = matches!(
-                &gen.iter,
-                ast::Expr::Call(c) if matches!(c.func.as_ref(), ast::Expr::Name(n) if n.id.as_str() == "range")
-            );
-
-            // Build a fresh inner scope so loop var + accumulator don't leak.
-            let mut inner_scope = scope.clone();
-
-            // Synthesise unique names for accumulator and (if iterating
-            // over a list) helper vars. Use the global scope size as a
-            // unique suffix.
             let uniq = scope.len();
             let acc_name = format!("__compr_acc_{}", uniq);
-            let lst_name = format!("__compr_lst_{}", uniq);
-            let idx_name = format!("__compr_idx_{}", uniq);
-
-            // Lower the iter and figure out the element type.
-            let elem_ty: Type;
-            let iter_lowered: Option<TypedExpr>;
-            let start_stop_step: Option<(TypedExpr, TypedExpr, TypedExpr)>;
-            if is_range_call {
-                let (start, stop, step) =
-                    parse_and_lower_range(&gen.iter, &inner_scope, signatures)?;
-                let step_value = match &step.expr {
-                    Expr::ConstI64(v) => *v,
-                    _ => bail!("unsupported_feature: range step must be a constant int literal"),
-                };
-                if step_value <= 0 {
-                    bail!("unsupported_feature: range step must be a positive int literal");
-                }
-                elem_ty = Type::I64;
-                iter_lowered = None;
-                start_stop_step = Some((start, stop, step));
-                inner_scope.insert(target_name.clone(), Type::I64);
-            } else {
-                let iter = lower_expr(&gen.iter, &inner_scope, signatures)?;
-                let elem = match iter.ty {
-                    Type::List(id) => id.elem(),
-                    other => bail!(
-                        "unsupported_feature: comprehension iter must be range(...) or list[T] (got {})",
-                        other.name()
-                    ),
-                };
-                elem_ty = elem;
-                iter_lowered = Some(iter);
-                start_stop_step = None;
-                inner_scope.insert(target_name.clone(), elem);
-            }
+            let (target_name, target_ty, iter, inner_scope) =
+                lower_comp_generator(gen, scope, signatures)?;
 
             // Lower the elt expression in the inner scope.
             let elt_lowered = lower_expr(&comp.elt, &inner_scope, signatures)?;
             let result_elem_ty = elt_lowered.ty;
-            let acc_list_id = ListId::intern(result_elem_ty);
-            let acc_ty = Type::List(acc_list_id);
+            let acc_ty = Type::List(ListId::intern(result_elem_ty));
+            let filter = lower_comp_filter(&gen.ifs, &inner_scope, signatures)?;
 
-            // Lower any `if` clauses (Python supports multiple, AND-ed).
-            // Combine into a single Bool expression with ad-hoc And.
-            let mut filter_cond: Option<TypedExpr> = None;
-            for if_e in &gen.ifs {
-                let c = lower_expr(if_e, &inner_scope, signatures)?;
-                let c = coerce(c, Type::Bool)?;
-                filter_cond = Some(match filter_cond {
-                    None => c,
-                    Some(prev) => TypedExpr::new(
-                        Type::Bool,
-                        Expr::BoolOp {
-                            op: BoolOp::And,
-                            lhs: Box::new(coerce(prev, Type::I64)?),
-                            rhs: Box::new(coerce(c, Type::I64)?),
-                        },
-                    ),
-                });
-            }
-            // Renormalise filter_cond back to Bool for the If statement.
-            let filter_cond_bool = filter_cond.map(|c| coerce(c, Type::Bool).unwrap());
-
-            // Build the body of the loop:
-            //   one_elem = [elt]
-            //   if cond: acc = acc + one_elem
-            //   else: skip
-            let one_elem_list = TypedExpr::new(
-                acc_ty,
-                Expr::ListLit { elements: vec![elt_lowered] },
-            );
+            // Per-element body: acc = acc + [elt]
+            let one_elem_list =
+                TypedExpr::new(acc_ty, Expr::ListLit { elements: vec![elt_lowered] });
             let append = Stmt::Let {
                 name: acc_name.clone(),
                 value: TypedExpr::new(
@@ -2203,96 +2122,58 @@ fn lower_expr(e: &ast::Expr, scope: &Scope, signatures: &SignatureTable) -> Resu
                     },
                 ),
             };
-            let body_stmt = match filter_cond_bool {
-                Some(cond) => Stmt::If {
-                    cond,
-                    then_body: vec![append],
-                    else_body: vec![],
-                },
-                None => append,
-            };
+            let body_stmt = wrap_filter(filter, append);
 
-            // Build the surrounding `for` desugar.
-            let mut stmts: Vec<Stmt> = Vec::new();
-            // acc = []
-            stmts.push(Stmt::Let {
+            // acc = []  ; <loop>  ; acc
+            let mut stmts = vec![Stmt::Let {
                 name: acc_name.clone(),
-                value: TypedExpr::new(
-                    acc_ty,
-                    Expr::ListLit { elements: Vec::new() },
-                ),
-            });
-
-            if let Some((start, stop, step)) = start_stop_step {
-                // for target in range(...):
-                stmts.push(Stmt::Let { name: target_name.clone(), value: start });
-                let cond = TypedExpr::new(
-                    Type::Bool,
-                    Expr::Cmp {
-                        op: CmpOp::Lt,
-                        lhs: Box::new(TypedExpr::new(Type::I64, Expr::Var(target_name.clone()))),
-                        rhs: Box::new(stop),
-                    },
+                value: TypedExpr::new(acc_ty, Expr::ListLit { elements: Vec::new() }),
+            }];
+            stmts.extend(build_comp_loop(&target_name, target_ty, iter, body_stmt, uniq));
+            return Ok(TypedExpr::new(
+                acc_ty,
+                Expr::DoBlock {
+                    stmts,
+                    result: Box::new(TypedExpr::new(acc_ty, Expr::Var(acc_name))),
+                },
+            ));
+        }
+        ast::Expr::DictComp(comp) => {
+            // {<key>: <value> for <target> in <iter> (if <cond>)*}
+            if comp.generators.len() != 1 {
+                bail!(
+                    "unsupported_feature: nested generators in comprehensions are not supported"
                 );
-                let mut wbody = vec![body_stmt];
-                wbody.push(Stmt::Let {
-                    name: target_name.clone(),
-                    value: TypedExpr::new(
-                        Type::I64,
-                        Expr::BinOp {
-                            op: BinOp::Add,
-                            lhs: Box::new(TypedExpr::new(Type::I64, Expr::Var(target_name.clone()))),
-                            rhs: Box::new(step),
-                        },
-                    ),
-                });
-                stmts.push(Stmt::While { cond, body: wbody });
-            } else {
-                // for target in <list>:
-                let iter = iter_lowered.unwrap();
-                let iter_ty = iter.ty;
-                stmts.push(Stmt::Let { name: lst_name.clone(), value: iter });
-                stmts.push(Stmt::Let {
-                    name: idx_name.clone(),
-                    value: TypedExpr::new(Type::I64, Expr::ConstI64(0)),
-                });
-                let lst_ref = TypedExpr::new(iter_ty, Expr::Var(lst_name.clone()));
-                let cond = TypedExpr::new(
-                    Type::Bool,
-                    Expr::Cmp {
-                        op: CmpOp::Lt,
-                        lhs: Box::new(TypedExpr::new(Type::I64, Expr::Var(idx_name.clone()))),
-                        rhs: Box::new(TypedExpr::new(
-                            Type::I64,
-                            Expr::ListLen { list: Box::new(lst_ref.clone()) },
-                        )),
-                    },
-                );
-                let mut wbody = vec![Stmt::Let {
-                    name: target_name.clone(),
-                    value: TypedExpr::new(
-                        elem_ty,
-                        Expr::ListIndex {
-                            list: Box::new(lst_ref),
-                            index: Box::new(TypedExpr::new(Type::I64, Expr::Var(idx_name.clone()))),
-                        },
-                    ),
-                }];
-                wbody.push(body_stmt);
-                wbody.push(Stmt::Let {
-                    name: idx_name.clone(),
-                    value: TypedExpr::new(
-                        Type::I64,
-                        Expr::BinOp {
-                            op: BinOp::Add,
-                            lhs: Box::new(TypedExpr::new(Type::I64, Expr::Var(idx_name))),
-                            rhs: Box::new(TypedExpr::new(Type::I64, Expr::ConstI64(1))),
-                        },
-                    ),
-                });
-                stmts.push(Stmt::While { cond, body: wbody });
             }
+            let gen = &comp.generators[0];
+            let uniq = scope.len();
+            let acc_name = format!("__compr_acc_{}", uniq);
+            let (target_name, target_ty, iter, inner_scope) =
+                lower_comp_generator(gen, scope, signatures)?;
 
+            // Keys/values are i64 only, matching dict literals (v0.26):
+            // the runtime is `pyx86_dict_i64_insert`.
+            let key_lowered =
+                coerce(lower_expr(&comp.key, &inner_scope, signatures)?, Type::I64)?;
+            let val_lowered =
+                coerce(lower_expr(&comp.value, &inner_scope, signatures)?, Type::I64)?;
+            let acc_ty = Type::Dict(DictId::intern(Type::I64, Type::I64));
+            let filter = lower_comp_filter(&gen.ifs, &inner_scope, signatures)?;
+
+            // Per-element body: acc[key] = value
+            let insert = Stmt::SetSubscript {
+                container: TypedExpr::new(acc_ty, Expr::Var(acc_name.clone())),
+                key: key_lowered,
+                value: val_lowered,
+            };
+            let body_stmt = wrap_filter(filter, insert);
+
+            // acc = {}  ; <loop>  ; acc
+            let mut stmts = vec![Stmt::Let {
+                name: acc_name.clone(),
+                value: TypedExpr::new(acc_ty, Expr::DictLit { entries: Vec::new() }),
+            }];
+            stmts.extend(build_comp_loop(&target_name, target_ty, iter, body_stmt, uniq));
             return Ok(TypedExpr::new(
                 acc_ty,
                 Expr::DoBlock {
@@ -3852,6 +3733,189 @@ fn resolve_call_args(
 
 /// Parse and lower a `range(...)` call as the iterable of a for-loop.
 /// Returns (start, stop, step) all as I64 TypedExprs. Defaults: start=0, step=1.
+/// The lowered iteration form of a single comprehension generator.
+/// `Range` carries the lowered `start`/`stop`/`step`; `List` carries the
+/// lowered iterable (a `list[T]`).
+enum CompIter {
+    Range { start: TypedExpr, stop: TypedExpr, step: TypedExpr },
+    List { iter: TypedExpr },
+}
+
+/// Lower and validate a single comprehension `for <target> in <iter>`
+/// generator. Rejects nested/async generators and non-name targets.
+/// Returns the target name, the target's element type, the lowered
+/// iteration form, and an inner scope with the target bound. The caller
+/// lowers the element/key/value expressions and `if` clauses against the
+/// returned scope. Shared by list/dict/set comprehensions.
+fn lower_comp_generator(
+    gen: &ast::Comprehension,
+    scope: &Scope,
+    signatures: &SignatureTable,
+) -> Result<(String, Type, CompIter, Scope)> {
+    if gen.is_async {
+        bail!("unsupported_feature: async comprehensions are not supported");
+    }
+    let target_name = match &gen.target {
+        ast::Expr::Name(n) => n.id.as_str().to_string(),
+        _ => bail!("unsupported_feature: comprehension target must be a simple name"),
+    };
+
+    // Fresh inner scope so the loop var doesn't leak into the surrounding scope.
+    let mut inner_scope = scope.clone();
+
+    let is_range_call = matches!(
+        &gen.iter,
+        ast::Expr::Call(c) if matches!(c.func.as_ref(), ast::Expr::Name(n) if n.id.as_str() == "range")
+    );
+    if is_range_call {
+        let (start, stop, step) = parse_and_lower_range(&gen.iter, &inner_scope, signatures)?;
+        let step_value = match &step.expr {
+            Expr::ConstI64(v) => *v,
+            _ => bail!("unsupported_feature: range step must be a constant int literal"),
+        };
+        if step_value <= 0 {
+            bail!("unsupported_feature: range step must be a positive int literal");
+        }
+        inner_scope.insert(target_name.clone(), Type::I64);
+        Ok((target_name, Type::I64, CompIter::Range { start, stop, step }, inner_scope))
+    } else {
+        let iter = lower_expr(&gen.iter, &inner_scope, signatures)?;
+        let elem = match iter.ty {
+            Type::List(id) => id.elem(),
+            other => bail!(
+                "unsupported_feature: comprehension iter must be range(...) or list[T] (got {})",
+                other.name()
+            ),
+        };
+        inner_scope.insert(target_name.clone(), elem);
+        Ok((target_name, elem, CompIter::List { iter }, inner_scope))
+    }
+}
+
+/// Lower and AND-combine a comprehension's `if` clauses (Python allows
+/// several) into a single optional `Bool` condition.
+fn lower_comp_filter(
+    ifs: &[ast::Expr],
+    scope: &Scope,
+    signatures: &SignatureTable,
+) -> Result<Option<TypedExpr>> {
+    let mut filter_cond: Option<TypedExpr> = None;
+    for if_e in ifs {
+        let c = coerce(lower_expr(if_e, scope, signatures)?, Type::Bool)?;
+        filter_cond = Some(match filter_cond {
+            None => c,
+            Some(prev) => TypedExpr::new(
+                Type::Bool,
+                Expr::BoolOp {
+                    op: BoolOp::And,
+                    lhs: Box::new(coerce(prev, Type::I64)?),
+                    rhs: Box::new(coerce(c, Type::I64)?),
+                },
+            ),
+        });
+    }
+    // Renormalise back to Bool for use as an `if` condition.
+    Ok(filter_cond.map(|c| coerce(c, Type::Bool).unwrap()))
+}
+
+/// Wrap a per-element comprehension `body` in an `if <filter>:` when a
+/// filter condition is present; otherwise return `body` unchanged.
+fn wrap_filter(filter: Option<TypedExpr>, body: Stmt) -> Stmt {
+    match filter {
+        Some(cond) => Stmt::If { cond, then_body: vec![body], else_body: vec![] },
+        None => body,
+    }
+}
+
+/// Build the `while`-loop desugar for a comprehension: a range counter or
+/// a list index walk binding `target_name` each iteration and running
+/// `body_stmt`. `uniq` disambiguates helper-var names. Returns the loop
+/// statements (caller prepends the accumulator init and wraps in a
+/// `DoBlock`). Shared by list/dict/set comprehensions.
+fn build_comp_loop(
+    target_name: &str,
+    target_ty: Type,
+    iter: CompIter,
+    body_stmt: Stmt,
+    uniq: usize,
+) -> Vec<Stmt> {
+    let mut stmts: Vec<Stmt> = Vec::new();
+    match iter {
+        CompIter::Range { start, stop, step } => {
+            // for target in range(...):
+            stmts.push(Stmt::Let { name: target_name.to_string(), value: start });
+            let cond = TypedExpr::new(
+                Type::Bool,
+                Expr::Cmp {
+                    op: CmpOp::Lt,
+                    lhs: Box::new(TypedExpr::new(Type::I64, Expr::Var(target_name.to_string()))),
+                    rhs: Box::new(stop),
+                },
+            );
+            let mut wbody = vec![body_stmt];
+            wbody.push(Stmt::Let {
+                name: target_name.to_string(),
+                value: TypedExpr::new(
+                    Type::I64,
+                    Expr::BinOp {
+                        op: BinOp::Add,
+                        lhs: Box::new(TypedExpr::new(Type::I64, Expr::Var(target_name.to_string()))),
+                        rhs: Box::new(step),
+                    },
+                ),
+            });
+            stmts.push(Stmt::While { cond, body: wbody });
+        }
+        CompIter::List { iter } => {
+            // for target in <list>:
+            let lst_name = format!("__compr_lst_{}", uniq);
+            let idx_name = format!("__compr_idx_{}", uniq);
+            let iter_ty = iter.ty;
+            stmts.push(Stmt::Let { name: lst_name.clone(), value: iter });
+            stmts.push(Stmt::Let {
+                name: idx_name.clone(),
+                value: TypedExpr::new(Type::I64, Expr::ConstI64(0)),
+            });
+            let lst_ref = TypedExpr::new(iter_ty, Expr::Var(lst_name.clone()));
+            let cond = TypedExpr::new(
+                Type::Bool,
+                Expr::Cmp {
+                    op: CmpOp::Lt,
+                    lhs: Box::new(TypedExpr::new(Type::I64, Expr::Var(idx_name.clone()))),
+                    rhs: Box::new(TypedExpr::new(
+                        Type::I64,
+                        Expr::ListLen { list: Box::new(lst_ref.clone()) },
+                    )),
+                },
+            );
+            let mut wbody = vec![Stmt::Let {
+                name: target_name.to_string(),
+                value: TypedExpr::new(
+                    target_ty,
+                    Expr::ListIndex {
+                        list: Box::new(lst_ref),
+                        index: Box::new(TypedExpr::new(Type::I64, Expr::Var(idx_name.clone()))),
+                    },
+                ),
+            }];
+            wbody.push(body_stmt);
+            wbody.push(Stmt::Let {
+                name: idx_name.clone(),
+                value: TypedExpr::new(
+                    Type::I64,
+                    Expr::BinOp {
+                        op: BinOp::Add,
+                        lhs: Box::new(TypedExpr::new(Type::I64, Expr::Var(idx_name))),
+                        rhs: Box::new(TypedExpr::new(Type::I64, Expr::ConstI64(1))),
+                    },
+                ),
+            });
+            stmts.push(Stmt::While { cond, body: wbody });
+        }
+    }
+    stmts
+}
+
 fn parse_and_lower_range(
     iter: &ast::Expr,
     scope: &Scope,
