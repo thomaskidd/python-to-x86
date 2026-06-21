@@ -1071,8 +1071,68 @@ fn lower_block(
                         }],
                         None => per_iter,
                     };
-                    out.extend(build_comp_loop(&y_name, y_ty, comp_iter, fused, uniq));
+                    out.extend(build_comp_loop(&y_name, y_ty, comp_iter, fused, Vec::new(), uniq));
                     continue;
+                }
+
+                // enumerate(it[, start]) with a two-name tuple target:
+                //   for i, x in enumerate(it, start): <body>
+                // desugars to
+                //   i = start; for x in it: <body>   (latch: i = i + 1)
+                // The index lives outside the loop and bumps in the latch,
+                // so it advances by 1 per iteration regardless of range step
+                // and survives `continue`.
+                if let ast::Expr::Call(call) = f.iter.as_ref() {
+                    if matches!(call.func.as_ref(), ast::Expr::Name(n) if n.id.as_str() == "enumerate")
+                    {
+                        let (i_name, x_name) = parse_pair_target(&f.target, "enumerate")?;
+                        if !call.keywords.is_empty() {
+                            bail!(
+                                "unsupported_feature: enumerate() keyword arguments are not supported"
+                            );
+                        }
+                        if call.args.is_empty() || call.args.len() > 2 {
+                            bail!(
+                                "unsupported_feature: enumerate() takes an iterable and an optional start"
+                            );
+                        }
+                        let (elem_ty, comp_iter) =
+                            lower_iterable(&call.args[0], scope, signatures)?;
+                        let start = if call.args.len() == 2 {
+                            coerce(lower_expr(&call.args[1], scope, signatures)?, Type::I64)?
+                        } else {
+                            TypedExpr::new(Type::I64, Expr::ConstI64(0))
+                        };
+                        let uniq = scope.len();
+                        scope.insert(i_name.clone(), Type::I64);
+                        scope.insert(x_name.clone(), elem_ty);
+                        let body_inner = lower_block(
+                            &f.body,
+                            scope,
+                            loop_depth + 1,
+                            signatures,
+                            return_ty,
+                        )?;
+                        out.push(Stmt::Let { name: i_name.clone(), value: start });
+                        let extra_latch = vec![Stmt::Let {
+                            name: i_name.clone(),
+                            value: TypedExpr::new(
+                                Type::I64,
+                                Expr::BinOp {
+                                    op: BinOp::Add,
+                                    lhs: Box::new(TypedExpr::new(
+                                        Type::I64,
+                                        Expr::Var(i_name.clone()),
+                                    )),
+                                    rhs: Box::new(TypedExpr::new(Type::I64, Expr::ConstI64(1))),
+                                },
+                            ),
+                        }];
+                        out.extend(build_comp_loop(
+                            &x_name, elem_ty, comp_iter, body_inner, extra_latch, uniq,
+                        ));
+                        continue;
+                    }
                 }
 
                 let loop_var = match f.target.as_ref() {
@@ -2181,7 +2241,7 @@ fn lower_expr(e: &ast::Expr, scope: &Scope, signatures: &SignatureTable) -> Resu
                 name: acc_name.clone(),
                 value: TypedExpr::new(acc_ty, Expr::ListLit { elements: Vec::new() }),
             }];
-            stmts.extend(build_comp_loop(&target_name, target_ty, iter, vec![body_stmt], uniq));
+            stmts.extend(build_comp_loop(&target_name, target_ty, iter, vec![body_stmt], Vec::new(), uniq));
             return Ok(TypedExpr::new(
                 acc_ty,
                 Expr::DoBlock {
@@ -2225,7 +2285,7 @@ fn lower_expr(e: &ast::Expr, scope: &Scope, signatures: &SignatureTable) -> Resu
                 name: acc_name.clone(),
                 value: TypedExpr::new(acc_ty, Expr::DictLit { entries: Vec::new() }),
             }];
-            stmts.extend(build_comp_loop(&target_name, target_ty, iter, vec![body_stmt], uniq));
+            stmts.extend(build_comp_loop(&target_name, target_ty, iter, vec![body_stmt], Vec::new(), uniq));
             return Ok(TypedExpr::new(
                 acc_ty,
                 Expr::DoBlock {
@@ -2266,7 +2326,7 @@ fn lower_expr(e: &ast::Expr, scope: &Scope, signatures: &SignatureTable) -> Resu
                 name: acc_name.clone(),
                 value: TypedExpr::new(acc_ty, Expr::SetLit { elements: Vec::new() }),
             }];
-            stmts.extend(build_comp_loop(&target_name, target_ty, iter, vec![body_stmt], uniq));
+            stmts.extend(build_comp_loop(&target_name, target_ty, iter, vec![body_stmt], Vec::new(), uniq));
             return Ok(TypedExpr::new(
                 acc_ty,
                 Expr::DoBlock {
@@ -3903,6 +3963,34 @@ fn resolve_call_args(
     Ok(out)
 }
 
+/// Parse a two-name tuple for-loop target, e.g. `for a, b in …`, used by
+/// `enumerate`/`zip`. `who` names the construct for error messages.
+fn parse_pair_target(target: &ast::Expr, who: &str) -> Result<(String, String)> {
+    let elts = match target {
+        ast::Expr::Tuple(t) => &t.elts,
+        _ => bail!(
+            "unsupported_feature: {}() requires a two-name tuple target, e.g. `for a, b in {}(...)`",
+            who,
+            who
+        ),
+    };
+    if elts.len() != 2 {
+        bail!(
+            "unsupported_feature: {}() requires exactly two targets (got {})",
+            who,
+            elts.len()
+        );
+    }
+    let name = |e: &ast::Expr| match e {
+        ast::Expr::Name(n) => Ok(n.id.as_str().to_string()),
+        _ => bail!(
+            "unsupported_feature: {}() targets must be simple names (no nested unpacking)",
+            who
+        ),
+    };
+    Ok((name(&elts[0])?, name(&elts[1])?))
+}
+
 /// The lowered iteration form of a single comprehension generator.
 /// `Range` carries the lowered `start`/`stop`/`step`; `List` carries the
 /// lowered iterable (a `list[T]`).
@@ -4003,7 +4091,7 @@ fn build_sum_reduction(
         TypedExpr::new(acc_ty, Expr::ConstI64(0))
     };
     let mut stmts = vec![Stmt::Let { name: acc_name.clone(), value: zero }];
-    stmts.extend(build_comp_loop(target_name, target_ty, iter, vec![body_stmt], uniq));
+    stmts.extend(build_comp_loop(target_name, target_ty, iter, vec![body_stmt], Vec::new(), uniq));
     TypedExpr::new(
         acc_ty,
         Expr::DoBlock {
@@ -4053,7 +4141,7 @@ fn build_any_all_reduction(
         name: acc_name.clone(),
         value: TypedExpr::new(Type::Bool, Expr::ConstBool(is_all)),
     }];
-    stmts.extend(build_comp_loop(target_name, target_ty, iter, vec![body_stmt], uniq));
+    stmts.extend(build_comp_loop(target_name, target_ty, iter, vec![body_stmt], Vec::new(), uniq));
     TypedExpr::new(
         Type::Bool,
         Expr::DoBlock {
@@ -4103,13 +4191,16 @@ fn wrap_filter(filter: Option<TypedExpr>, body: Stmt) -> Stmt {
 /// iteration and running `body`. `uniq` disambiguates helper-var names.
 /// The loop advance lives in the `while` latch (`update`) so a `continue`
 /// inside `body` advances correctly. Returns the loop statements (caller
-/// prepends any accumulator init). Shared by comprehensions, `sum`/`any`/
-/// `all` reductions, and genexp-fused for-loops.
+/// prepends any accumulator init). `extra_latch` statements run in the
+/// latch after the built-in advance (used by `enumerate` to bump its
+/// index so it survives `continue`). Shared by comprehensions, `sum`/
+/// `any`/`all` reductions, genexp-fused for-loops, and `enumerate`/`zip`.
 fn build_comp_loop(
     target_name: &str,
     target_ty: Type,
     iter: CompIter,
     body: Vec<Stmt>,
+    extra_latch: Vec<Stmt>,
     uniq: usize,
 ) -> Vec<Stmt> {
     let mut stmts: Vec<Stmt> = Vec::new();
@@ -4127,7 +4218,7 @@ fn build_comp_loop(
             );
             let wbody = body;
             // Increment in the latch so a fused `continue` advances the loop.
-            let update = vec![Stmt::Let {
+            let mut update = vec![Stmt::Let {
                 name: target_name.to_string(),
                 value: TypedExpr::new(
                     Type::I64,
@@ -4138,6 +4229,7 @@ fn build_comp_loop(
                     },
                 ),
             }];
+            update.extend(extra_latch);
             stmts.push(Stmt::While { cond, body: wbody, update });
         }
         CompIter::List { iter } => {
@@ -4174,7 +4266,7 @@ fn build_comp_loop(
             }];
             wbody.extend(body);
             // Index bump in the latch so a fused `continue` advances the loop.
-            let update = vec![Stmt::Let {
+            let mut update = vec![Stmt::Let {
                 name: idx_name.clone(),
                 value: TypedExpr::new(
                     Type::I64,
@@ -4185,6 +4277,7 @@ fn build_comp_loop(
                     },
                 ),
             }];
+            update.extend(extra_latch);
             stmts.push(Stmt::While { cond, body: wbody, update });
         }
     }
