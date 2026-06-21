@@ -3700,6 +3700,46 @@ fn lower_builtin_call(
                 },
             )))
         }
+        "sum" => {
+            // sum(<genexp>) or sum(<iterable>). No start-value argument.
+            if args.len() != 1 {
+                bail!("unsupported_feature: sum() takes exactly 1 argument (no start value)");
+            }
+            let uniq = scope.len();
+            match &args[0] {
+                ast::Expr::GeneratorExp(comp) => {
+                    // Fused generator expression: sum(elt for t in iter if c).
+                    if comp.generators.len() != 1 {
+                        bail!(
+                            "unsupported_feature: nested generators in sum() are not supported"
+                        );
+                    }
+                    let gen = &comp.generators[0];
+                    let (target_name, target_ty, iter, inner_scope) =
+                        lower_comp_generator(gen, scope, signatures)?;
+                    let elt = lower_expr(&comp.elt, &inner_scope, signatures)?;
+                    let acc_ty = if elt.ty == Type::F64 { Type::F64 } else { Type::I64 };
+                    let elt = coerce(elt, acc_ty)?;
+                    let filter = lower_comp_filter(&gen.ifs, &inner_scope, signatures)?;
+                    Ok(Some(build_sum_reduction(
+                        &target_name, target_ty, iter, elt, acc_ty, filter, uniq,
+                    )))
+                }
+                other => {
+                    // Plain iterable: sum(range(n)) or sum(list[T]).
+                    let (elem_ty, iter) = lower_iterable(other, scope, signatures)?;
+                    let acc_ty = if elem_ty == Type::F64 { Type::F64 } else { Type::I64 };
+                    let target_name = format!("__sum_x_{}", uniq);
+                    let elt = coerce(
+                        TypedExpr::new(elem_ty, Expr::Var(target_name.clone())),
+                        acc_ty,
+                    )?;
+                    Ok(Some(build_sum_reduction(
+                        &target_name, elem_ty, iter, elt, acc_ty, None, uniq,
+                    )))
+                }
+            }
+        }
         _ => Ok(None),
     }
 }
@@ -3772,8 +3812,6 @@ fn resolve_call_args(
     Ok(out)
 }
 
-/// Parse and lower a `range(...)` call as the iterable of a for-loop.
-/// Returns (start, stop, step) all as I64 TypedExprs. Defaults: start=0, step=1.
 /// The lowered iteration form of a single comprehension generator.
 /// `Range` carries the lowered `start`/`stop`/`step`; `List` carries the
 /// lowered iterable (a `list[T]`).
@@ -3803,13 +3841,25 @@ fn lower_comp_generator(
 
     // Fresh inner scope so the loop var doesn't leak into the surrounding scope.
     let mut inner_scope = scope.clone();
+    let (elem, iter) = lower_iterable(&gen.iter, &inner_scope, signatures)?;
+    inner_scope.insert(target_name.clone(), elem);
+    Ok((target_name, elem, iter, inner_scope))
+}
 
+/// Lower an iterable expression usable as a comprehension or reduction
+/// source: `range(...)` or a `list[T]`. Returns the element type and the
+/// lowered iteration form. Shared by comprehensions and `sum()`.
+fn lower_iterable(
+    iter: &ast::Expr,
+    scope: &Scope,
+    signatures: &SignatureTable,
+) -> Result<(Type, CompIter)> {
     let is_range_call = matches!(
-        &gen.iter,
+        iter,
         ast::Expr::Call(c) if matches!(c.func.as_ref(), ast::Expr::Name(n) if n.id.as_str() == "range")
     );
     if is_range_call {
-        let (start, stop, step) = parse_and_lower_range(&gen.iter, &inner_scope, signatures)?;
+        let (start, stop, step) = parse_and_lower_range(iter, scope, signatures)?;
         let step_value = match &step.expr {
             Expr::ConstI64(v) => *v,
             _ => bail!("unsupported_feature: range step must be a constant int literal"),
@@ -3817,20 +3867,59 @@ fn lower_comp_generator(
         if step_value <= 0 {
             bail!("unsupported_feature: range step must be a positive int literal");
         }
-        inner_scope.insert(target_name.clone(), Type::I64);
-        Ok((target_name, Type::I64, CompIter::Range { start, stop, step }, inner_scope))
+        Ok((Type::I64, CompIter::Range { start, stop, step }))
     } else {
-        let iter = lower_expr(&gen.iter, &inner_scope, signatures)?;
+        let iter = lower_expr(iter, scope, signatures)?;
         let elem = match iter.ty {
             Type::List(id) => id.elem(),
             other => bail!(
-                "unsupported_feature: comprehension iter must be range(...) or list[T] (got {})",
+                "unsupported_feature: iterable must be range(...) or list[T] (got {})",
                 other.name()
             ),
         };
-        inner_scope.insert(target_name.clone(), elem);
-        Ok((target_name, elem, CompIter::List { iter }, inner_scope))
+        Ok((elem, CompIter::List { iter }))
     }
+}
+
+/// Build a `sum(...)` reduction as a `DoBlock`:
+/// `acc = 0; for <target> in <iter>: (if <filter>) acc = acc + <elt>; acc`.
+/// `acc_ty` is `I64` for integer sums and `F64` for float sums.
+fn build_sum_reduction(
+    target_name: &str,
+    target_ty: Type,
+    iter: CompIter,
+    elt: TypedExpr,
+    acc_ty: Type,
+    filter: Option<TypedExpr>,
+    uniq: usize,
+) -> TypedExpr {
+    let acc_name = format!("__sum_acc_{}", uniq);
+    let add = Stmt::Let {
+        name: acc_name.clone(),
+        value: TypedExpr::new(
+            acc_ty,
+            Expr::BinOp {
+                op: BinOp::Add,
+                lhs: Box::new(TypedExpr::new(acc_ty, Expr::Var(acc_name.clone()))),
+                rhs: Box::new(elt),
+            },
+        ),
+    };
+    let body_stmt = wrap_filter(filter, add);
+    let zero = if acc_ty == Type::F64 {
+        TypedExpr::new(Type::F64, Expr::ConstF64(0.0))
+    } else {
+        TypedExpr::new(acc_ty, Expr::ConstI64(0))
+    };
+    let mut stmts = vec![Stmt::Let { name: acc_name.clone(), value: zero }];
+    stmts.extend(build_comp_loop(target_name, target_ty, iter, body_stmt, uniq));
+    TypedExpr::new(
+        acc_ty,
+        Expr::DoBlock {
+            stmts,
+            result: Box::new(TypedExpr::new(acc_ty, Expr::Var(acc_name))),
+        },
+    )
 }
 
 /// Lower and AND-combine a comprehension's `if` clauses (Python allows
@@ -3957,6 +4046,8 @@ fn build_comp_loop(
     stmts
 }
 
+/// Parse and lower a `range(...)` call as the iterable of a for-loop.
+/// Returns (start, stop, step) all as I64 TypedExprs. Defaults: start=0, step=1.
 fn parse_and_lower_range(
     iter: &ast::Expr,
     scope: &Scope,
