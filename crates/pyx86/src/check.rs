@@ -1135,6 +1135,119 @@ fn lower_block(
                     }
                 }
 
+                // zip(xs, ys) with a two-name tuple target:
+                //   for a, b in zip(xs, ys): <body>
+                // desugars to a single index walk that stops at the shorter
+                // list (cond `i < len(xs) and i < len(ys)`):
+                //   zl0 = xs; zl1 = ys; i = 0
+                //   while i < len(zl0) and i < len(zl1):
+                //       a = zl0[i]; b = zl1[i]; <body>     (latch: i = i + 1)
+                if let ast::Expr::Call(call) = f.iter.as_ref() {
+                    if matches!(call.func.as_ref(), ast::Expr::Name(n) if n.id.as_str() == "zip")
+                    {
+                        let (a_name, b_name) = parse_pair_target(&f.target, "zip")?;
+                        if !call.keywords.is_empty() {
+                            bail!("unsupported_feature: zip() keyword arguments are not supported");
+                        }
+                        if call.args.len() != 2 {
+                            bail!(
+                                "unsupported_feature: zip() supports exactly two iterables in v0.48"
+                            );
+                        }
+                        let xs = lower_expr(&call.args[0], scope, signatures)?;
+                        let ys = lower_expr(&call.args[1], scope, signatures)?;
+                        let (xs_ty, elem0) = match xs.ty {
+                            Type::List(id) => (xs.ty, id.elem()),
+                            other => bail!(
+                                "unsupported_feature: zip() operands must be list[T] in v0.48 (got {}); range is not yet supported",
+                                other.name()
+                            ),
+                        };
+                        let (ys_ty, elem1) = match ys.ty {
+                            Type::List(id) => (ys.ty, id.elem()),
+                            other => bail!(
+                                "unsupported_feature: zip() operands must be list[T] in v0.48 (got {}); range is not yet supported",
+                                other.name()
+                            ),
+                        };
+                        let uniq = scope.len();
+                        let zl0 = format!("__zip_l0_{}", uniq);
+                        let zl1 = format!("__zip_l1_{}", uniq);
+                        let zi = format!("__zip_i_{}", uniq);
+                        scope.insert(a_name.clone(), elem0);
+                        scope.insert(b_name.clone(), elem1);
+                        let body_inner =
+                            lower_block(&f.body, scope, loop_depth + 1, signatures, return_ty)?;
+
+                        out.push(Stmt::Let { name: zl0.clone(), value: xs });
+                        out.push(Stmt::Let { name: zl1.clone(), value: ys });
+                        out.push(Stmt::Let {
+                            name: zi.clone(),
+                            value: TypedExpr::new(Type::I64, Expr::ConstI64(0)),
+                        });
+                        // cond: i < len(zl0) and i < len(zl1)
+                        let zi_lt = |list_name: &str, list_ty: Type| {
+                            TypedExpr::new(
+                                Type::Bool,
+                                Expr::Cmp {
+                                    op: CmpOp::Lt,
+                                    lhs: Box::new(TypedExpr::new(Type::I64, Expr::Var(zi.clone()))),
+                                    rhs: Box::new(TypedExpr::new(
+                                        Type::I64,
+                                        Expr::ListLen {
+                                            list: Box::new(TypedExpr::new(
+                                                list_ty,
+                                                Expr::Var(list_name.to_string()),
+                                            )),
+                                        },
+                                    )),
+                                },
+                            )
+                        };
+                        // `i < len(zl0) and i < len(zl1)` — both operands are
+                        // Bool, so the And is a clean i1 (no value-semantics
+                        // i64 widening).
+                        let cond = TypedExpr::new(
+                            Type::Bool,
+                            Expr::BoolOp {
+                                op: BoolOp::And,
+                                lhs: Box::new(zi_lt(&zl0, xs_ty)),
+                                rhs: Box::new(zi_lt(&zl1, ys_ty)),
+                            },
+                        );
+                        let index_at = |list_name: &str, list_ty: Type, elem: Type| {
+                            TypedExpr::new(
+                                elem,
+                                Expr::ListIndex {
+                                    list: Box::new(TypedExpr::new(
+                                        list_ty,
+                                        Expr::Var(list_name.to_string()),
+                                    )),
+                                    index: Box::new(TypedExpr::new(Type::I64, Expr::Var(zi.clone()))),
+                                },
+                            )
+                        };
+                        let mut wbody = vec![
+                            Stmt::Let { name: a_name.clone(), value: index_at(&zl0, xs_ty, elem0) },
+                            Stmt::Let { name: b_name.clone(), value: index_at(&zl1, ys_ty, elem1) },
+                        ];
+                        wbody.extend(body_inner);
+                        let update = vec![Stmt::Let {
+                            name: zi.clone(),
+                            value: TypedExpr::new(
+                                Type::I64,
+                                Expr::BinOp {
+                                    op: BinOp::Add,
+                                    lhs: Box::new(TypedExpr::new(Type::I64, Expr::Var(zi.clone()))),
+                                    rhs: Box::new(TypedExpr::new(Type::I64, Expr::ConstI64(1))),
+                                },
+                            ),
+                        }];
+                        out.push(Stmt::While { cond, body: wbody, update });
+                        continue;
+                    }
+                }
+
                 let loop_var = match f.target.as_ref() {
                     ast::Expr::Name(n) => n.id.as_str().to_string(),
                     _ => bail!(
@@ -4163,18 +4276,20 @@ fn lower_comp_filter(
         let c = coerce(lower_expr(if_e, scope, signatures)?, Type::Bool)?;
         filter_cond = Some(match filter_cond {
             None => c,
+            // Both operands are Bool, so the And is a clean i1 — do NOT
+            // widen to i64 (that would tag an i64 value as Bool and emit
+            // `store i64 … i1*`).
             Some(prev) => TypedExpr::new(
                 Type::Bool,
                 Expr::BoolOp {
                     op: BoolOp::And,
-                    lhs: Box::new(coerce(prev, Type::I64)?),
-                    rhs: Box::new(coerce(c, Type::I64)?),
+                    lhs: Box::new(prev),
+                    rhs: Box::new(c),
                 },
             ),
         });
     }
-    // Renormalise back to Bool for use as an `if` condition.
-    Ok(filter_cond.map(|c| coerce(c, Type::Bool).unwrap()))
+    Ok(filter_cond)
 }
 
 /// Wrap a per-element comprehension `body` in an `if <filter>:` when a
