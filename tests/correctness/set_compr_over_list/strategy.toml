@@ -1,0 +1,6 @@
+[[arg]]
+type = "i64"
+range = [-20, 20]
+[[arg]]
+type = "i64"
+range = [-20, 20]

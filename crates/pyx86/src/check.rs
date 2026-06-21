@@ -2182,6 +2182,47 @@ fn lower_expr(e: &ast::Expr, scope: &Scope, signatures: &SignatureTable) -> Resu
                 },
             ));
         }
+        ast::Expr::SetComp(comp) => {
+            // {<elt> for <target> in <iter> (if <cond>)*}
+            if comp.generators.len() != 1 {
+                bail!(
+                    "unsupported_feature: nested generators in comprehensions are not supported"
+                );
+            }
+            let gen = &comp.generators[0];
+            let uniq = scope.len();
+            let acc_name = format!("__compr_acc_{}", uniq);
+            let (target_name, target_ty, iter, inner_scope) =
+                lower_comp_generator(gen, scope, signatures)?;
+
+            // Elements are i64 only, matching set literals (v0.32):
+            // the runtime stores i64 members.
+            let elt_lowered =
+                coerce(lower_expr(&comp.elt, &inner_scope, signatures)?, Type::I64)?;
+            let acc_ty = Type::Set(SetId::intern(Type::I64));
+            let filter = lower_comp_filter(&gen.ifs, &inner_scope, signatures)?;
+
+            // Per-element body: acc.add(elt)
+            let add = Stmt::SetAdd {
+                set: TypedExpr::new(acc_ty, Expr::Var(acc_name.clone())),
+                value: elt_lowered,
+            };
+            let body_stmt = wrap_filter(filter, add);
+
+            // acc = set()  ; <loop>  ; acc
+            let mut stmts = vec![Stmt::Let {
+                name: acc_name.clone(),
+                value: TypedExpr::new(acc_ty, Expr::SetLit { elements: Vec::new() }),
+            }];
+            stmts.extend(build_comp_loop(&target_name, target_ty, iter, body_stmt, uniq));
+            return Ok(TypedExpr::new(
+                acc_ty,
+                Expr::DoBlock {
+                    stmts,
+                    result: Box::new(TypedExpr::new(acc_ty, Expr::Var(acc_name))),
+                },
+            ));
+        }
         ast::Expr::List(l) => {
             // List literal: `[a, b, c]`. All elements must be coercible
             // to a common type. Empty `[]` produces a List of element
